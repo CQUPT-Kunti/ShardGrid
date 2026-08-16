@@ -3,17 +3,20 @@ Name: shardgrid
 Version: 0.1.0
 Summary: ShardGrid control-plane package
 Description-Content-Type: text/markdown
+Requires-Dist: PyYAML<7,>=6
 Provides-Extra: dev
 Requires-Dist: build<2,>=1.2; extra == "dev"
 Requires-Dist: mypy<2,>=1.11; extra == "dev"
 Requires-Dist: pytest<9,>=8; extra == "dev"
 Requires-Dist: ruff<1,>=0.6; extra == "dev"
+Requires-Dist: types-PyYAML<7,>=6.0.12; extra == "dev"
 Provides-Extra: test
 Requires-Dist: pytest<9,>=8; extra == "test"
 Provides-Extra: lint
 Requires-Dist: ruff<1,>=0.6; extra == "lint"
 Provides-Extra: typecheck
 Requires-Dist: mypy<2,>=1.11; extra == "typecheck"
+Requires-Dist: types-PyYAML<7,>=6.0.12; extra == "typecheck"
 Provides-Extra: kubernetes
 Provides-Extra: engines
 Provides-Extra: volcano

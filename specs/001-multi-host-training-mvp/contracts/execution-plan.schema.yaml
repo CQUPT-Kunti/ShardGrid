@@ -1,93 +1,112 @@
-schemas:
-  ExecutionPlan:
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: ExecutionPlan
+type: object
+required:
+  - job_id
+  - engine
+  - backend
+  - world_size
+  - master
+  - workers
+properties:
+  job_id:
+    type: string
+    minLength: 1
+  engine:
+    type: string
+    minLength: 1
+  backend:
+    type: string
+    minLength: 1
+  world_size:
+    type: integer
+    minimum: 1
+  master:
     type: object
     required:
-      - job_id
-      - engine
-      - backend
-      - world_size
-      - master
-      - workers
-    properties:
-      job_id:
-        type: string
-      engine:
-        type: string
-        description: Parallel engine or static validation engine.
-      backend:
-        enum: [nccl, gloo, auto, kubernetes, volcano]
-      launcher:
-        enum: [ssh, kubernetes, volcano]
-      world_size:
-        type: integer
-        minimum: 1
-      master:
-        $ref: "#/schemas/Master"
-      workers:
-        type: array
-        items:
-          $ref: "#/schemas/WorkerAssignment"
-      parallel_plan_ref:
-        type: string
-      snapshot_ref:
-        type: string
-      placement_reason:
-        type: array
-        items:
-          type: string
-      environment:
-        type: object
-        additionalProperties:
-          type: string
-      labels:
-        type: object
-        additionalProperties:
-          type: string
-
-  Master:
-    type: object
-    required: [address, port]
+      - address
+      - port
     properties:
       address:
         type: string
+        minLength: 1
       port:
         type: integer
         minimum: 1
         maximum: 65535
-
-  WorkerAssignment:
+    additionalProperties: false
+  workers:
+    type: array
+    minItems: 1
+    items:
+      type: object
+      required:
+        - worker_id
+        - rank
+        - local_rank
+      properties:
+        worker_id:
+          type: string
+          minLength: 1
+        rank:
+          type: integer
+          minimum: 0
+        local_rank:
+          type: integer
+          const: 0
+        stage:
+          type:
+            - string
+            - "null"
+        gpu_index:
+          type: integer
+          minimum: 0
+        launch_command:
+          type:
+            - string
+            - "null"
+        environment:
+          type: object
+          additionalProperties:
+            type: string
+        status:
+          type: string
+        pid:
+          type:
+            - integer
+            - "null"
+        log_path:
+          type:
+            - string
+            - "null"
+      additionalProperties: false
+  placement_reason:
+    type:
+      - string
+      - "null"
+  parallel_plan_ref:
+    type:
+      - string
+      - "null"
+  snapshot_ref:
+    type:
+      - string
+      - "null"
+  environment:
     type: object
-    required:
-      - worker_id
-      - rank
-      - local_rank
-      - stage
-    properties:
-      worker_id:
-        type: string
-      rank:
-        type: integer
-        minimum: 0
-      local_rank:
-        type: integer
-        minimum: 0
-      stage:
-        type: integer
-        minimum: 0
-      gpu_index:
-        type: integer
-        default: 0
-      host:
-        type: string
-      runtime_os:
-        enum: [linux, wsl2_linux]
-      launch_command:
-        type: string
-      log_path:
-        type: string
-
-validation_rules:
-  - world_size must equal length(workers).
-  - ranks must be unique and cover 0..world_size-1.
-  - Stage A-C assignments must have local_rank 0 and gpu_index 0.
-  - backend labels must preserve NCCL failure and Gloo fallback status.
+    additionalProperties:
+      type: string
+  labels:
+    type: object
+    additionalProperties:
+      type: string
+additionalProperties: false
+allOf:
+  - properties:
+      workers:
+        uniqueItems: true
+  - $comment: uniqueItems on whole objects is not enough for rank uniqueness; use the custom x-shardgrid rule below.
+x-shardgrid-rules:
+  unique_rank: workers[*].rank
+  contiguous_ranks: true
+  world_size_matches_workers: true

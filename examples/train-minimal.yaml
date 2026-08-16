@@ -1,0 +1,26 @@
+job:
+  name: train-minimal
+  backend: ssh
+  communication_backend: auto
+
+model:
+  name: tiny-sequential
+  type: minimal_sequential
+  stage_count: 2
+  max_train_minutes: 15
+  min_loss_decrease_percent: 5.0
+
+resources:
+  world_size: 2
+  preferred_workers:
+    - gpu4060
+    - gpu1060
+  worker_overrides:
+    gpu4060:
+      stage: "0"
+    gpu1060:
+      stage: "1"
+
+artifacts:
+  snapshot_name: train-minimal
+  keep_failed_snapshots: true

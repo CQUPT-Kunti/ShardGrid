@@ -2,43 +2,143 @@ schemas:
   ClusterConfig:
     type: object
     required:
+      - control
+      - jobs_root
       - workers
     properties:
+      control:
+        $ref: "#/schemas/ControlNodeConfig"
       jobs_root:
         type: string
-        description: Configurable Control-node job snapshot root.
-      default_ports:
-        type: object
-        properties:
-          rendezvous:
-            type: integer
-            default: 29500
-          iperf3:
-            type: integer
-            default: 5201
+        description: Absolute path used by the Ubuntu control node for job snapshots.
+      ssh:
+        $ref: "#/schemas/SSHConfig"
+      runtime:
+        $ref: "#/schemas/RuntimeConfig"
+      network:
+        $ref: "#/schemas/NetworkConfig"
+      backend_preference:
+        $ref: "#/schemas/BackendPreferenceConfig"
+      manual_override:
+        $ref: "#/schemas/ManualOverrideConfig"
       workers:
         type: array
         minItems: 1
         items:
           $ref: "#/schemas/WorkerConfig"
 
+  ControlNodeConfig:
+    type: object
+    required: [machine_id, hostname]
+    properties:
+      machine_id:
+        type: string
+      hostname:
+        type: string
+
+  SSHConfig:
+    type: object
+    properties:
+      default_port:
+        type: integer
+        default: 22
+      connect_timeout_seconds:
+        type: integer
+        default: 15
+      strict_host_key_checking:
+        type: boolean
+        default: true
+      private_key_path:
+        type: [string, "null"]
+      known_hosts_path:
+        type: [string, "null"]
+
+  RuntimeConfig:
+    type: object
+    properties:
+      python_executable:
+        type: string
+        default: python3
+      linux_shell:
+        type: string
+        default: /bin/bash
+      windows_shell:
+        type: string
+        default: powershell.exe
+      wsl_shell:
+        type: string
+        default: /bin/bash
+      default_wsl_distro:
+        type: [string, "null"]
+      environment:
+        type: object
+        additionalProperties:
+          type: string
+
+  NetworkConfig:
+    type: object
+    properties:
+      rendezvous_port:
+        type: integer
+        default: 29500
+      iperf3_port:
+        type: integer
+        default: 5201
+      interface_preference:
+        type: [string, "null"]
+
+  BackendPreferenceConfig:
+    type: object
+    properties:
+      launcher:
+        type: string
+        default: ssh
+      communication_backend:
+        type: string
+        default: auto
+      parallel_engine:
+        type: string
+        default: auto
+
+  ManualOverrideConfig:
+    type: object
+    properties:
+      preferred_workers:
+        type: array
+        items:
+          type: string
+      disabled_workers:
+        type: array
+        items:
+          type: string
+      worker_address_overrides:
+        type: object
+        additionalProperties:
+          type: string
+      rendezvous_port:
+        type: [integer, "null"]
+
   WorkerConfig:
     type: object
     required:
       - id
+      - machine_id
       - physical_os
+      - runtime_os
       - runtime
       - host
       - ssh_user
     properties:
       id:
         type: string
+      machine_id:
+        type: string
       physical_os:
         enum: [linux, windows]
-      runtime:
-        enum: [native_linux, wsl2]
       runtime_os:
-        enum: [linux, wsl2_linux]
+        enum: [linux, wsl2_linux, windows, unknown]
+      runtime:
+        type: string
       host:
         type: string
       ssh_user:
@@ -46,19 +146,18 @@ schemas:
       ssh_port:
         type: integer
         default: 22
-      wsl_distro:
-        type: string
-        default: Ubuntu
+      runtime_distro:
+        type: [string, "null"]
       local_world_size:
         type: integer
         default: 1
+      enabled:
+        type: boolean
+        default: true
       labels:
         type: object
         additionalProperties:
           type: string
-      enabled:
-        type: boolean
-        default: true
 
   TrainingConfig:
     type: object
@@ -74,10 +173,10 @@ schemas:
           name:
             type: string
           backend:
-            enum: [ssh, kubernetes, volcano, auto]
+            type: string
             default: ssh
           communication_backend:
-            enum: [nccl, gloo, auto]
+            type: string
             default: auto
       model:
         type: object
@@ -86,7 +185,7 @@ schemas:
           name:
             type: string
           type:
-            enum: [minimal_transformer, minimal_sequential]
+            type: string
           stage_count:
             type: integer
             default: 2
@@ -111,11 +210,13 @@ schemas:
             type: object
             additionalProperties:
               type: object
+              additionalProperties:
+                type: string
       artifacts:
         type: object
         properties:
           snapshot_name:
-            type: string
+            type: [string, "null"]
           keep_failed_snapshots:
             type: boolean
             default: true

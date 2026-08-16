@@ -1,57 +1,65 @@
-schemas:
-  JobStatus:
-    type: object
-    required:
-      - job_id
-      - state
-      - phase
-    properties:
-      job_id:
-        type: string
-      state:
-        enum:
-          - created
-          - probing
-          - planning
-          - snapshotting
-          - distributing
-          - launching
-          - rendezvous
-          - training
-          - checkpointing
-          - completed
-          - failed
-          - stopping
-          - stopped
-      phase:
-        type: string
-      workers:
-        type: array
-        items:
-          type: string
-      backend:
-        type: string
-      fallback_used:
-        type: boolean
-      latest_loss:
-        type: number
-      loss_history:
-        type: array
-        items:
-          type: number
-      checkpoint_ref:
-        type: string
-      started_at:
-        type: string
-      finished_at:
-        type: string
-      failure:
-        $ref: "#/schemas/FailureRecord"
-
-  FailureRecord:
-    type: object
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: JobStatus
+type: object
+required:
+  - job_id
+  - state
+  - phase
+properties:
+  job_id:
+    type: string
+    minLength: 1
+  state:
+    enum:
+      - created
+      - probing
+      - planning
+      - snapshotting
+      - distributing
+      - launching
+      - rendezvous
+      - training
+      - checkpointing
+      - completed
+      - failed
+      - stopping
+      - stopped
+  phase:
+    type: string
+    minLength: 1
+  workers:
+    type: array
+    items:
+      type: string
+  latest_loss:
+    type:
+      - number
+      - "null"
+  loss_history:
+    type: array
+    items:
+      type: number
+  backend:
+    type:
+      - string
+      - "null"
+  fallback_used:
+    type: boolean
+  started_at:
+    type:
+      - string
+      - "null"
+  finished_at:
+    type:
+      - string
+      - "null"
+  failure:
+    type:
+      - object
+      - "null"
     required:
       - stage
+      - host
       - message
       - recommended_action
     properties:
@@ -73,26 +81,66 @@ schemas:
           - CLEANUP
       host:
         type: string
+        minLength: 1
       worker_id:
-        type: string
+        type:
+          - string
+          - "null"
       command:
-        type: string
+        type:
+          - string
+          - "null"
       exit_code:
-        type: integer
+        type:
+          - integer
+          - "null"
       stdout_path:
-        type: string
+        type:
+          - string
+          - "null"
       stderr_path:
-        type: string
+        type:
+          - string
+          - "null"
       message:
         type: string
+        minLength: 1
       recommended_action:
         type: string
+        minLength: 1
       retryable:
         type: boolean
       manual_action_required:
         type: boolean
-
-validation_rules:
-  - failed jobs must include failure.
-  - completed jobs must include checkpoint_ref and final loss metrics.
-  - fallback_used true must be accompanied by backend labels and diagnostics.
+    additionalProperties: false
+  checkpoint_ref:
+    type:
+      - string
+      - "null"
+additionalProperties: false
+allOf:
+  - if:
+      properties:
+        state:
+          const: failed
+      required:
+        - state
+    then:
+      required:
+        - failure
+      properties:
+        failure:
+          type: object
+  - if:
+      properties:
+        state:
+          const: completed
+      required:
+        - state
+    then:
+      required:
+        - checkpoint_ref
+      properties:
+        checkpoint_ref:
+          type: string
+          minLength: 1
