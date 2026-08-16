@@ -7,7 +7,7 @@ Adapters keep ShardGrid orchestration independent from external tools and platfo
 Methods:
 
 - `detect() -> PlatformInfo`
-- `run(command, timeout, env, cwd) -> CommandResult`
+- `run(command, timeout, env, cwd, runtime_environment) -> CommandResult`
 - `path_join(parts) -> str`
 - `validate_manual_action(action) -> ManualAction`
 - `bootstrap_step(step) -> BootstrapFinding`
@@ -15,7 +15,12 @@ Methods:
 Rules:
 
 - Business modules must not embed PowerShell/Bash-specific command strings directly.
+- Business modules must not hard-code `conda activate`, `conda run`, system Python,
+  or platform-specific Python paths; the selected runtime environment is resolved by
+  configuration plus PlatformAdapter/runtime abstractions.
 - Any action requiring administrator permission, reboot, BIOS changes, password entry, or risky firewall change returns `manual_action_required=true`.
+- Conda installation or environment creation that requires elevated permissions or
+  would overwrite an existing environment returns `manual_action_required=true`.
 
 ## ResourceProvider
 
@@ -29,6 +34,9 @@ Rules:
 
 - Probe failures return structured FailureRecord.
 - WorkerResource must include both `physical_os` and `runtime_os`.
+- WorkerResource must record the detected Conda manager state, selected Conda
+  environment or prefix, Python executable, PyTorch/CUDA runtime versions, and must
+  distinguish Windows host state from WSL2 training runtime state.
 
 ## ParallelEngine
 
@@ -75,6 +83,8 @@ Rules:
 
 - Snapshot root must be configurable.
 - Accepted job snapshots are immutable except lifecycle append records.
+- Environment records must include Conda executable, active environment, prefix,
+  Python executable/version, PyTorch version, and CUDA/runtime fields when checked.
 
 ## ArtifactTransport
 

@@ -37,6 +37,8 @@ def make_worker_resource() -> WorkerResource:
         hostname=as_hostname("machine-c.local"),
         physical_os=PhysicalOS.WINDOWS,
         runtime_os=RuntimeOS.WSL2_LINUX,
+        conda_environment="shardgrid-worker",
+        python_executable="python",
         ip="10.0.0.13",
         gpu_name="RTX 4060",
         gpu_total_memory=8188,
@@ -85,9 +87,23 @@ def make_execution_plan() -> ExecutionPlan:
         world_size=2,
         master=MasterMetadata(address="10.0.0.13", port=29500),
         workers=[
-            WorkerAssignment(worker_id=as_worker_id("gpu4060"), rank=0, stage="0"),
-            WorkerAssignment(worker_id=as_worker_id("gpu1060"), rank=1, stage="1"),
+            WorkerAssignment(
+                worker_id=as_worker_id("gpu4060"),
+                rank=0,
+                stage="0",
+                conda_environment="shardgrid-worker",
+                python_executable="python",
+            ),
+            WorkerAssignment(
+                worker_id=as_worker_id("gpu1060"),
+                rank=1,
+                stage="1",
+                conda_environment="shardgrid-worker",
+                python_executable="python",
+            ),
         ],
+        conda_environment="shardgrid-worker",
+        python_executable="python",
         labels={"backend_result": "gloo_fallback"},
     )
 
@@ -106,6 +122,8 @@ def make_job_status() -> JobStatus:
             worker_id=as_worker_id("gpu4060"),
             message="ssh launch failed",
             recommended_action="inspect remote logs and ssh access",
+            conda_environment="shardgrid-worker",
+            python_executable="python",
             retryable=True,
         ),
     )

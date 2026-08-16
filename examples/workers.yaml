@@ -13,6 +13,10 @@ ssh:
 
 runtime:
   python_executable: python3
+  environment_manager: conda
+  conda_executable: null
+  conda_environment: null
+  conda_prefix: null
   linux_shell: /bin/bash
   windows_shell: powershell.exe
   wsl_shell: /bin/bash
@@ -45,6 +49,8 @@ workers:
     ssh_user: shardgrid
     ssh_port: 22
     runtime_distro: Ubuntu-22.04
+    conda_environment: null
+    conda_prefix: null
     local_world_size: 1
     enabled: true
     labels:
@@ -59,6 +65,8 @@ workers:
     ssh_user: shardgrid
     ssh_port: 22
     runtime_distro: Ubuntu-22.04
+    conda_environment: null
+    conda_prefix: null
     local_world_size: 1
     enabled: true
     labels:
@@ -73,6 +81,8 @@ workers:
     ssh_user: shardgrid
     ssh_port: 22
     runtime_distro: Ubuntu-22.04
+    conda_environment: null
+    conda_prefix: null
     local_world_size: 1
     enabled: false
     labels:

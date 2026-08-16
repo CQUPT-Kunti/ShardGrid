@@ -39,6 +39,9 @@ class WorkerAssignment:
     local_rank: int = 0
     stage: str | None = None
     gpu_index: int = 0
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
+    python_executable: str | None = None
     launch_command: str | None = None
     environment: dict[str, str] = field(default_factory=dict)
     status: AssignmentStatus = "pending"
@@ -64,6 +67,9 @@ class WorkerAssignment:
             local_rank=int(data.get("local_rank", 0)),
             stage=data.get("stage"),
             gpu_index=int(data.get("gpu_index", 0)),
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
+            python_executable=data.get("python_executable"),
             launch_command=data.get("launch_command"),
             environment={
                 str(key): str(value)
@@ -100,6 +106,9 @@ class ExecutionPlan:
     world_size: int
     master: MasterMetadata
     workers: list[WorkerAssignment]
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
+    python_executable: str | None = None
     placement_reason: str | None = None
     parallel_plan_ref: str | None = None
     snapshot_ref: str | None = None
@@ -129,6 +138,9 @@ class ExecutionPlan:
             world_size=int(data["world_size"]),
             master=MasterMetadata.from_dict(data["master"]),
             workers=[WorkerAssignment.from_dict(item) for item in data.get("workers", [])],
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
+            python_executable=data.get("python_executable"),
             placement_reason=data.get("placement_reason"),
             parallel_plan_ref=data.get("parallel_plan_ref"),
             snapshot_ref=data.get("snapshot_ref"),
@@ -149,6 +161,10 @@ class PlatformAdapterState:
     platform: str
     shell: str
     path_rules: str
+    environment_manager: str = "conda"
+    conda_executable: str | None = None
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
     supports_bootstrap: bool = False
     supports_probe: bool = False
     manual_action_rules: list[str] = field(default_factory=list)
@@ -163,6 +179,10 @@ class PlatformAdapterState:
             platform=str(data["platform"]),
             shell=str(data["shell"]),
             path_rules=str(data["path_rules"]),
+            environment_manager=str(data.get("environment_manager", "conda")),
+            conda_executable=data.get("conda_executable"),
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
             supports_bootstrap=bool(data.get("supports_bootstrap", False)),
             supports_probe=bool(data.get("supports_probe", False)),
             manual_action_rules=[str(item) for item in data.get("manual_action_rules", [])],

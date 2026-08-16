@@ -15,6 +15,12 @@ policy:
     - Keep observed versions separate from compatibility expectations.
 
 compatibility:
+  conda:
+    status: not_checked
+    constraints:
+      version: null
+      notes:
+        - Conda is required as the environment manager, but no fixed Conda version is mandatory by default.
   python:
     status: not_checked
     constraints:
@@ -54,6 +60,18 @@ compatibility:
         - HAMi is only evaluated after Kubernetes and Volcano are stable.
 
 components:
+  conda:
+    executable: null
+    version: null
+    active_environment: null
+    active_prefix: null
+    environments: []
+    status: not_checked
+    source: not_checked
+    compatibility: not_checked
+    notes:
+      - Detect Conda before any environment change.
+      - Reuse a compatible existing environment before creating a ShardGrid environment.
   os:
     name: Ubuntu
     version: null
@@ -158,6 +176,12 @@ machines:
       os:
         version: null
         status: installed
+      conda:
+        executable: null
+        version: null
+        active_environment: null
+        active_prefix: null
+        status: not_checked
       python:
         version: null
         status: installed
@@ -178,6 +202,12 @@ machines:
       wsl:
         version: null
         status: not_checked
+      conda:
+        executable: null
+        version: null
+        active_environment: null
+        active_prefix: null
+        status: not_checked
       nvidia_driver:
         version: null
         status: not_checked
@@ -194,6 +224,12 @@ machines:
     components:
       wsl:
         version: null
+        status: not_checked
+      conda:
+        executable: null
+        version: null
+        active_environment: null
+        active_prefix: null
         status: not_checked
       nvidia_driver:
         version: null

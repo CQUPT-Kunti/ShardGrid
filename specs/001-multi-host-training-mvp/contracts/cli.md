@@ -6,8 +6,14 @@ All commands support human-readable output by default and `--json` for machine-r
 
 - `--config PATH`: cluster config path. Default is `shardgrid.yaml` or `examples/workers.yaml` in examples.
 - `--jobs-root PATH`: override configured job snapshot root.
+- `--conda-env NAME`: optional Conda environment name override for Python/runtime commands.
+- `--conda-prefix PATH`: optional Conda environment prefix override for Python/runtime commands.
 - `--verbose`: include command details and diagnostics.
 - `--json`: emit structured JSON.
+
+Conda overrides select or describe the runtime environment. They do not imply a fixed
+Python or Conda version, and command implementations must still detect and validate
+the selected environment before launch.
 
 ## shardgrid doctor
 

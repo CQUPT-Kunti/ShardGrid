@@ -11,6 +11,7 @@ This gate confirms the T001-T027 foundation is ready before any real machine, GP
 ## Verified On Ubuntu
 
 - PASS: Python package install/import
+- PASS: Conda executable and selected environment evidence recorded on Ubuntu revalidation
 - PASS: dependency setup required for the current foundation scope
 - PASS: pytest non-hardware suite
 - PASS: Ruff
@@ -48,6 +49,7 @@ These belong to T028 and later.
 ## Known Prerequisites
 
 - A usable Python environment on the control node
+- A usable Conda installation and selected compatible Conda environment on the control node
 - The current package dev/test tools available in the environment
 - Real Windows/WSL workers prepared for later platform verification
 - Operator availability for any blocked manual actions such as reboots, BIOS changes, administrator elevation, password entry, or firewall changes
@@ -60,6 +62,7 @@ These belong to T028 and later.
 ## Entry Criteria For T028
 
 - Ubuntu foundation gate remains PASS
+- Revalidated local quality commands record Conda executable, selected environment, prefix, and Python executable
 - Windows/WSL verification is planned and tracked as pending, not silently assumed complete
 - No failing non-hardware tests
 - No unresolved schema, packaging, CLI, inventory, artifact, or manual-action regressions
@@ -68,4 +71,5 @@ These belong to T028 and later.
 
 - Ubuntu Gate: PASS
 - Windows Gate: PENDING PLATFORM VERIFICATION
+- Conda revalidation: PASS on Ubuntu Machine A using `/home/yangjilei/anaconda3/bin/conda`, active environment `base`, Python `/home/yangjilei/anaconda3/bin/python`
 - Overall foundation status for starting T028 on the Ubuntu control node: PASS WITH PENDING WINDOWS PLATFORM VERIFICATION

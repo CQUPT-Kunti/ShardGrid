@@ -16,6 +16,7 @@ def test_cli_help(capsys: Any) -> None:
     captured = capsys.readouterr()
     assert "ShardGrid control-plane CLI" in captured.out
     assert "--config" in captured.out
+    assert "--conda-env" in captured.out
 
 
 def test_cli_unknown_command_returns_usage_error(capsys: Any) -> None:

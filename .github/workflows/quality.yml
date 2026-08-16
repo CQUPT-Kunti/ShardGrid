@@ -9,8 +9,11 @@ on:
 
 jobs:
   quality:
-    name: "${{ matrix.os }} / Python ${{ matrix.python-version }}"
+    name: "${{ matrix.os }} / Conda Python ${{ matrix.python-version }}"
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash -el {0}
     strategy:
       fail-fast: false
       matrix:
@@ -25,14 +28,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Conda environment
+        uses: conda-incubator/setup-miniconda@v3
         with:
+          activate-environment: shardgrid-ci
           python-version: ${{ matrix.python-version }}
-          cache: pip
+          auto-update-conda: false
 
       - name: Install package and quality tools
         run: |
+          conda info
+          conda env list
+          command -v python
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 

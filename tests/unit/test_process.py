@@ -48,9 +48,12 @@ def test_run_process_environment_propagation() -> None:
     result = run_process(
         [sys.executable, "-c", "import os; print(os.environ['SG_TEST_ENV'])"],
         env={"SG_TEST_ENV": "present"},
+        runtime_environment={"manager": "conda", "name": "shardgrid-dev"},
     )
 
     assert result.stdout.strip() == "present"
+    assert result.runtime_environment["manager"] == "conda"
+    assert result.runtime_environment["name"] == "shardgrid-dev"
 
 
 def test_run_process_output_capture_and_encoding() -> None:

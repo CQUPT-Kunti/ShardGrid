@@ -15,6 +15,10 @@ def test_worker_resource_round_trip_json() -> None:
         hostname=as_hostname("machine-c.local"),
         physical_os=PhysicalOS.WINDOWS,
         runtime_os=RuntimeOS.WSL2_LINUX,
+        environment_manager="conda",
+        conda_environment="shardgrid-worker",
+        conda_prefix="/opt/conda/envs/shardgrid-worker",
+        python_executable="python",
         ip="10.0.0.13",
         gpu_name="RTX 4060",
         gpu_total_memory=8188,
@@ -40,6 +44,7 @@ def test_worker_resource_round_trip_json() -> None:
     assert restored == resource
     assert restored.physical_os is PhysicalOS.WINDOWS
     assert restored.runtime_os is RuntimeOS.WSL2_LINUX
+    assert restored.conda_environment == "shardgrid-worker"
 
 
 def test_worker_defaults_to_one_gpu_per_physical_host() -> None:
@@ -52,10 +57,12 @@ def test_worker_defaults_to_one_gpu_per_physical_host() -> None:
         host="machine-d.local",
         ssh_user_ref="shardgrid",
         runtime="wsl2",
+        conda_environment="shardgrid-worker",
     )
 
     assert worker.local_world_size == 1
     assert worker.enabled is True
+    assert worker.conda_environment == "shardgrid-worker"
 
 
 def test_windows_and_wsl_runtime_os_remain_separate() -> None:
@@ -73,6 +80,12 @@ def test_windows_and_wsl_runtime_os_remain_separate() -> None:
     runtime = WorkerRuntime(
         worker_id=as_worker_id("gpu4060"),
         runtime_os=RuntimeOS.WSL2_LINUX,
+        environment_manager="conda",
+        conda_executable="/opt/conda/bin/conda",
+        conda_environment="shardgrid-worker",
+        conda_prefix="/opt/conda/envs/shardgrid-worker",
+        conda_active=True,
+        python_executable="python",
         python_version="3.13.5",
         torch_version="2.5.1",
         cuda_available=True,
@@ -83,6 +96,8 @@ def test_windows_and_wsl_runtime_os_remain_separate() -> None:
     assert worker.physical_os is PhysicalOS.WINDOWS
     assert worker.runtime_os is RuntimeOS.WSL2_LINUX
     assert runtime.runtime_os is RuntimeOS.WSL2_LINUX
+    assert runtime.conda_environment == "shardgrid-worker"
+    assert runtime.conda_active is True
 
 
 def test_models_cover_control_gpu_and_network_records() -> None:
@@ -105,6 +120,7 @@ def test_models_cover_control_gpu_and_network_records() -> None:
         jobs_root=Path("/var/tmp/shardgrid/jobs"),
         disk_free_bytes=10_000_000,
         health=Health.HEALTHY,
+        conda_environment="shardgrid-dev",
     )
     gpu = GPUResource(
         worker_id=as_worker_id("gpu4060"),
@@ -133,6 +149,7 @@ def test_models_cover_control_gpu_and_network_records() -> None:
 
     assert machine.role is MachineRole.CONTROL
     assert control.health is Health.HEALTHY
+    assert control.conda_environment == "shardgrid-dev"
     assert gpu.gpu_index == 0
     assert state.links[0].tcp_reachable is True
     assert NetworkState.from_dict(state.to_dict()) == state

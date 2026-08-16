@@ -119,6 +119,8 @@
 - loss 出现 NaN、无限值、未下降或下降幅度低于阈值。
 - 用户请求 stop 时部分 rank 已启动、部分 rank 未启动。
 - bootstrap 需要管理员权限、重启、BIOS 修改、用户密码或危险防火墙规则。
+- 当前机器已有 Conda 或已有可用 Conda environment，但 bootstrap/doctor 试图强制重装、删除、覆盖或切换到固定版本。
+- Windows GPU Worker 的 Windows 主机 Python 可用但 WSL2 training runtime 内 Conda/Python/PyTorch 不可用；系统必须区分主机和训练 runtime，不能混为健康状态。
 - 新增 Optional Machine E 后配置重复 worker ID、端口或 artifact 路径。
 - Kubernetes compatibility gate 通过节点加入但 GPU Pod、跨主机网络或 distributed training 失败。
 - Volcano 或 HAMi 安装成功但无法在当前 Windows/WSL2 GPU Worker 环境下稳定调度真实训练。
@@ -148,21 +150,25 @@
 - **FR-012**: The system MUST document the reason whenever it uses a fallback or ShardGrid-owned implementation for a capability that has mature existing candidates.
 - **FR-013**: The system MUST use a standard remote command and file transfer mechanism rather than a custom remote protocol or custom file transfer protocol.
 - **FR-014**: The system MUST use the Windows host's Linux-compatible training runtime as the preferred GPU execution environment instead of creating a separate Windows-native GPU training runtime for MVP.
-- **FR-015**: The doctor flow MUST check Ubuntu Control OS, Python/runtime, remote access, network, dependencies, and disk readiness.
-- **FR-016**: The doctor flow MUST check Windows Worker version, Linux runtime availability, Ubuntu runtime distribution, remote access, NVIDIA driver, and GPU presence.
-- **FR-017**: The doctor flow MUST check Linux runtime GPU visibility, Python/runtime, training framework, CUDA availability, GPU name, VRAM, distributed backends, and network interface.
+- **FR-015**: The doctor flow MUST check Ubuntu Control OS, Conda availability, selected Conda environment, Python/runtime, remote access, network, dependencies, and disk readiness.
+- **FR-016**: The doctor flow MUST check Windows Worker version, Linux runtime availability, Ubuntu runtime distribution, remote access, NVIDIA driver, GPU presence, and must not treat Windows host Python as the WSL2 training Python.
+- **FR-017**: The doctor flow MUST check Linux runtime GPU visibility, Conda availability, selected Conda environment, Python/runtime, training framework, CUDA availability, GPU name, VRAM, distributed backends, and network interface.
 - **FR-018**: Bootstrap/setup actions MUST exist for Linux Control, Windows Worker, and Linux Worker Runtime.
 - **FR-019**: Bootstrap/setup actions MUST be idempotent where practical, verify every step, record versions, and fail with clear next action.
 - **FR-020**: Bootstrap/setup MUST pause and report manual instructions when administrator approval, reboot, BIOS changes, user passwords, or risky firewall changes are required.
+- **FR-020a**: All Python development and training environments MUST be managed with Conda using a Conda-first, reuse-first policy.
+- **FR-020b**: Before any environment operation, the system MUST detect the Conda executable, existing environments, active environment, environment prefix, Python executable, and relevant runtime versions.
+- **FR-020c**: Existing compatible Conda installations and environments MUST be reused; a ShardGrid-specific Conda environment may be created only when no existing environment satisfies the project requirements.
+- **FR-020d**: Conda is an environment management policy, not a fixed Conda or Python version requirement; Python versions may be constrained only by proven dependency compatibility.
 - **FR-021**: Worker Inventory MAY use simple configuration in the first stage and MUST support real-time probing from the Control node.
-- **FR-022**: WorkerResource MUST include worker ID, hostname, physical OS, runtime OS, IP, GPU name, total/free memory, utilization, compute capability, driver version, CUDA version, training runtime versions, backend availability, network interface, bandwidth, latency, and health.
+- **FR-022**: WorkerResource MUST include worker ID, hostname, physical OS, runtime OS, IP, Conda environment identity, Python executable/version, GPU name, total/free memory, utilization, compute capability, driver version, CUDA version, training runtime versions, backend availability, network interface, bandwidth, latency, and health.
 - **FR-023**: Network state MUST be treated as a first-class planning resource, not a secondary diagnostic-only detail.
 - **FR-024**: Network Probe MUST validate TCP connectivity, latency, and bandwidth between selected Workers.
 - **FR-025**: Network Probe MUST generate pairwise Worker-to-Worker network results for all relevant configured Workers.
 - **FR-026**: Network diagnostics MUST identify rendezvous address, selected interface, port, reachability, latency, bandwidth, and failure reason.
-- **FR-027**: The system MUST save each accepted training job under an immutable job snapshot containing code, config, plan, logs, checkpoint, and environment records.
+- **FR-027**: The system MUST save each accepted training job under an immutable job snapshot containing code, config, plan, logs, checkpoint, diagnostics, and environment records including Conda environment identity.
 - **FR-028**: Artifact distribution MUST use mature existing file transfer mechanisms and MUST NOT invent a custom transfer protocol.
-- **FR-029**: ExecutionPlan MUST be a stable JSON or YAML structure with job ID, engine, backend, world size, master address/port, worker assignments, rank, local rank, stage, and launch metadata.
+- **FR-029**: ExecutionPlan MUST be a stable JSON or YAML structure with job ID, engine, backend, world size, master address/port, worker assignments, rank, local rank, stage, Conda/runtime identity, and launch metadata.
 - **FR-030**: If a parallel engine generates its own plan, ShardGrid MUST save the original plan and add only placement/launch metadata required for execution.
 - **FR-031**: The first Planner MUST perform placement using WorkerResource, NetworkState, and parallel engine requirements.
 - **FR-032**: The first Planner MUST enforce memory eligibility, prefer fewer Workers, prefer faster networks, consider GPU performance as secondary, and allow manual override.
@@ -173,11 +179,11 @@
 - **FR-037**: The system MUST prove optimizer-managed parameters changed on the relevant stages.
 - **FR-038**: The system MUST mark the job unsuccessful if loss does not decrease by the configured threshold for the deterministic validation workload.
 - **FR-039**: Control Plane MUST launch all ranks from the Ubuntu Control node; the user MUST NOT manually log into each GPU Worker to start ranks.
-- **FR-040**: SSH-style launch MUST prepare Worker runtime, copy or expose snapshot, set up environment, start rank, collect PID, collect logs, report status, stop, and cleanup.
+- **FR-040**: SSH-style launch MUST prepare Worker runtime, resolve the selected Conda environment through runtime/platform abstraction, copy or expose snapshot, set up environment, start rank, collect PID, collect logs, report status, stop, and cleanup.
 - **FR-041**: The Control Plane MUST remain a simple first-stage system and MUST NOT require microservices to complete the MVP.
 - **FR-042**: The Control Plane MUST cover training submission, job management, worker probing, resource management, network probing, planning, parallel engine adaptation, execution plan management, artifact management, and launch.
 - **FR-043**: A Galvatron compatibility spike MUST be performed before selecting the first parallel engine path.
-- **FR-044**: The compatibility spike MUST cover installation, runtime versions, RTX 4060, GTX 1060, Linux runtime on Windows, multi-host, heterogeneous GPU, one-GPU-per-host, pipeline parallel behavior, profiler, search, runtime, and checkpoint.
+- **FR-044**: The compatibility spike MUST cover Conda environment identity, installation, runtime versions, RTX 4060, GTX 1060, Linux runtime on Windows, multi-host, heterogeneous GPU, one-GPU-per-host, pipeline parallel behavior, profiler, search, runtime, and checkpoint.
 - **FR-045**: If Galvatron satisfies the compatibility spike, ShardGrid MUST use it through an adapter instead of reimplementing its planning/runtime capabilities.
 - **FR-046**: If Galvatron does not satisfy the spike, ShardGrid MUST evaluate mature alternatives and record why the selected alternative was chosen.
 - **FR-047**: The system MUST NOT implement autograd, collective communication, CUDA kernels, CUDA allocators, custom NCCL, a full model-parallel framework, Kubernetes itself, or GPU virtualization in the first stage.
@@ -200,17 +206,17 @@
 - **Machine**: A physical computer in the ShardGrid environment; key attributes include machine ID, role, physical OS, reachability, and whether it is required for MVP success.
 - **Control Node**: The login/control machine responsible for user commands, job management, resource discovery, planning, artifact storage, launch, monitoring, and result collection.
 - **Worker**: A physical GPU host that can participate in training; key attributes include worker ID, hostname, physical OS, runtime OS, configured host, remote account reference, role, and health.
-- **Worker Runtime**: The Linux-compatible execution environment on a Worker; key attributes include runtime OS, GPU visibility, training runtime state, distributed backend state, and setup status.
+- **Worker Runtime**: The Linux-compatible execution environment on a Worker; key attributes include runtime OS, Conda executable, selected Conda environment or prefix, Python executable/version, GPU visibility, training runtime state, distributed backend state, and setup status.
 - **GPU Resource**: The GPU visible inside a Worker Runtime; key attributes include GPU name, total/free memory, utilization, compute capability, driver version, CUDA/runtime versions, and health.
-- **WorkerResource**: The complete resource record used by planning; key attributes include worker identity, OS/runtime fields, GPU fields, network fields, backend availability, and health.
+- **WorkerResource**: The complete resource record used by planning; key attributes include worker identity, OS/runtime fields, Conda/Python runtime identity, GPU fields, network fields, backend availability, and health.
 - **NetworkLink**: A directional or pairwise network measurement between Workers; key attributes include source, destination, selected interface, IP, port, reachability, latency, bandwidth, and failure reason.
 - **NetworkState**: The collection of Worker-to-Worker network measurements used by Planner and diagnostics.
 - **Training Job**: A user-submitted training request; key attributes include job ID, config, requested world size, selected model, status, timestamps, selected backend, and result summary.
-- **Job Snapshot**: Immutable per-job artifact storage; key attributes include code, config, plan, logs, checkpoint, environment, diagnostics, and source references.
+- **Job Snapshot**: Immutable per-job artifact storage; key attributes include code, config, plan, logs, checkpoint, Conda-backed environment snapshot, diagnostics, and source references.
 - **Parallel Engine Candidate**: A mature external training/planning option under evaluation; key attributes include name, version, compatibility status, supported capabilities, limitations, and report location.
 - **Compatibility Spike Report**: Evidence from testing a candidate component on the real ShardGrid environment; key attributes include tested machines, versions, commands, pass/fail results, blockers, and decision.
-- **ExecutionPlan**: The stable plan consumed by launchers; key attributes include job ID, engine, backend, world size, master address/port, worker assignments, ranks, local ranks, stages, placement reason, and launch metadata.
-- **Worker Assignment**: The mapping of a rank/stage to a Worker; key attributes include worker ID, rank, local rank, stage, GPU selection, environment, status, and logs.
+- **ExecutionPlan**: The stable plan consumed by launchers; key attributes include job ID, engine, backend, world size, master address/port, selected Conda/Python runtime identity, worker assignments, ranks, local ranks, stages, placement reason, and launch metadata.
+- **Worker Assignment**: The mapping of a rank/stage to a Worker; key attributes include worker ID, rank, local rank, stage, GPU selection, Conda/Python runtime identity, status, and logs.
 - **Launcher Backend**: A mechanism that executes an ExecutionPlan; key attributes include backend name, compatibility status, supported lifecycle actions, failure mode, and fallback state.
 - **Artifact Record**: A stored result or diagnostic tied to a job; key attributes include type, path, creation time, checksum or identity, and retrieval status.
 - **Training Result**: The final outcome of a training job; key attributes include forward success, transfer success, backward success, optimizer update confirmation, loss trend, checkpoint, backend labels, diagnostics, and final status.

@@ -19,6 +19,7 @@ class ProcessResult:
     stdout: str
     stderr: str
     timed_out: bool
+    runtime_environment: dict[str, str]
 
     @property
     def ok(self) -> bool:
@@ -61,6 +62,7 @@ def run_process(
     secrets: Sequence[str] = (),
     check: bool = False,
     encoding: str = "utf-8",
+    runtime_environment: Mapping[str, str] | None = None,
 ) -> ProcessResult:
     completed = None
     recorded_command = redact_command(command, secrets)
@@ -93,6 +95,7 @@ def run_process(
             stdout=completed.stdout,
             stderr=completed.stderr,
             timed_out=False,
+            runtime_environment={} if runtime_environment is None else dict(runtime_environment),
         )
     except subprocess.TimeoutExpired as exc:
         result = ProcessResult(
@@ -104,6 +107,7 @@ def run_process(
             stdout=_coerce_output(exc.stdout, encoding),
             stderr=_coerce_output(exc.stderr, encoding),
             timed_out=True,
+            runtime_environment={} if runtime_environment is None else dict(runtime_environment),
         )
         if check:
             raise ProcessTimeoutError(result) from exc

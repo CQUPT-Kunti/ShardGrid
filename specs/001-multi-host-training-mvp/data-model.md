@@ -111,6 +111,8 @@ Fields:
 - `machine_id`
 - `hostname`
 - `os_version`
+- `conda_environment`
+- `conda_prefix`
 - `python_version`
 - `ssh_available`
 - `git_available`
@@ -145,6 +147,8 @@ Fields:
 - `ssh_user_ref`
 - `runtime`: e.g. `wsl2`
 - `runtime_distro`
+- `conda_environment`
+- `conda_prefix`
 - `local_world_size`: default `1`
 - `enabled`
 - `health`
@@ -170,6 +174,12 @@ Fields:
 - `worker_id`
 - `runtime_os`
 - `runtime_version`
+- `environment_manager`: default `conda`
+- `conda_executable`
+- `conda_environment`
+- `conda_prefix`
+- `conda_active`
+- `python_executable`
 - `python_version`
 - `torch_version`
 - `torch_cuda_version`
@@ -227,6 +237,10 @@ Fields:
 - `hostname`
 - `physical_os`
 - `runtime_os`
+- `environment_manager`: default `conda`
+- `conda_environment`
+- `conda_prefix`
+- `python_executable`
 - `ip`
 - `gpu_name`
 - `gpu_total_memory`
@@ -253,6 +267,7 @@ Relationships:
 Validation:
 
 - Must include both physical and runtime OS.
+- Must include enough Conda/Python identity to reproduce the runtime used for probe or launch.
 - Must not be used for placement if health is not eligible.
 
 ### NetworkLink
@@ -433,6 +448,36 @@ Validation:
 - Snapshot paths must be under configured jobs root.
 - Existing snapshots must not be mutated except by appending logs/status/checkpoint metadata for the same job lifecycle.
 
+### EnvironmentSnapshot
+
+Stable record of the Python/runtime environment used by control checks, Worker
+probe, bootstrap, or training launch.
+
+Fields:
+
+- `snapshot_id`
+- `scope`: control, worker, job, or rank scope.
+- `environment_manager`: default `conda`.
+- `conda_executable`
+- `conda_environment`
+- `conda_prefix`
+- `python_executable`
+- `python_version`
+- `torch_version`
+- `torch_cuda_version`
+- `cuda_version`
+- `components`: additional detected component versions or `not_installed`/`not_checked` states.
+
+Relationships:
+
+- Stored under JobSnapshot `environment_path`.
+- Referenced by WorkerRuntime, WorkerResource, ExecutionPlan, and diagnostics.
+
+Validation:
+
+- Detection fields record actual observations, not desired versions.
+- Missing or unchecked components must be represented explicitly rather than fabricated.
+
 ### ExecutionPlan
 
 Stable launch plan consumed by launchers.
@@ -446,6 +491,9 @@ Fields:
 - `master.address`
 - `master.port`
 - `workers`
+- `conda_environment`
+- `conda_prefix`
+- `python_executable`
 - `placement_reason`
 - `parallel_plan_ref`
 - `snapshot_ref`
@@ -474,6 +522,9 @@ Fields:
 - `local_rank`
 - `stage`
 - `gpu_index`
+- `conda_environment`
+- `conda_prefix`
+- `python_executable`
 - `launch_command`
 - `environment`
 - `status`
@@ -558,6 +609,10 @@ Fields:
 - `exit_code`
 - `stdout_path`
 - `stderr_path`
+- `runtime_environment`
+- `python_executable`
+- `conda_environment`
+- `conda_prefix`
 - `message`
 - `recommended_action`
 - `retryable`
@@ -570,6 +625,7 @@ Relationships:
 Validation:
 
 - Any operation marked failed must include a stage and recommended action.
+- Diagnostics should distinguish system Python from the selected Conda Python when both are visible.
 
 ### TrainingResult
 
@@ -611,6 +667,10 @@ Fields:
 - `platform`
 - `shell`
 - `path_rules`
+- `environment_manager`
+- `conda_executable`
+- `conda_environment`
+- `conda_prefix`
 - `supports_bootstrap`
 - `supports_probe`
 - `manual_action_rules`

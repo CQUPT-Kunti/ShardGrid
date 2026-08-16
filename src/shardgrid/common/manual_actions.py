@@ -50,6 +50,19 @@ _RULES = (
             "have an operator review the firewall change and apply it manually if approved"
         ),
     ),
+    ManualActionRule(
+        category="conda_install_or_env_create",
+        tokens=(
+            "install conda",
+            "conda create",
+            "delete conda environment",
+            "overwrite conda environment",
+        ),
+        recommended_action=(
+            "detect existing Conda installations and environments first; ask an operator "
+            "before installing Conda or creating/replacing an environment"
+        ),
+    ),
 )
 
 

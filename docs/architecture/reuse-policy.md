@@ -14,6 +14,7 @@ ShardGrid does not own or reimplement these layers:
 
 - SSH / OpenSSH
 - File transfer protocols
+- Conda and Conda dependency solving
 - WSL2
 - PyTorch Distributed
 - NCCL / Gloo
@@ -43,7 +44,8 @@ The base `shardgrid` package must stay light:
 
 - Base installation must not require Kubernetes, Volcano, HAMi, Galvatron, PyTorch, CUDA, or other late-phase platform/runtime components
 - Those integrations belong in optional dependency groups or future adapter-specific packages
-- A compatible existing local Python/tooling environment should be reused when available; recommended versions are guidance, not a reason to reinstall or force a specific patch release
+- A compatible existing Conda installation and Conda environment should be reused when available; recommended versions are guidance, not a reason to reinstall or force a specific Python/Conda patch release
+- A ShardGrid-specific Conda environment is created only when no existing environment satisfies current dependencies, and never by deleting or overwriting user environments
 
 Current packaging boundary:
 

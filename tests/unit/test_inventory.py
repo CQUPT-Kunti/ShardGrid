@@ -34,6 +34,7 @@ workers:
     runtime: wsl2
     host: machine-c.local
     ssh_user: shardgrid
+    conda_environment: shardgrid-worker
     local_world_size: 1
     enabled: true
   - id: gpu1060
@@ -77,6 +78,7 @@ def test_load_inventory_supports_required_and_optional_workers(tmp_path: Path) -
     ]
     assert [str(worker_id) for worker_id in inventory.preferred_workers] == ["gpu4060", "gpu1060"]
     assert inventory.identify_worker("gpu1060").host == "machine-d-override.local"
+    assert inventory.identify_worker("gpu4060").conda_environment == "shardgrid-worker"
 
 
 def test_inventory_rejects_duplicate_worker_ids(tmp_path: Path) -> None:

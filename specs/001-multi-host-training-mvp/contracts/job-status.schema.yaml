@@ -102,6 +102,22 @@ properties:
         type:
           - string
           - "null"
+      runtime_environment:
+        type: object
+        additionalProperties:
+          type: string
+      python_executable:
+        type:
+          - string
+          - "null"
+      conda_environment:
+        type:
+          - string
+          - "null"
+      conda_prefix:
+        type:
+          - string
+          - "null"
       message:
         type: string
         minLength: 1

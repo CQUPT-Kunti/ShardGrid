@@ -18,8 +18,11 @@ def test_load_cluster_config_from_example() -> None:
 
     assert config.control.machine_id == "machine-a"
     assert str(config.jobs_root) == "/var/tmp/shardgrid/jobs"
+    assert config.runtime.environment_manager == "conda"
+    assert config.runtime.conda_environment is None
     assert len(config.workers) == 3
     assert [worker.worker_id for worker in config.workers[:2]] == ["gpu4060", "gpu1060"]
+    assert config.workers[0].conda_environment is None
     assert config.workers[2].enabled is False
 
 

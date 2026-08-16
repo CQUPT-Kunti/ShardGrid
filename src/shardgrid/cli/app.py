@@ -27,6 +27,14 @@ def build_parser() -> CLIArgumentParser:
     parser = CLIArgumentParser(prog="shardgrid", description="ShardGrid control-plane CLI")
     parser.add_argument("--config", help="Path to cluster configuration")
     parser.add_argument("--jobs-root", help="Override jobs root directory")
+    parser.add_argument(
+        "--conda-env",
+        help="Override Conda environment name for Python/runtime commands",
+    )
+    parser.add_argument(
+        "--conda-prefix",
+        help="Override Conda environment prefix for Python/runtime commands",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--json", action="store_true", help="Emit structured JSON output")
     subparsers = parser.add_subparsers(dest="command")
@@ -43,6 +51,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         context = resolve_cli_context(
             config=namespace.config,
             jobs_root=namespace.jobs_root,
+            conda_env=namespace.conda_env,
+            conda_prefix=namespace.conda_prefix,
             verbose=namespace.verbose,
             json_output=namespace.json,
         )

@@ -5,15 +5,17 @@
 - Only real execution can produce `PASS`
 - Missing hardware or platform prerequisites must remain `PENDING`, `SKIPPED`, or `BLOCKED`
 - Non-hardware quality checks run separately from later platform gates
+- Python checks run inside a detected, reused, compatible Conda environment where available
 
 ## Baseline Automated Quality
 
 | Scope | Environment | Commands | Current Status |
 |---|---|---|---|
-| Package install and import | Ubuntu CI / Windows CI | `python -m pip install -e ".[dev]"`, `python -c "import shardgrid"` | Configured in workflow |
-| Unit and local pytest | Ubuntu CI / Windows CI | `pytest -q` | Configured in workflow |
-| Lint | Ubuntu CI / Windows CI | `ruff check` | Configured in workflow |
-| Type check | Ubuntu CI / Windows CI | `mypy` | Configured in workflow |
+| Conda detection | Ubuntu CI / Windows CI | `conda info`, `conda env list`, `command -v python` | Configured in workflow |
+| Package install and import | Ubuntu CI / Windows CI Conda env | `python -m pip install -e ".[dev]"`, `python -c "import shardgrid"` | Configured in workflow |
+| Unit and local pytest | Ubuntu CI / Windows CI Conda env | `pytest -q` | Configured in workflow |
+| Lint | Ubuntu CI / Windows CI Conda env | `ruff check` | Configured in workflow |
+| Type check | Ubuntu CI / Windows CI Conda env | `mypy` | Configured in workflow |
 
 These checks are intended to run without GPU, CUDA, WSL2, Kubernetes, Volcano, HAMi, or Galvatron.
 
@@ -34,12 +36,18 @@ These checks are intended to run without GPU, CUDA, WSL2, Kubernetes, Volcano, H
 Default local development on Ubuntu Machine A should be able to run:
 
 ```bash
-python3 -m pip install -e ".[dev]"
-python3 -c "import shardgrid; print(shardgrid.__file__)"
+command -v conda
+conda info
+python -m pip install -e ".[dev]"
+python -c "import shardgrid; print(shardgrid.__file__)"
 pytest -q
 ruff check
 mypy
 ```
+
+Use the already active compatible Conda environment when possible. Creating a new
+ShardGrid Conda environment is reserved for cases where no existing environment
+satisfies project dependencies.
 
 Default local runs must not require:
 

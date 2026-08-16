@@ -25,7 +25,10 @@ Do not describe later phases as available until their compatibility gates and im
 
 - Prefer mature components and existing platform capabilities over ShardGrid-owned replacements
 - Do not reimplement SSH, distributed runtimes, Kubernetes, Volcano, HAMi, or GPU virtualization when an adapter boundary is sufficient
-- Reuse a compatible installed Python/tooling environment when available; do not force one exact patch release without a demonstrated compatibility reason
+- Manage all Python development and training environments through Conda
+- Detect Conda before any environment operation, reuse compatible existing Conda environments, and create a ShardGrid-specific environment only when needed
+- Do not force one exact Python or Conda version without a demonstrated compatibility reason
+- For Windows GPU Workers, treat Windows host access and WSL2 Linux training Conda environments as separate runtime layers
 
 ## Working References
 

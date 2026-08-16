@@ -26,7 +26,9 @@ This repository does not claim those later platform paths are available yet.
 - Use the existing `src` layout: `src/shardgrid/`
 - Prefer mature components and adapters over custom reimplementation
 - Keep machine addresses, users, paths, ports, and runtime details configurable
-- Reuse a compatible local Python environment when available instead of forcing one exact patch/minor version
+- Manage Python development and training environments with Conda
+- Detect Conda first, reuse a compatible existing Conda environment when available, and create a ShardGrid environment only when needed
+- Do not force one exact Python or Conda version without a demonstrated compatibility reason
 
 ## Project Pointers
 
@@ -40,11 +42,17 @@ This repository does not claim those later platform paths are available yet.
 These commands are expected to work on Ubuntu Machine A in the current repository state:
 
 ```bash
-python3 -m pip install -e .
-python3 -c "import shardgrid; print(shardgrid.__file__)"
+command -v conda
+conda info
+python -m pip install -e .
+python -c "import shardgrid; print(shardgrid.__file__)"
 pytest
 ruff check
 mypy
 ```
+
+Run them from the selected compatible Conda environment. If no compatible Conda
+environment exists yet, bootstrap should create one only after checking existing
+Conda installations and without deleting user environments.
 
 Commands such as `shardgrid doctor`, distributed training, SSH launch, Kubernetes, Volcano, and HAMi flows are planned but not implemented yet.

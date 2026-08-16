@@ -12,7 +12,14 @@ from shardgrid.engines.models import (
     ParallelEngineCandidate,
     ParallelPlan,
 )
-from shardgrid.jobs.models import FailureRecord, JobSnapshot, JobStatus, TrainingJob, TrainingResult
+from shardgrid.jobs.models import (
+    EnvironmentSnapshot,
+    FailureRecord,
+    JobSnapshot,
+    JobStatus,
+    TrainingJob,
+    TrainingResult,
+)
 from shardgrid.planner.models import (
     ExecutionPlan,
     MasterMetadata,
@@ -29,9 +36,23 @@ def test_execution_plan_round_trip_and_constraints() -> None:
         world_size=2,
         master=MasterMetadata(address="10.0.0.13", port=29500),
         workers=[
-            WorkerAssignment(worker_id=as_worker_id("gpu4060"), rank=0, stage="0"),
-            WorkerAssignment(worker_id=as_worker_id("gpu1060"), rank=1, stage="1"),
+            WorkerAssignment(
+                worker_id=as_worker_id("gpu4060"),
+                rank=0,
+                stage="0",
+                conda_environment="shardgrid-worker",
+                python_executable="python",
+            ),
+            WorkerAssignment(
+                worker_id=as_worker_id("gpu1060"),
+                rank=1,
+                stage="1",
+                conda_environment="shardgrid-worker",
+                python_executable="python",
+            ),
         ],
+        conda_environment="shardgrid-worker",
+        python_executable="python",
         labels={"backend_result": "gloo_fallback"},
     )
 
@@ -41,6 +62,7 @@ def test_execution_plan_round_trip_and_constraints() -> None:
     assert restored.world_size == 2
     assert [item.rank for item in restored.workers] == [0, 1]
     assert all(item.local_rank == 0 for item in restored.workers)
+    assert restored.conda_environment == "shardgrid-worker"
 
 
 def test_execution_plan_rejects_duplicate_rank_and_nonzero_local_rank() -> None:
@@ -112,6 +134,8 @@ def test_failure_and_completion_requirements_are_enforced() -> None:
         worker_id=as_worker_id("gpu4060"),
         message="ssh launch failed",
         recommended_action="inspect remote logs and ssh access",
+        conda_environment="shardgrid-worker",
+        python_executable="python",
         retryable=True,
     )
     failed_status = JobStatus(
@@ -174,6 +198,7 @@ def test_engine_and_platform_models_cover_experimental_fallback_and_blocked() ->
         platform="wsl2_linux",
         shell="/bin/bash",
         path_rules="posix",
+        conda_environment="shardgrid-worker",
         supports_bootstrap=True,
         supports_probe=True,
         manual_action_rules=["admin_required", "reboot_required"],
@@ -206,11 +231,25 @@ def test_engine_and_platform_models_cover_experimental_fallback_and_blocked() ->
         stages=["0", "1"],
         limitations=["static validation only"],
     )
+    environment_snapshot = EnvironmentSnapshot(
+        snapshot_id="env-1",
+        scope="worker:gpu4060",
+        conda_executable="/opt/conda/bin/conda",
+        conda_environment="shardgrid-worker",
+        conda_prefix="/opt/conda/envs/shardgrid-worker",
+        python_executable="python",
+        python_version="3.13.5",
+        torch_version="2.5.1",
+        torch_cuda_version="12.4",
+        cuda_version="12.4",
+    )
 
     assert candidate.status is BackendStatus.EXPERIMENTAL
     assert report.status is BackendStatus.BLOCKED
     assert result.backend_label == "gloo_fallback"
     assert platform.supports_probe is True
+    assert platform.conda_environment == "shardgrid-worker"
     assert share.isolation_status == "not_enabled"
     assert snapshot.root_path.endswith("job-0001")
     assert parallel_plan.world_size == 2
+    assert EnvironmentSnapshot.from_dict(environment_snapshot.to_dict()) == environment_snapshot

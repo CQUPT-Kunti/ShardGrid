@@ -19,6 +19,8 @@ EXIT_CONFIG_ERROR = 3
 class CLIContext:
     config_path: Path | None
     jobs_root: Path | None
+    conda_env: str | None = None
+    conda_prefix: Path | None = None
     verbose: bool = False
     json_output: bool = False
 
@@ -32,12 +34,16 @@ def resolve_cli_context(
     *,
     config: str | None,
     jobs_root: str | None,
-    verbose: bool,
-    json_output: bool,
+    conda_env: str | None = None,
+    conda_prefix: str | None = None,
+    verbose: bool = False,
+    json_output: bool = False,
 ) -> CLIContext:
     return CLIContext(
         config_path=None if config is None else Path(config),
         jobs_root=None if jobs_root is None else Path(jobs_root),
+        conda_env=conda_env,
+        conda_prefix=None if conda_prefix is None else Path(conda_prefix),
         verbose=verbose,
         json_output=json_output,
     )

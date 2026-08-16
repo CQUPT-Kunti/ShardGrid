@@ -156,6 +156,10 @@ class SSHConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     python_executable: str = "python3"
+    environment_manager: str = "conda"
+    conda_executable: str | None = None
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
     linux_shell: str = "/bin/bash"
     windows_shell: str = "powershell.exe"
     wsl_shell: str = "/bin/bash"
@@ -169,6 +173,22 @@ class RuntimeConfig:
             python_executable=_require_string(
                 payload.get("python_executable", "python3"),
                 field_name="runtime.python_executable",
+            ),
+            environment_manager=_require_string(
+                payload.get("environment_manager", "conda"),
+                field_name="runtime.environment_manager",
+            ),
+            conda_executable=_optional_string(
+                payload.get("conda_executable"),
+                field_name="runtime.conda_executable",
+            ),
+            conda_environment=_optional_string(
+                payload.get("conda_environment"),
+                field_name="runtime.conda_environment",
+            ),
+            conda_prefix=_optional_string(
+                payload.get("conda_prefix"),
+                field_name="runtime.conda_prefix",
             ),
             linux_shell=_require_string(
                 payload.get("linux_shell", "/bin/bash"), field_name="runtime.linux_shell"
@@ -301,6 +321,8 @@ class WorkerConfig:
     ssh_user: str
     ssh_port: int = 22
     runtime_distro: str | None = None
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
     local_world_size: int = 1
     enabled: bool = True
     labels: dict[str, str] = field(default_factory=dict)
@@ -332,6 +354,12 @@ class WorkerConfig:
             runtime_distro=_optional_string(
                 payload.get("runtime_distro"), field_name="worker.runtime_distro"
             ),
+            conda_environment=_optional_string(
+                payload.get("conda_environment"), field_name="worker.conda_environment"
+            ),
+            conda_prefix=_optional_string(
+                payload.get("conda_prefix"), field_name="worker.conda_prefix"
+            ),
             local_world_size=_require_int(
                 payload.get("local_world_size", 1),
                 field_name="worker.local_world_size",
@@ -351,6 +379,8 @@ class WorkerConfig:
             "ssh_user": self.ssh_user,
             "ssh_port": self.ssh_port,
             "runtime_distro": self.runtime_distro,
+            "conda_environment": self.conda_environment,
+            "conda_prefix": self.conda_prefix,
             "local_world_size": self.local_world_size,
             "enabled": self.enabled,
             "labels": dict(self.labels),

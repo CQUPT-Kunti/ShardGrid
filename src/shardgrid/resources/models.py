@@ -69,6 +69,10 @@ class WorkerResource:
     hostname: Hostname
     physical_os: PhysicalOS
     runtime_os: RuntimeOS
+    environment_manager: str = "conda"
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
+    python_executable: str | None = None
     ip: str | None = None
     gpu_name: str | None = None
     gpu_total_memory: int | None = None
@@ -97,6 +101,10 @@ class WorkerResource:
             hostname=as_hostname(str(data["hostname"])),
             physical_os=PhysicalOS(data["physical_os"]),
             runtime_os=RuntimeOS(data["runtime_os"]),
+            environment_manager=str(data.get("environment_manager", "conda")),
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
+            python_executable=data.get("python_executable"),
             ip=data.get("ip"),
             gpu_name=data.get("gpu_name"),
             gpu_total_memory=_optional_int(data, "gpu_total_memory"),

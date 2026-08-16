@@ -29,6 +29,8 @@ def _as_worker(config: WorkerConfig) -> Worker:
         ssh_user_ref=config.ssh_user,
         runtime=config.runtime,
         runtime_distro=config.runtime_distro,
+        conda_environment=config.conda_environment,
+        conda_prefix=config.conda_prefix,
         local_world_size=config.local_world_size,
         enabled=config.enabled,
         health=Health.UNKNOWN,

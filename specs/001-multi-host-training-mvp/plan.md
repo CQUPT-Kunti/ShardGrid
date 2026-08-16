@@ -14,9 +14,9 @@ The core architectural rule is adapter-first reuse. ShardGrid owns orchestration
 
 ## Technical Context
 
-**Language/Version**: Python 3.11 as the initial control-plane and worker-runtime target; PowerShell 5+/7 for Windows bootstrap; Bash for Ubuntu/WSL bootstrap. Python 3.12 may be enabled after PyTorch and selected engine compatibility is proven.
+**Language/Version**: Python from the selected Conda-managed development or training environment; no fixed Python or Conda version is required unless a dependency compatibility check proves it. PowerShell 5+/7 is used for Windows bootstrap; Bash is used for Ubuntu/WSL bootstrap.
 
-**Primary Dependencies**: Typer or Click for CLI; Pydantic for schemas; PyYAML for config; Rich or standard logging for human output; pytest for tests; system OpenSSH/SCP/SFTP/rsync for remote execution and transfer; iperf3/ping/system network tools for probing; PyTorch distributed and torchrun for training runtime; NCCL first and Gloo fallback; Galvatron compatibility spike first, then DeepSpeed Pipeline, PyTorch pipeline APIs, and nnScaler as ordered alternatives; Kubernetes Python client or kubectl manifests for Stage D; official Volcano and HAMi distributions for later stages.
+**Primary Dependencies**: Existing Conda installation and compatible Conda environments are reused first for Python development and training; Typer or Click for CLI; Pydantic for schemas; PyYAML for config; Rich or standard logging for human output; pytest for tests; system OpenSSH/SCP/SFTP/rsync for remote execution and transfer; iperf3/ping/system network tools for probing; PyTorch distributed and torchrun for training runtime inside the selected Conda environment; NCCL first and Gloo fallback; Galvatron compatibility spike first, then DeepSpeed Pipeline, PyTorch pipeline APIs, and nnScaler as ordered alternatives; Kubernetes Python client or kubectl manifests for Stage D; official Volcano and HAMi distributions for later stages.
 
 **Storage**: Stage A-C use local filesystem snapshots on the Ubuntu control node under configurable `jobs/<job-id>/`. Stage D may add NFS through an `ArtifactStore` interface. Future artifact backends may include S3 or MinIO without changing job semantics.
 
@@ -28,7 +28,7 @@ The core architectural rule is adapter-first reuse. ShardGrid owns orchestration
 
 **Performance Goals**: The supported validation model completes forward, activation transfer, loss, backward, gradient transfer, optimizer step, and checkpoint across RTX 4060 plus GTX 1060 within 15 minutes. Distributed process group initialization succeeds within 2 minutes or fails with diagnostics. Worker inventory succeeds in at least 95% of repeated discovery attempts on a stable LAN.
 
-**Constraints**: One GPU per physical Worker; default `local_world_size = 1`; no hard-coded paths, users, drive letters, IPs, or ports; all addresses and paths configurable; no manual rank launch by the user; no Kubernetes/Volcano/HAMi dependency before the SSH backend proves real training; stop any automated setup step that requires administrator approval, reboot, BIOS changes, password entry, or risky firewall changes.
+**Constraints**: One GPU per physical Worker; default `local_world_size = 1`; no hard-coded paths, users, drive letters, IPs, ports, Conda prefixes, environment names, or Python executables; all addresses, paths, and runtime environment selections are configurable or detected; no manual rank launch by the user; no Kubernetes/Volcano/HAMi dependency before the SSH backend proves real training; stop any automated setup step that requires administrator approval, reboot, BIOS changes, password entry, risky firewall changes, Conda installation with elevated permissions, or destructive environment replacement.
 
 **Scale/Scope**: First formal MVP covers Machine A, Machine C, Machine D, and optional Machine E. Stage C supports a small number of configured one-GPU Workers and one active validation job at a time. Stage E expands to multi-job and multi-user simulation, not production multi-tenancy.
 
@@ -41,6 +41,7 @@ The project constitution file is still the unratified template, so there are no 
 Feature gates derived from the specification:
 
 - **Reuse-first gate**: Pass. All external capabilities are integrated through adapters and mature upstream tools.
+- **Conda-first environment gate**: Pass. Python development and training environments are Conda-managed, existing compatible Conda installations/environments are reused, and Conda is not treated as a fixed version requirement.
 - **Training-first gate**: Pass. Stage B and Stage C must complete SSH-backed real training before Kubernetes becomes a candidate main path.
 - **One-GPU-per-host gate**: Pass. Resource and launch models default to one GPU per physical Worker.
 - **Cross-platform gate**: Pass. `physical_os` and `runtime_os` are modeled separately and platform commands are isolated behind adapters.
@@ -162,13 +163,14 @@ docs/
 
 **Implementation Work**:
 
-- Create repository layout and Python packaging.
+- Create repository layout and Python packaging without pinning a Python minor version.
+- Detect Conda before environment operations, reuse an existing compatible Conda environment when available, and record the selected environment identity for local quality checks.
 - Define `PlatformAdapter` with `LinuxPlatform`, `WindowsPlatform`, and `WSLPlatform`.
 - Define command execution result types that always capture stage, host, command, exit code, stdout, stderr, and recommended action.
 - Implement bootstrap scripts:
-  - `scripts/bootstrap-linux.sh`: Python, Git, OpenSSH client/server as needed, iperf3, basic system packages.
+  - `scripts/bootstrap-linux.sh`: Conda detection/reuse, selected Python environment, Git, OpenSSH client/server as needed, iperf3, basic system packages.
   - `scripts/bootstrap-windows.ps1`: OpenSSH, WSL2 detection, Ubuntu distro detection, NVIDIA driver compatibility checks, safe/manual blockers.
-  - `scripts/bootstrap-wsl.sh`: Python, package manager, PyTorch install path, CUDA visibility, iperf3, runtime dependencies.
+  - `scripts/bootstrap-wsl.sh`: Conda detection/reuse inside WSL2, selected Python/PyTorch environment, CUDA visibility, iperf3, runtime dependencies.
 - Implement `shardgrid doctor` across Control, Windows Worker, and WSL runtime.
 - Implement config loading for workers and train configs with validation.
 
@@ -187,12 +189,13 @@ docs/
 - Gate A passed on Machine A, C, and D.
 - Control can authenticate to GPU Workers.
 - WSL runtime can see CUDA on each GPU Worker.
+- Each training runtime has a detected Conda executable and either a compatible reused Conda environment or a newly created ShardGrid environment with recorded evidence.
 
 **Implementation Work**:
 
 - Implement `Worker Inventory` from YAML configuration.
 - Implement `SSHTransport` using system OpenSSH first, with structured command results.
-- Implement Worker Probe over SSH -> WSL for GPU, VRAM, driver, CUDA, PyTorch, NCCL/Gloo, IP, and selected network interface.
+- Implement Worker Probe over SSH -> WSL for Conda executable, available environments, active environment, Python executable/version, PyTorch, GPU, VRAM, driver, CUDA, NCCL/Gloo, IP, and selected network interface.
 - Implement Network Probe using iperf3 and ping/system tools for pairwise latency and bandwidth.
 - Implement `shardgrid dist-test`:
   - `world_size = 2`.
@@ -224,7 +227,7 @@ docs/
 
 **Implementation Work**:
 
-- Define serializable entities: `TrainingJob`, `WorkerResource`, `NetworkState`, `ParallelPlan`, `ExecutionPlan`, `JobStatus`, `TrainingResult`, and `CompatibilityReport`.
+- Define serializable entities: `TrainingJob`, `WorkerResource`, `NetworkState`, `ParallelPlan`, `ExecutionPlan`, `JobStatus`, `TrainingResult`, `EnvironmentSnapshot`, and `CompatibilityReport`.
 - Implement local file snapshot under configurable `jobs/<job-id>/`.
 - Implement `ArtifactStore` and `ArtifactTransport`:
   - Stage C concrete transport: SSH/SCP/SFTP/rsync.

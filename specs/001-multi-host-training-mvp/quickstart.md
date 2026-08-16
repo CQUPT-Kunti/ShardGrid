@@ -4,6 +4,11 @@ This quickstart describes the intended validation flow after implementation task
 
 ## Stage A - Foundation
 
+All Python commands are expected to run from a detected, compatible Conda
+environment. Bootstrap checks must detect Conda first, reuse existing compatible
+environments, and create a ShardGrid environment only when no existing environment
+fits.
+
 1. On Machine A, prepare the Ubuntu control node:
 
    ```bash
@@ -34,6 +39,8 @@ Expected result:
 - Machine A reports Control readiness.
 - Machine C reports Windows + WSL2 + RTX 4060 runtime readiness.
 - Machine D reports Windows + WSL2 + GTX 1060 runtime readiness.
+- Reports include Conda executable, selected environment, environment prefix,
+  Python, PyTorch, and CUDA/runtime fields where checked.
 - Any manual action is explicit and not marked successful.
 
 ## Stage B - Real Multi-Host GPU Training

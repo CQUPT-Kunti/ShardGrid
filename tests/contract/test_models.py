@@ -10,7 +10,7 @@ from shardgrid.common.models import (
     as_job_id,
     as_worker_id,
 )
-from shardgrid.jobs.models import FailureRecord, JobStatus
+from shardgrid.jobs.models import EnvironmentSnapshot, FailureRecord, JobStatus
 from shardgrid.planner.models import ExecutionPlan, MasterMetadata, WorkerAssignment
 from shardgrid.resources.models import NetworkLink, NetworkState, WorkerResource
 
@@ -21,6 +21,8 @@ def test_worker_resource_contract_round_trip() -> None:
         hostname=as_hostname("machine-c.local"),
         physical_os=PhysicalOS.WINDOWS,
         runtime_os=RuntimeOS.WSL2_LINUX,
+        conda_environment="shardgrid-worker",
+        python_executable="python",
         ip="192.168.1.30",
         gpu_name="RTX 4060",
         gpu_total_memory=8192,
@@ -33,6 +35,7 @@ def test_worker_resource_contract_round_trip() -> None:
     assert WorkerResource.from_dict(payload) == resource
     assert payload["physical_os"] == "windows"
     assert payload["runtime_os"] == "wsl2_linux"
+    assert payload["conda_environment"] == "shardgrid-worker"
 
 
 def test_network_state_contract_round_trip() -> None:
@@ -65,9 +68,18 @@ def test_execution_plan_contract_round_trip_preserves_backend_labels() -> None:
         world_size=2,
         master=MasterMetadata(address="192.168.1.30", port=29500),
         workers=[
-            WorkerAssignment(worker_id=as_worker_id("gpu4060"), rank=0),
-            WorkerAssignment(worker_id=as_worker_id("gpu1060"), rank=1),
+            WorkerAssignment(
+                worker_id=as_worker_id("gpu4060"),
+                rank=0,
+                conda_environment="shardgrid-worker",
+            ),
+            WorkerAssignment(
+                worker_id=as_worker_id("gpu1060"),
+                rank=1,
+                conda_environment="shardgrid-worker",
+            ),
         ],
+        conda_environment="shardgrid-worker",
         labels={"backend_label": "nccl", "fallback": "false"},
     )
 
@@ -76,6 +88,7 @@ def test_execution_plan_contract_round_trip_preserves_backend_labels() -> None:
 
     assert restored == plan
     assert restored.labels["backend_label"] == "nccl"
+    assert restored.conda_environment == "shardgrid-worker"
 
 
 def test_execution_plan_contract_rejects_invalid_states() -> None:
@@ -143,6 +156,8 @@ def test_job_status_contract_failure_record_round_trip() -> None:
         exit_code=1,
         stdout_path="/tmp/stdout.log",
         stderr_path="/tmp/stderr.log",
+        conda_environment="shardgrid-worker",
+        python_executable="python",
         message="rendezvous failed",
         recommended_action="check master address and port",
         retryable=True,
@@ -157,3 +172,25 @@ def test_job_status_contract_failure_record_round_trip() -> None:
     restored = JobStatus.from_dict(status.to_dict())
 
     assert restored.failure == failure
+    assert restored.failure.conda_environment == "shardgrid-worker"
+
+
+def test_environment_snapshot_contract_records_conda_identity() -> None:
+    snapshot = EnvironmentSnapshot(
+        snapshot_id="env-worker-gpu4060",
+        scope="worker:gpu4060",
+        conda_executable="/opt/conda/bin/conda",
+        conda_environment="shardgrid-worker",
+        conda_prefix="/opt/conda/envs/shardgrid-worker",
+        python_executable="python",
+        python_version="3.13.5",
+        torch_version="2.5.1",
+        torch_cuda_version="12.4",
+        cuda_version="12.4",
+    )
+
+    payload = snapshot.to_dict()
+
+    assert EnvironmentSnapshot.from_dict(payload) == snapshot
+    assert payload["environment_manager"] == "conda"
+    assert payload["conda_environment"] == "shardgrid-worker"

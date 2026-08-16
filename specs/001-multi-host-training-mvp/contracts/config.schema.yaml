@@ -59,6 +59,15 @@ schemas:
       python_executable:
         type: string
         default: python3
+      environment_manager:
+        type: string
+        default: conda
+      conda_executable:
+        type: [string, "null"]
+      conda_environment:
+        type: [string, "null"]
+      conda_prefix:
+        type: [string, "null"]
       linux_shell:
         type: string
         default: /bin/bash
@@ -147,6 +156,10 @@ schemas:
         type: integer
         default: 22
       runtime_distro:
+        type: [string, "null"]
+      conda_environment:
+        type: [string, "null"]
+      conda_prefix:
         type: [string, "null"]
       local_world_size:
         type: integer

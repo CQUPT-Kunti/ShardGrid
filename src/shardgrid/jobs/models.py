@@ -63,6 +63,10 @@ class FailureRecord:
     exit_code: int | None = None
     stdout_path: str | None = None
     stderr_path: str | None = None
+    runtime_environment: dict[str, str] = field(default_factory=dict)
+    python_executable: str | None = None
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
     message: str = ""
     recommended_action: str = ""
     retryable: bool = False
@@ -91,6 +95,13 @@ class FailureRecord:
             exit_code=_optional_int(data, "exit_code"),
             stdout_path=data.get("stdout_path"),
             stderr_path=data.get("stderr_path"),
+            runtime_environment={
+                str(key): str(value)
+                for key, value in data.get("runtime_environment", {}).items()
+            },
+            python_executable=data.get("python_executable"),
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
             message=str(data["message"]),
             recommended_action=str(data["recommended_action"]),
             retryable=bool(data.get("retryable", False)),
@@ -214,6 +225,42 @@ class JobSnapshot:
             checkpoint_path=str(data["checkpoint_path"]),
             diagnostics_path=str(data["diagnostics_path"]),
             created_at=data.get("created_at"),
+        )
+
+
+@dataclass(frozen=True)
+class EnvironmentSnapshot:
+    snapshot_id: str
+    scope: str
+    environment_manager: str = "conda"
+    conda_executable: str | None = None
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
+    python_executable: str | None = None
+    python_version: str | None = None
+    torch_version: str | None = None
+    torch_cuda_version: str | None = None
+    cuda_version: str | None = None
+    components: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EnvironmentSnapshot":
+        return cls(
+            snapshot_id=str(data["snapshot_id"]),
+            scope=str(data["scope"]),
+            environment_manager=str(data.get("environment_manager", "conda")),
+            conda_executable=data.get("conda_executable"),
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
+            python_executable=data.get("python_executable"),
+            python_version=data.get("python_version"),
+            torch_version=data.get("torch_version"),
+            torch_cuda_version=data.get("torch_cuda_version"),
+            cuda_version=data.get("cuda_version"),
+            components={str(key): str(value) for key, value in data.get("components", {}).items()},
         )
 
 

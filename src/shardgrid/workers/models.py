@@ -73,6 +73,8 @@ class ControlNode:
     jobs_root: Path
     disk_free_bytes: int
     health: Health = Health.UNKNOWN
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)
@@ -90,6 +92,8 @@ class ControlNode:
             jobs_root=Path(str(data["jobs_root"])),
             disk_free_bytes=int(data["disk_free_bytes"]),
             health=Health(data.get("health", Health.UNKNOWN.value)),
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
         )
 
 
@@ -107,6 +111,8 @@ class Worker:
     local_world_size: int = 1
     enabled: bool = True
     health: Health = Health.UNKNOWN
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)
@@ -126,6 +132,8 @@ class Worker:
             local_world_size=int(data.get("local_world_size", 1)),
             enabled=bool(data.get("enabled", True)),
             health=Health(data.get("health", Health.UNKNOWN.value)),
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
         )
 
 
@@ -134,6 +142,12 @@ class WorkerRuntime:
     worker_id: WorkerId
     runtime_os: RuntimeOS
     runtime_version: str | None = None
+    environment_manager: str = "conda"
+    conda_executable: str | None = None
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
+    conda_active: bool = False
+    python_executable: str | None = None
     python_version: str | None = None
     torch_version: str | None = None
     torch_cuda_version: str | None = None
@@ -153,6 +167,12 @@ class WorkerRuntime:
             worker_id=as_worker_id(str(data["worker_id"])),
             runtime_os=RuntimeOS(data["runtime_os"]),
             runtime_version=data.get("runtime_version"),
+            environment_manager=str(data.get("environment_manager", "conda")),
+            conda_executable=data.get("conda_executable"),
+            conda_environment=data.get("conda_environment"),
+            conda_prefix=data.get("conda_prefix"),
+            conda_active=bool(data.get("conda_active", False)),
+            python_executable=data.get("python_executable"),
             python_version=data.get("python_version"),
             torch_version=data.get("torch_version"),
             torch_cuda_version=data.get("torch_cuda_version"),

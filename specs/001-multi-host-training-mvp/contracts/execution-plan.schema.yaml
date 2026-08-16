@@ -61,6 +61,18 @@ properties:
         gpu_index:
           type: integer
           minimum: 0
+        conda_environment:
+          type:
+            - string
+            - "null"
+        conda_prefix:
+          type:
+            - string
+            - "null"
+        python_executable:
+          type:
+            - string
+            - "null"
         launch_command:
           type:
             - string
@@ -81,6 +93,18 @@ properties:
             - "null"
       additionalProperties: false
   placement_reason:
+    type:
+      - string
+      - "null"
+  conda_environment:
+    type:
+      - string
+      - "null"
+  conda_prefix:
+    type:
+      - string
+      - "null"
+  python_executable:
     type:
       - string
       - "null"

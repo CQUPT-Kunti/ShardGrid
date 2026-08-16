@@ -16,6 +16,7 @@ from shardgrid.jobs.models import JobStatus
         ("enable BIOS SR-IOV option", "bios_modification"),
         ("password required for remote login", "password_request"),
         ("netsh advfirewall firewall add rule", "risky_firewall_modification"),
+        ("conda create -n shardgrid python", "conda_install_or_env_create"),
     ],
 )
 def test_manual_action_categories_are_blocked(action: str, category: str) -> None:
