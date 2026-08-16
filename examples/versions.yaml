@@ -1,0 +1,206 @@
+schema_version: "1"
+recorded_at: null
+recorded_by:
+  machine_id: null
+  role: control
+  hostname: null
+
+policy:
+  detection_mode: detect_first
+  reuse_mode: reuse_first
+  version_strategy: record_actual_versions
+  notes:
+    - Reuse an already compatible environment when available.
+    - Record actual detected versions before deciding whether any change is needed.
+    - Keep observed versions separate from compatibility expectations.
+
+compatibility:
+  python:
+    status: not_checked
+    constraints:
+      min_version: null
+      recommended_version: null
+      notes:
+        - No single Python patch version is mandatory by default.
+  pytorch:
+    status: not_checked
+    constraints:
+      version: null
+      notes:
+        - Compatibility depends on the real worker runtime, CUDA stack, and target engine.
+  cuda:
+    status: not_checked
+    constraints:
+      version: null
+      notes:
+        - Record the detected driver/runtime pair before deciding on changes.
+  kubernetes:
+    status: not_checked
+    constraints:
+      version: null
+      notes:
+        - Kubernetes is a later compatibility-gated integration, not a base requirement.
+  volcano:
+    status: not_checked
+    constraints:
+      version: null
+      notes:
+        - Volcano is only evaluated after Kubernetes is proven stable.
+  hami:
+    status: not_checked
+    constraints:
+      version: null
+      notes:
+        - HAMi is only evaluated after Kubernetes and Volcano are stable.
+
+components:
+  os:
+    name: Ubuntu
+    version: null
+    status: installed
+    source: detected
+    compatibility: not_checked
+    notes: []
+  python:
+    version: null
+    status: installed
+    source: detected
+    compatibility: not_checked
+    notes: []
+  git:
+    version: null
+    status: installed
+    source: detected
+    compatibility: not_checked
+    notes: []
+  openssh:
+    version: null
+    status: installed
+    source: detected
+    compatibility: not_checked
+    notes: []
+  wsl:
+    version: null
+    status: not_checked
+    source: not_checked
+    compatibility: not_checked
+    notes:
+      - WSL applies to Windows GPU workers, not the Ubuntu control node.
+  nvidia_driver:
+    version: null
+    status: not_checked
+    source: not_checked
+    compatibility: not_checked
+    notes: []
+  cuda:
+    version: null
+    status: not_checked
+    source: not_checked
+    compatibility: not_checked
+    notes: []
+  pytorch:
+    version: null
+    status: not_installed
+    source: detected
+    compatibility: not_checked
+    notes: []
+  nccl:
+    version: null
+    status: not_checked
+    source: not_checked
+    compatibility: not_checked
+    notes: []
+  gloo:
+    version: null
+    status: not_checked
+    source: not_checked
+    compatibility: not_checked
+    notes: []
+  iperf3:
+    version: null
+    status: not_checked
+    source: not_checked
+    compatibility: not_checked
+    notes: []
+  parallel_engine:
+    name: null
+    version: null
+    status: not_checked
+    source: not_checked
+    compatibility: not_checked
+    notes:
+      - Record the actual selected engine or leave null until a compatibility spike runs.
+  kubernetes:
+    version: null
+    status: not_installed
+    source: detected
+    compatibility: not_checked
+    notes: []
+  volcano:
+    version: null
+    status: not_installed
+    source: detected
+    compatibility: not_checked
+    notes: []
+  hami:
+    version: null
+    status: not_installed
+    source: detected
+    compatibility: not_checked
+    notes: []
+
+machines:
+  - machine_id: machine-a
+    role: control
+    physical_os: linux
+    runtime_os: linux
+    components:
+      os:
+        version: null
+        status: installed
+      python:
+        version: null
+        status: installed
+      git:
+        version: null
+        status: installed
+      openssh:
+        version: null
+        status: installed
+      iperf3:
+        version: null
+        status: not_checked
+  - machine_id: machine-c
+    role: gpu_worker
+    physical_os: windows
+    runtime_os: wsl2_linux
+    components:
+      wsl:
+        version: null
+        status: not_checked
+      nvidia_driver:
+        version: null
+        status: not_checked
+      cuda:
+        version: null
+        status: not_checked
+      pytorch:
+        version: null
+        status: not_checked
+  - machine_id: machine-d
+    role: gpu_worker
+    physical_os: windows
+    runtime_os: wsl2_linux
+    components:
+      wsl:
+        version: null
+        status: not_checked
+      nvidia_driver:
+        version: null
+        status: not_checked
+      cuda:
+        version: null
+        status: not_checked
+      pytorch:
+        version: null
+        status: not_checked

@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=69", "wheel>=0.43,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shardgrid"
+version = "0.1.0"
+description = "ShardGrid control-plane package"
+readme = "README.md"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2,<2",
+    "mypy>=1.11,<2",
+    "pytest>=8,<9",
+    "ruff>=0.6,<1",
+]
+test = [
+    "pytest>=8,<9",
+]
+lint = [
+    "ruff>=0.6,<1",
+]
+typecheck = [
+    "mypy>=1.11,<2",
+]
+kubernetes = []
+engines = []
+volcano = []
+hami = []
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src"]
+log_level = "INFO"
+xfail_strict = true
+markers = [
+    "local: tests intended to run on the local development machine by default",
+    "unit: fast local unit tests",
+    "integration: tests that exercise multiple local components together",
+    "hardware: tests that require real hardware access",
+    "multi_host: tests that require more than one machine",
+    "windows: tests that require a Windows host or runtime",
+    "wsl: tests that require a WSL runtime",
+    "kubernetes: tests that require Kubernetes",
+    "volcano: tests that require Volcano",
+    "hami: tests that require HAMi",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+files = ["src", "tests"]
+mypy_path = "src"
+explicit_package_bases = true
+check_untyped_defs = true
+warn_unused_configs = true
