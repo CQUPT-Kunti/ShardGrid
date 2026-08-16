@@ -1,0 +1,93 @@
+schemas:
+  ExecutionPlan:
+    type: object
+    required:
+      - job_id
+      - engine
+      - backend
+      - world_size
+      - master
+      - workers
+    properties:
+      job_id:
+        type: string
+      engine:
+        type: string
+        description: Parallel engine or static validation engine.
+      backend:
+        enum: [nccl, gloo, auto, kubernetes, volcano]
+      launcher:
+        enum: [ssh, kubernetes, volcano]
+      world_size:
+        type: integer
+        minimum: 1
+      master:
+        $ref: "#/schemas/Master"
+      workers:
+        type: array
+        items:
+          $ref: "#/schemas/WorkerAssignment"
+      parallel_plan_ref:
+        type: string
+      snapshot_ref:
+        type: string
+      placement_reason:
+        type: array
+        items:
+          type: string
+      environment:
+        type: object
+        additionalProperties:
+          type: string
+      labels:
+        type: object
+        additionalProperties:
+          type: string
+
+  Master:
+    type: object
+    required: [address, port]
+    properties:
+      address:
+        type: string
+      port:
+        type: integer
+        minimum: 1
+        maximum: 65535
+
+  WorkerAssignment:
+    type: object
+    required:
+      - worker_id
+      - rank
+      - local_rank
+      - stage
+    properties:
+      worker_id:
+        type: string
+      rank:
+        type: integer
+        minimum: 0
+      local_rank:
+        type: integer
+        minimum: 0
+      stage:
+        type: integer
+        minimum: 0
+      gpu_index:
+        type: integer
+        default: 0
+      host:
+        type: string
+      runtime_os:
+        enum: [linux, wsl2_linux]
+      launch_command:
+        type: string
+      log_path:
+        type: string
+
+validation_rules:
+  - world_size must equal length(workers).
+  - ranks must be unique and cover 0..world_size-1.
+  - Stage A-C assignments must have local_rank 0 and gpu_index 0.
+  - backend labels must preserve NCCL failure and Gloo fallback status.

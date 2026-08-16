@@ -1,0 +1,98 @@
+schemas:
+  JobStatus:
+    type: object
+    required:
+      - job_id
+      - state
+      - phase
+    properties:
+      job_id:
+        type: string
+      state:
+        enum:
+          - created
+          - probing
+          - planning
+          - snapshotting
+          - distributing
+          - launching
+          - rendezvous
+          - training
+          - checkpointing
+          - completed
+          - failed
+          - stopping
+          - stopped
+      phase:
+        type: string
+      workers:
+        type: array
+        items:
+          type: string
+      backend:
+        type: string
+      fallback_used:
+        type: boolean
+      latest_loss:
+        type: number
+      loss_history:
+        type: array
+        items:
+          type: number
+      checkpoint_ref:
+        type: string
+      started_at:
+        type: string
+      finished_at:
+        type: string
+      failure:
+        $ref: "#/schemas/FailureRecord"
+
+  FailureRecord:
+    type: object
+    required:
+      - stage
+      - message
+      - recommended_action
+    properties:
+      stage:
+        enum:
+          - BOOTSTRAP
+          - PROBE
+          - NETWORK
+          - PROFILE
+          - PLAN
+          - DISTRIBUTE
+          - LAUNCH
+          - RENDEZVOUS
+          - TRAIN
+          - CHECKPOINT
+          - SCHEDULE
+          - GPU_SHARE
+          - STOP
+          - CLEANUP
+      host:
+        type: string
+      worker_id:
+        type: string
+      command:
+        type: string
+      exit_code:
+        type: integer
+      stdout_path:
+        type: string
+      stderr_path:
+        type: string
+      message:
+        type: string
+      recommended_action:
+        type: string
+      retryable:
+        type: boolean
+      manual_action_required:
+        type: boolean
+
+validation_rules:
+  - failed jobs must include failure.
+  - completed jobs must include checkpoint_ref and final loss metrics.
+  - fallback_used true must be accompanied by backend labels and diagnostics.
