@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import Never
 
 from shardgrid.cli.commands import register_placeholder_commands
+from shardgrid.cli.commands.doctor import register_doctor_command
 from shardgrid.cli.context import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -39,6 +40,7 @@ def build_parser() -> CLIArgumentParser:
     parser.add_argument("--json", action="store_true", help="Emit structured JSON output")
     subparsers = parser.add_subparsers(dest="command")
     register_placeholder_commands(subparsers)
+    register_doctor_command(subparsers)
     return parser
 
 
@@ -57,6 +59,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             json_output=namespace.json,
         )
         context.load_config()
+        namespace.context = context
         handler = getattr(namespace, "handler", None)
     except FileNotFoundError as error:
         json_output = "--json" in args

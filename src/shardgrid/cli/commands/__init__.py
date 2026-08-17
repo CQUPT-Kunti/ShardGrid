@@ -8,7 +8,6 @@ from typing import Any
 from shardgrid.cli.context import EXIT_RUNTIME_ERROR
 
 PLACEHOLDER_COMMANDS = (
-    "doctor",
     "workers",
     "probe",
     "network-test",

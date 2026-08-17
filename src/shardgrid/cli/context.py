@@ -23,11 +23,14 @@ class CLIContext:
     conda_prefix: Path | None = None
     verbose: bool = False
     json_output: bool = False
+    config: ClusterConfig | None = None
 
     def load_config(self) -> ClusterConfig | None:
         if self.config_path is None:
             return None
-        return load_cluster_config(self.config_path)
+        loaded = load_cluster_config(self.config_path)
+        object.__setattr__(self, "config", loaded)
+        return loaded
 
 
 def resolve_cli_context(
