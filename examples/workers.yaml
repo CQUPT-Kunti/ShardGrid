@@ -1,16 +1,13 @@
 control:
   machine_id: machine-a
   hostname: control-a.local
-
 jobs_root: /var/tmp/shardgrid/jobs
-
 ssh:
   default_port: 22
   connect_timeout_seconds: 15
   strict_host_key_checking: true
   private_key_path: null
   known_hosts_path: null
-
 runtime:
   python_executable: python3
   environment_manager: conda
@@ -22,69 +19,65 @@ runtime:
   wsl_shell: /bin/bash
   default_wsl_distro: null
   environment: {}
-
 network:
   rendezvous_port: 29500
   iperf3_port: 5201
   interface_preference: null
-
 backend_preference:
   launcher: ssh
   communication_backend: auto
   parallel_engine: auto
-
 manual_override:
   preferred_workers: []
   disabled_workers: []
   worker_address_overrides: {}
   rendezvous_port: null
-
 workers:
-  - id: gpu4060
-    machine_id: machine-c
-    physical_os: windows
-    runtime_os: wsl2_linux
-    runtime: wsl2
-    host: machine-c.local
-    ssh_user: shardgrid
-    ssh_port: 22
-    runtime_distro: Ubuntu-22.04
-    conda_environment: null
-    conda_prefix: null
-    local_world_size: 1
-    enabled: true
-    labels:
-      gpu: rtx4060
-      required_for_mvp: "true"
-  - id: gpu1060
-    machine_id: machine-d
-    physical_os: windows
-    runtime_os: wsl2_linux
-    runtime: wsl2
-    host: machine-d.local
-    ssh_user: shardgrid
-    ssh_port: 22
-    runtime_distro: Ubuntu-22.04
-    conda_environment: null
-    conda_prefix: null
-    local_world_size: 1
-    enabled: true
-    labels:
-      gpu: gtx1650
-      required_for_mvp: "true"
-  - id: gpu4060e
-    machine_id: machine-e
-    physical_os: windows
-    runtime_os: wsl2_linux
-    runtime: wsl2
-    host: machine-e.local
-    ssh_user: shardgrid
-    ssh_port: 22
-    runtime_distro: Ubuntu-22.04
-    conda_environment: null
-    conda_prefix: null
-    local_world_size: 1
-    enabled: false
-    labels:
-      gpu: rtx4060
-      optional: "true"
+- id: gpu4060
+  machine_id: machine-c
+  physical_os: windows
+  runtime_os: wsl2_linux
+  runtime: wsl2
+  host: machine-c.local
+  ssh_user: shardgrid
+  ssh_port: 22
+  runtime_distro: Ubuntu
+  conda_environment: shardgrid
+  conda_prefix: /home/shardgrid/miniconda3/envs/shardgrid
+  local_world_size: 1
+  enabled: true
+  labels:
+    gpu: rtx4060
+    required_for_mvp: 'true'
+- id: gpu1060
+  machine_id: machine-d
+  physical_os: windows
+  runtime_os: wsl2_linux
+  runtime: wsl2
+  host: machine-d.local
+  ssh_user: shardgrid
+  ssh_port: 22
+  runtime_distro: Ubuntu
+  conda_environment: shardgrid
+  conda_prefix: /home/shardgrid/miniconda3/envs/shardgrid
+  local_world_size: 1
+  enabled: true
+  labels:
+    gpu: gtx1650
+    required_for_mvp: 'true'
+- id: gpu4060e
+  machine_id: machine-e
+  physical_os: windows
+  runtime_os: wsl2_linux
+  runtime: wsl2
+  host: machine-e.local
+  ssh_user: shardgrid
+  ssh_port: 22
+  runtime_distro: Ubuntu-22.04
+  conda_environment: null
+  conda_prefix: null
+  local_world_size: 1
+  enabled: false
+  labels:
+    gpu: rtx4060
+    optional: 'true'

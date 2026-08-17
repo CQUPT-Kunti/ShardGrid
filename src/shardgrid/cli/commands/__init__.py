@@ -10,7 +10,6 @@ from shardgrid.cli.context import EXIT_RUNTIME_ERROR
 PLACEHOLDER_COMMANDS = (
     "workers",
     "probe",
-    "network-test",
     "dist-test",
     "train",
     "status",

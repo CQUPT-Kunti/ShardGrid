@@ -103,6 +103,7 @@ class SSHTransport:
         timeout: float | None = None,
         secrets: Sequence[str] = (),
         check: bool = False,
+        stdin: str | bytes | None = None,
     ) -> ProcessResult:
         argv = self.assemble_command(command)
         recorded = redact_command(argv, secrets)
@@ -125,6 +126,7 @@ class SSHTransport:
                 shell=False,
                 secrets=secrets,
                 check=check,
+                input=stdin,
             )
         except FileNotFoundError:
             return ProcessResult(

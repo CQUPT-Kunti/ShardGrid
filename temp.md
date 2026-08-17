@@ -1,120 +1,110 @@
-# Agent Handoff: current worker reality
+# Agent Handoff
 
 Date: 2026-08-17
 
-This file exists because earlier agent conclusions mixed old state with current
-worker state.
+This file is the short handoff for the next agent. Read this before touching
+the worker-access path.
 
-## Read this first
+## Current task state
 
-- Do not assume T029/T030 are pending. In `tasks.md`, `T029`, `T030`, and `T031`
-  are already `[X]`.
-- The real training runtime for Windows GPU workers is **WSL2 Ubuntu inside the
-  Windows host**, not Windows Python, not Windows Conda.
-- If you run checks from the Windows host and look only at `conda` on `PATH`,
-  you can get a false blocker even when WSL is healthy.
+- `T029`: `[X]`
+- `T030`: `[X]`
+- `T031`: `[X]`
+- `T037`: `[X]`
+- `T038`: `[X]`
+- `T039`: not started in this handoff
 
-## Worker map
+Do not regress `T038` back to blocked unless you have fresh live evidence.
+
+## Current worker reality
+
+Source of truth for machine addresses:
+
+- `tests/address.json`
+
+Current GPU workers:
 
 - `10.87.5.155`
   - hostname: `LDJ`
   - Windows user: `shardgrid`
   - GPU: `NVIDIA GeForce RTX 4060`
-  - training runtime: `WSL2 Ubuntu`
 - `10.87.5.15`
   - hostname: `LAPTOP-5G3QUOGM`
   - Windows user: `shardgrid`
   - GPU: `NVIDIA GeForce GTX 1650`
-  - training runtime: `WSL2 Ubuntu`
+
+Non-GPU Windows machine:
+
 - `10.87.5.228`
   - hostname: `DESKTOP-DFVMAH9`
   - Windows user: `lei`
-  - not a GPU training worker
 
-Source: `tests/address.json`
+## WSL runtime truth
 
-## Known good WSL runtime facts
+For both GPU workers, the real training runtime is:
 
-These facts were already verified for both GPU workers in `docs/wsl-worker.md`.
-
-- WSL distro: `Ubuntu`
-- WSL Conda path: `/home/shardgrid/miniconda3/bin/conda`
+- Windows host
+- `WSL2 Ubuntu`
+- Conda executable: `/home/shardgrid/miniconda3/bin/conda`
 - selected env: `shardgrid`
-- selected prefix: `/home/shardgrid/miniconda3/envs/shardgrid`
-- training Python:
-  `/home/shardgrid/miniconda3/envs/shardgrid/bin/python`
-- PyTorch: `2.7.1+cu118`
-- CUDA visible from torch: `true`
-- `nvidia-smi` path in WSL: `/usr/lib/wsl/lib/nvidia-smi`
+- prefix: `/home/shardgrid/miniconda3/envs/shardgrid`
+- runtime Python: `/home/shardgrid/miniconda3/envs/shardgrid/bin/python`
 
-For `10.87.5.155` specifically, the documented verified GPU summary is:
+Do not treat Windows Python or Windows Conda as the training runtime.
 
-- `NVIDIA GeForce RTX 4060 Laptop GPU, 566.07`
+## SSH access truth
+
+Machine A public key was added to both GPU workers on 2026-08-17:
+
+- `C:\Users\shardgrid\.ssh\authorized_keys` on `10.87.5.155`
+- `C:\Users\shardgrid\.ssh\authorized_keys` on `10.87.5.15`
+
+Verified from Machine A:
+
+- `ssh -o BatchMode=yes shardgrid@10.87.5.155 hostname` works
+- `ssh -o BatchMode=yes shardgrid@10.87.5.15 hostname` works
+- `ssh -o BatchMode=yes shardgrid@10.87.5.155 wsl.exe -l -v` works
+- `ssh -o BatchMode=yes shardgrid@10.87.5.15 wsl.exe -l -v` works
+
+Meaning:
+
+- the earlier `authentication_failure` blocker for `T038` is resolved
+- `T039` is no longer blocked on SSH entry
+
+## T038 live result
+
+`T038` was rerun live and passed on `10.87.5.155`.
+
+Observed live values:
+
+- Windows identity: `ldj`
+- WSL distro: `Ubuntu`
+- Conda executable: `/home/shardgrid/miniconda3/bin/conda`
+- Conda env: `shardgrid`
+- Conda prefix: `/home/shardgrid/miniconda3/envs/shardgrid`
+- runtime Python: `/home/shardgrid/miniconda3/envs/shardgrid/bin/python`
+- Python version: `Python 3.12.13`
+
+## Files to trust
+
+- `docs/wsl-worker.md`
+- `docs/operations/bootstrap-findings.md`
+- `docs/operations/remote-access.md`
+- `attention.md`
+- `specs/001-multi-host-training-mvp/tasks.md`
 
 ## Important trap
 
-`bootstrap-windows.ps1` can report WSL Conda as missing even when the WSL
-runtime is healthy.
+Windows-host-side checks can still disagree with WSL runtime truth if they only
+look at shell `PATH`.
 
-Observed on `10.87.5.15`:
+Do not conclude "WSL has no conda" just because a Windows-side check failed to
+resolve `conda` through a non-interactive shell. Check the real WSL path.
 
-- Windows host check saw:
-  - WSL present
-  - Ubuntu present
-  - Windows Conda present
-  - `wsl_training_conda.executable` empty
-- Read-only probe inside WSL showed:
-  - `command -v conda` was empty in that non-interactive shell path
-  - `/home/shardgrid/miniconda3/bin/conda` exists
-  - `~/.bashrc` contains Conda init for `/home/shardgrid/miniconda3`
+## If the next task is T039
 
-Meaning: do not treat a Windows-host-side `conda not found` inside WSL as proof
-that WSL has no Conda. Check the actual WSL path directly.
+The direct analog path to verify is:
 
-## What to trust
+`Machine A -> 10.87.5.15 -> Windows host -> WSL2 Ubuntu -> shardgrid env -> runtime Python`
 
-- Trust `docs/wsl-worker.md` for the latest real WSL runtime verification.
-- Trust `docs/operations/bootstrap-findings.md` for the T031 explanation of why
-  Windows host check and WSL runtime check can disagree.
-- Trust `tasks.md` current checkboxes over old conversational summaries.
-
-## What is stale
-
-`docs/windows-worker.md` still contains an older verification note saying
-Ubuntu WSL distro was missing on `10.87.5.15`. That is stale relative to later
-real verification and should not be used as the current truth.
-
-## If you need to verify a GPU worker again
-
-Use WSL directly, under the WSL user and WSL Conda env. Do not validate GPU
-runtime from Windows Python.
-
-Minimal commands to run on a Windows GPU worker:
-
-```powershell
-wsl.exe -d Ubuntu -u shardgrid -- bash -lc "ls -l /home/shardgrid/miniconda3/bin/conda"
-wsl.exe -d Ubuntu -u shardgrid -- bash -lc "/home/shardgrid/miniconda3/envs/shardgrid/bin/python --version"
-wsl.exe -d Ubuntu -u shardgrid -- bash -lc "/home/shardgrid/miniconda3/envs/shardgrid/bin/python - <<'PY'
-import torch
-print(torch.__version__)
-print(torch.version.cuda)
-print(torch.cuda.is_available())
-if torch.cuda.is_available():
-    print(torch.cuda.get_device_name(0))
-PY"
-wsl.exe -d Ubuntu -u shardgrid -- bash -lc "/usr/lib/wsl/lib/nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv,noheader"
-```
-
-For repo bootstrap checks from the worker:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\bootstrap-windows.ps1 -Check -Json
-wsl.exe -d Ubuntu -u shardgrid -- bash -lc "~/.shardgrid/scripts/bootstrap-wsl.sh --check --json"
-```
-
-## Bottom line for the next agent
-
-- Do not regress to "worker not prepared" without rereading `tasks.md`,
-  `docs/wsl-worker.md`, and `docs/operations/bootstrap-findings.md`.
-- The likely failure mode is checking the wrong runtime layer.
-- For GPU truth, WSL `shardgrid` env is the source of truth.
+Use the existing `SSHTransport`. Do not create a second SSH implementation.

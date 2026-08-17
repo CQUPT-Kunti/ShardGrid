@@ -22,7 +22,9 @@ def test_load_cluster_config_from_example() -> None:
     assert config.runtime.conda_environment is None
     assert len(config.workers) == 3
     assert [worker.worker_id for worker in config.workers[:2]] == ["gpu4060", "gpu1060"]
-    assert config.workers[0].conda_environment is None
+    assert config.workers[0].conda_environment == "shardgrid"
+    assert config.workers[0].conda_prefix == "/home/shardgrid/miniconda3/envs/shardgrid"
+    assert config.workers[0].runtime_distro == "Ubuntu"
     assert config.workers[2].enabled is False
 
 

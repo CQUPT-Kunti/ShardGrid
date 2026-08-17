@@ -3,6 +3,7 @@
         "ip": "10.87.5.228",
         "hostname": "DESKTOP-DFVMAH9",
         "username": "lei",
+        "password": "a2031291160",
         "gpu": false,
         "gpu_model": null,
         "os": "Windows"
@@ -11,6 +12,7 @@
         "ip": "10.87.5.155",
         "hostname": "LDJ",
         "username": "shardgrid",
+        "password": "090157",
         "gpu": true,
         "gpu_model": "NVIDIA GeForce RTX 4060",
         "os": "Windows"
@@ -19,6 +21,7 @@
         "ip": "10.87.5.15",
         "hostname": "LAPTOP-5G3QUOGM",
         "username": "shardgrid",
+        "password": "090157",
         "gpu": true,
         "gpu_model": "NVIDIA GeForce GTX 1650",
         "os": "Windows"
@@ -27,6 +30,7 @@
         "ip": "10.87.5.93",
         "hostname": null,
         "username": null,
+        "password": "090157",
         "gpu": false,
         "gpu_model": null,
         "os": "Ubuntu"

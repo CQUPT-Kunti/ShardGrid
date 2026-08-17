@@ -63,6 +63,7 @@ def run_process(
     check: bool = False,
     encoding: str = "utf-8",
     runtime_environment: Mapping[str, str] | None = None,
+    input: str | bytes | None = None,
 ) -> ProcessResult:
     completed = None
     recorded_command = redact_command(command, secrets)
@@ -85,6 +86,7 @@ def run_process(
             encoding=encoding,
             errors="replace",
             check=False,
+            input=input,
         )
         result = ProcessResult(
             args=args,
