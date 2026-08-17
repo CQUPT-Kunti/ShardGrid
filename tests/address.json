@@ -1,0 +1,34 @@
+[
+    {
+        "ip": "10.87.5.228",
+        "username": "shardgrid",
+        "gpu": false,
+        "gpu_model": null,
+        "os": "Windows",
+        "password": "090157"
+    },
+    {
+        "ip": "10.87.5.155",
+        "username": "shardgrid",
+        "gpu": true,
+        "gpu_model": "NVIDIA GeForce RTX 4060",
+        "os": "Windows",
+        "password": "090157"
+    },
+    {
+        "ip": "10.87.5.15",
+        "username": "shardgrid",
+        "gpu": true,
+        "gpu_model": "NVIDIA GeForce GTX 1650",
+        "os": "Windows",
+        "password": "090157"
+    },
+    {
+        "ip": "10.87.5.93",
+        "username": null,
+        "gpu": false,
+        "gpu_model": null,
+        "os": "Ubuntu",
+        "password": "090157"
+    }
+]
