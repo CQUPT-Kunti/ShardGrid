@@ -70,7 +70,7 @@ workers:
     local_world_size: 1
     enabled: true
     labels:
-      gpu: gtx1060
+      gpu: gtx1650
       required_for_mvp: "true"
   - id: gpu4060e
     machine_id: machine-e

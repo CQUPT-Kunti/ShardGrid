@@ -87,7 +87,7 @@ This research resolves planning choices for the first implementation route. Deci
 - PyTorch version
 - CUDA version
 - RTX 4060
-- GTX 1060
+- GTX 1650
 - Windows host with WSL2 runtime
 - multi-host
 - heterogeneous GPU
@@ -107,7 +107,7 @@ This research resolves planning choices for the first implementation route. Deci
 
 ## Decision: Minimal Supported Model Before Arbitrary Model Support
 
-**Rationale**: The first validation model must be small enough for GTX 1060 and deterministic enough to prove loss decrease. It should be a Sequential or small Transformer split into Stage0 on RTX 4060 and Stage1 on GTX 1060.
+**Rationale**: The first validation model must be small enough for GTX 1650 and deterministic enough to prove loss decrease. It should be a Sequential or small Transformer split into Stage0 on RTX 4060 and Stage1 on GTX 1650.
 
 **Alternatives considered**:
 

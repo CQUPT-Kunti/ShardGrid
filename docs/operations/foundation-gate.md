@@ -73,3 +73,13 @@ These belong to T028 and later.
 - Windows Gate: PENDING PLATFORM VERIFICATION
 - Conda revalidation: PASS on Ubuntu Machine A using `/home/yangjilei/anaconda3/bin/conda`, active environment `base`, Python `/home/yangjilei/anaconda3/bin/python`
 - Overall foundation status for starting T028 on the Ubuntu control node: PASS WITH PENDING WINDOWS PLATFORM VERIFICATION
+
+## Superseded Notes
+
+This gate records the T001-T027 state on 2026-08-16.  The "PENDING PLATFORM
+VERIFICATION" entries for Windows/WSL were accurate at that time and were
+superseded by later real verification in T029 (bootstrap-windows.ps1 on a
+prepared Worker), T030 (bootstrap-wsl.sh real WSL2 execution, see
+`docs/wsl-worker.md`), and T031 (see `docs/operations/bootstrap-findings.md`).
+Trust `tasks.md` current checkboxes and `docs/wsl-worker.md` over this
+point-in-time record.

@@ -81,13 +81,27 @@ Observed:
 - OpenSSH server observed through the active SSH session
 - NVIDIA driver major `527`, compatible with the script's CUDA-on-WSL2 floor
 - Windows-host Conda present and recorded as host-only
-- Ubuntu WSL distro missing
-- WSL2 training Conda not checked because the Ubuntu distro is missing
 
-Manual action:
+Manual action recorded at that time:
 
 - Install the Ubuntu WSL distro manually, then rerun this check
 
-The required RTX 4060 host `10.87.5.155` was not reachable from Machine A during
-this T029 run (`no route to host`), so verification for that specific Worker is
-`PENDING`.
+## Stale Verification Notes (superseded 2026-08-17)
+
+The following earlier conclusions are **stale** and must not be used as current
+truth.  Later real verification (see `docs/wsl-worker.md`, T030, and
+`docs/operations/bootstrap-findings.md`) confirmed that the Ubuntu WSL2 distro
+is present and the WSL2 training runtime is healthy on both GPU Workers.
+
+- ~~Ubuntu WSL distro missing on `10.87.5.15`~~ -> superseded: Ubuntu distro
+  present, WSL2 training Conda verified at
+  `/home/shardgrid/miniconda3/bin/conda`, selected env `shardgrid`.
+- ~~WSL2 training Conda not checked because the Ubuntu distro is missing~~ ->
+  superseded: real WSL runtime checks passed (see `docs/wsl-worker.md`).
+- ~~`10.87.5.155` not reachable from Machine A during the T029 run~~ ->
+  that was a transient T029-time observation; the RTX 4060 host `10.87.5.155`
+  is a prepared GPU Worker (`NVIDIA GeForce RTX 4060 Laptop GPU`).
+
+A Windows-host-side `conda not found` inside WSL must not be treated as proof
+that WSL has no Conda: check the actual WSL path directly
+(`/home/shardgrid/miniconda3/bin/conda`).

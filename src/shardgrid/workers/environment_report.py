@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
+from shardgrid.common.config import WorkerConfig
 from shardgrid.common.enums import Health, PhysicalOS, RuntimeOS, SerializableStrEnum
 from shardgrid.common.models import Hostname, MachineId, as_hostname, as_machine_id
 from shardgrid.common.process import run_process
@@ -43,6 +44,11 @@ def _serialize(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_serialize(item) for item in value]
     return value
+
+
+def _optional_int(data: dict[str, Any], key: str) -> int | None:
+    value = data.get(key)
+    return None if value is None else int(value)
 
 
 def now_utc() -> str:
@@ -72,6 +78,11 @@ class EnvironmentReport:
     torch_cuda_version: str | None = None
     cuda_version: str | None = None
     runtime_version: str | None = None
+    gpu_name: str | None = None
+    driver_version: str | None = None
+    gpu_total_memory_mb: int | None = None
+    compute_capability: str | None = None
+    evidence_path: str | None = None
     commands: tuple[str, ...] = ()
     manual_actions: tuple[str, ...] = ()
     components: dict[str, str] = field(default_factory=dict)
@@ -126,6 +137,11 @@ class EnvironmentReport:
             torch_cuda_version=data.get("torch_cuda_version"),
             cuda_version=data.get("cuda_version"),
             runtime_version=data.get("runtime_version"),
+            gpu_name=data.get("gpu_name"),
+            driver_version=data.get("driver_version"),
+            gpu_total_memory_mb=_optional_int(data, "gpu_total_memory_mb"),
+            compute_capability=data.get("compute_capability"),
+            evidence_path=data.get("evidence_path"),
             commands=tuple(str(item) for item in data.get("commands", [])),
             manual_actions=tuple(str(item) for item in data.get("manual_actions", [])),
             components={
@@ -279,3 +295,86 @@ def build_control_report(
         components=components,
         evidence_status="live",
     )
+
+
+def build_worker_report(
+    worker: WorkerConfig,
+    *,
+    distro: str | None = None,
+    health: Health = Health.UNKNOWN,
+    evidence_status: str = "pending",
+    runtime_facts: Mapping[str, str | None] | None = None,
+    commands: Sequence[str] = (),
+    manual_actions: Sequence[str] = (),
+    failure: FailureRecord | None = None,
+    evidence_path: str | None = None,
+    components: Mapping[str, str] | None = None,
+) -> EnvironmentReport:
+    """Build a Worker environment report from identity plus runtime facts.
+
+    The identity (machine_id, hostname, physical_os, runtime_os) comes from the
+    configured Worker; runtime facts must be real evidence collected by earlier
+    probe/bootstrap flows.  ``evidence_status`` keeps unverified platform
+    evidence explicit instead of presenting it as a pass.
+    """
+    facts = dict(runtime_facts or {})
+    gpu_memory = facts.get("gpu_total_memory_mb")
+    return EnvironmentReport(
+        report_id=f"worker-{worker.worker_id}",
+        scope=ReportScope.WORKER,
+        target=str(worker.worker_id),
+        machine_id=worker.machine_id,
+        hostname=as_hostname(worker.host),
+        physical_os=worker.physical_os,
+        runtime_os=worker.runtime_os,
+        timestamp=now_utc(),
+        health=health,
+        conda_executable=facts.get("conda_executable"),
+        conda_environment=facts.get("conda_environment"),
+        conda_prefix=facts.get("conda_prefix"),
+        python_executable=facts.get("python_executable"),
+        python_version=facts.get("python_version"),
+        torch_version=facts.get("torch_version"),
+        torch_cuda_version=facts.get("torch_cuda_version"),
+        cuda_version=facts.get("cuda_version"),
+        runtime_version=distro or worker.runtime_distro,
+        gpu_name=facts.get("gpu_name"),
+        driver_version=facts.get("driver_version"),
+        gpu_total_memory_mb=None if gpu_memory is None else int(gpu_memory),
+        compute_capability=facts.get("compute_capability"),
+        evidence_path=evidence_path,
+        commands=tuple(commands),
+        manual_actions=tuple(manual_actions),
+        components={str(key): str(value) for key, value in (components or {}).items()},
+        failure=failure,
+        evidence_status=evidence_status,
+    )
+
+
+_SCHEMA_PATH = Path(
+    "specs/001-multi-host-training-mvp/contracts/environment-report.schema.yaml"
+)
+
+
+def load_environment_report_schema() -> dict[str, Any]:
+    import yaml
+
+    return cast(dict[str, Any], yaml.safe_load(_SCHEMA_PATH.read_text()))
+
+
+def validate_environment_report_payload(payload: dict[str, Any]) -> None:
+    from jsonschema import Draft202012Validator
+
+    from shardgrid.common.serialization import SchemaValidationError
+
+    validator = Draft202012Validator(load_environment_report_schema())
+    errors = sorted(
+        validator.iter_errors(payload), key=lambda error: list(error.path)
+    )
+    if errors:
+        message = "; ".join(error.message for error in errors)
+        raise SchemaValidationError(message)
+
+
+def validate_environment_report(report: EnvironmentReport) -> None:
+    validate_environment_report_payload(report.to_dict())

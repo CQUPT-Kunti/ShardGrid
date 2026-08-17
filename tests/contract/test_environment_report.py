@@ -5,13 +5,17 @@ from pathlib import Path
 
 import pytest
 
+from shardgrid.common.config import WorkerConfig
 from shardgrid.common.enums import FailureStage, Health, PhysicalOS, RuntimeOS
 from shardgrid.common.models import as_hostname, as_machine_id, as_worker_id
 from shardgrid.jobs.models import EnvironmentSnapshot, FailureRecord
 from shardgrid.workers.environment_report import (
     EnvironmentReport,
     ReportScope,
+    build_worker_report,
     load_environment_report,
+    validate_environment_report,
+    validate_environment_report_payload,
     write_environment_report,
 )
 
@@ -211,3 +215,125 @@ def test_environment_report_rejects_invalid_evidence_status() -> None:
             health=Health.HEALTHY,
             evidence_status="fabricated",
         )
+
+
+def _worker_config(**overrides: str) -> WorkerConfig:
+    payload: dict[str, str] = {
+        "id": "gpu4060",
+        "machine_id": "machine-c",
+        "physical_os": "windows",
+        "runtime_os": "wsl2_linux",
+        "runtime": "wsl2",
+        "host": "machine-c.local",
+        "ssh_user": "shardgrid",
+        "runtime_distro": "Ubuntu",
+    }
+    payload.update(overrides)
+    return WorkerConfig.from_dict(payload)
+
+
+def test_environment_report_pass_status_validates_against_schema() -> None:
+    report = _worker_report()
+    report = EnvironmentReport(
+        report_id=report.report_id,
+        scope=report.scope,
+        target=report.target,
+        machine_id=report.machine_id,
+        hostname=report.hostname,
+        physical_os=report.physical_os,
+        runtime_os=report.runtime_os,
+        timestamp=report.timestamp,
+        health=Health.HEALTHY,
+        conda_executable=report.conda_executable,
+        conda_environment=report.conda_environment,
+        conda_prefix=report.conda_prefix,
+        python_executable=report.python_executable,
+        python_version=report.python_version,
+        torch_version=report.torch_version,
+        torch_cuda_version=report.torch_cuda_version,
+        cuda_version=report.cuda_version,
+        runtime_version=report.runtime_version,
+        gpu_name="NVIDIA GeForce RTX 4060 Laptop GPU",
+        driver_version="566.07",
+        gpu_total_memory_mb=8192,
+        compute_capability="8.9",
+        evidence_path="/tmp/rtx4060-latest.json",
+        commands=report.commands,
+        components={"hardware_findings_doc": "docs/operations/hardware-findings.md"},
+        evidence_status="live",
+    )
+
+    validate_environment_report(report)
+    assert EnvironmentReport.from_dict(report.to_dict()) == report
+
+
+def test_environment_report_blocked_pending_status_validates_against_schema() -> None:
+    failure = FailureRecord(
+        stage=FailureStage.PROBE,
+        host="10.87.5.15",
+        worker_id=as_worker_id("gpu1650"),
+        message="SSH public-key authentication denied",
+        recommended_action="authorize Machine A public key on the Worker",
+        manual_action_required=True,
+    )
+    report = build_worker_report(
+        _worker_config(id="gpu1650", host="10.87.5.15"),
+        distro="Ubuntu",
+        health=Health.BLOCKED_MANUAL_ACTION,
+        evidence_status="pending",
+        runtime_facts={
+            "conda_executable": "/home/shardgrid/miniconda3/bin/conda",
+            "conda_environment": "shardgrid",
+            "conda_prefix": "/home/shardgrid/miniconda3/envs/shardgrid",
+            "python_executable": "/home/shardgrid/miniconda3/envs/shardgrid/bin/python",
+            "python_version": "3.12.13",
+            "torch_version": "2.7.1+cu118",
+            "torch_cuda_version": "11.8",
+            "cuda_version": "11.8",
+            "gpu_name": "NVIDIA GeForce GTX 1650",
+            "driver_version": "527.41",
+        },
+        commands=("wsl.exe -d Ubuntu -u shardgrid -- bash -lc 'python -V'",),
+        manual_actions=(
+            "authorize Machine A public key for shardgrid on 10.87.5.15, "
+            "then re-run the smoke test",
+        ),
+        failure=failure,
+        components={"runtime_facts_source": "docs/wsl-worker.md (T030 real verification)"},
+    )
+
+    validate_environment_report(report)
+    restored = EnvironmentReport.from_dict(report.to_dict())
+
+    assert restored == report
+    assert restored.health == Health.BLOCKED_MANUAL_ACTION
+    assert restored.evidence_status == "pending"
+    assert restored.failure is not None
+    assert restored.failure.manual_action_required is True
+    assert restored.physical_os == PhysicalOS.WINDOWS
+    assert restored.runtime_os == RuntimeOS.WSL2_LINUX
+    assert restored.runtime_version == "Ubuntu"
+    assert restored.python_executable == "/home/shardgrid/miniconda3/envs/shardgrid/bin/python"
+    assert restored.torch_version == "2.7.1+cu118"
+
+
+def test_environment_report_schema_rejects_missing_required_field() -> None:
+    payload = _worker_report().to_dict()
+    del payload["machine_id"]
+
+    with pytest.raises(Exception, match="machine_id"):
+        validate_environment_report_payload(payload)
+
+
+def test_environment_report_schema_rejects_invalid_health_and_evidence_status() -> None:
+    from shardgrid.common.serialization import SchemaValidationError
+
+    payload = _worker_report().to_dict()
+    payload["health"] = "fabricated"
+    with pytest.raises(SchemaValidationError):
+        validate_environment_report_payload(payload)
+
+    payload = _worker_report().to_dict()
+    payload["evidence_status"] = "fabricated"
+    with pytest.raises(SchemaValidationError):
+        validate_environment_report_payload(payload)

@@ -26,7 +26,7 @@ The core architectural rule is adapter-first reuse. ShardGrid owns orchestration
 
 **Project Type**: Python CLI plus local control-plane library, worker-side scripts, remote launcher adapters, training examples, deployment manifests, and layered test suite.
 
-**Performance Goals**: The supported validation model completes forward, activation transfer, loss, backward, gradient transfer, optimizer step, and checkpoint across RTX 4060 plus GTX 1060 within 15 minutes. Distributed process group initialization succeeds within 2 minutes or fails with diagnostics. Worker inventory succeeds in at least 95% of repeated discovery attempts on a stable LAN.
+**Performance Goals**: The supported validation model completes forward, activation transfer, loss, backward, gradient transfer, optimizer step, and checkpoint across RTX 4060 plus GTX 1650 within 15 minutes. Distributed process group initialization succeeds within 2 minutes or fails with diagnostics. Worker inventory succeeds in at least 95% of repeated discovery attempts on a stable LAN.
 
 **Constraints**: One GPU per physical Worker; default `local_world_size = 1`; no hard-coded paths, users, drive letters, IPs, ports, Conda prefixes, environment names, or Python executables; all addresses, paths, and runtime environment selections are configurable or detected; no manual rank launch by the user; no Kubernetes/Volcano/HAMi dependency before the SSH backend proves real training; stop any automated setup step that requires administrator approval, reboot, BIOS changes, password entry, risky firewall changes, Conda installation with elevated permissions, or destructive environment replacement.
 
@@ -207,7 +207,7 @@ docs/
 - Run Galvatron compatibility spike first.
 - If Galvatron fails, run ordered fallback spikes: DeepSpeed Pipeline, PyTorch pipeline APIs, nnScaler.
 - Implement the minimal two-stage validation model with a static ExecutionPlan if needed.
-- Prove Stage0 on RTX 4060 and Stage1 on GTX 1060 with real forward, activation transfer, loss, backward, gradient transfer, optimizer step, loss decrease, and checkpoint.
+- Prove Stage0 on RTX 4060 and Stage1 on GTX 1650 with real forward, activation transfer, loss, backward, gradient transfer, optimizer step, loss decrease, and checkpoint.
 
 **Gate B**:
 
@@ -290,7 +290,7 @@ docs/
 - Add `ArtifactStore` support for NFS if shared filesystem is needed.
 - Install Volcano only after Kubernetes gate is stable.
 - Implement `VolcanoLauncher` to generate Volcano Jobs with gang scheduling, queue, priority, and multi-worker configuration.
-- Validate Volcano multi-host training on RTX 4060 + GTX 1060.
+- Validate Volcano multi-host training on RTX 4060 + GTX 1650.
 - Add network-aware scheduling only through supported Volcano/Kubernetes features or ShardGrid placement preferences; do not modify Volcano core.
 
 **Gate D**:
@@ -313,7 +313,7 @@ docs/
 
 - Run HAMi compatibility spike:
   - WSL2 Linux Worker nodes.
-  - RTX 4060 and GTX 1060.
+  - RTX 4060 and GTX 1650.
   - Kubernetes and NVIDIA runtime.
   - memory isolation.
   - compute isolation.
@@ -414,7 +414,7 @@ CLEANUP
 - Reboot required: stop, record resume point, and instruct user to reboot.
 - BIOS or virtualization setting required: stop and explain the required setting.
 - Password entry required: do not script around it; ask the user to configure credentials or run the command.
-- Multiple version choices: choose official stable versions compatible with GTX 1060, RTX 4060, WSL2, PyTorch, and selected engine; record the exact resolved versions in environment artifacts.
+- Multiple version choices: choose official stable versions compatible with GTX 1650, RTX 4060, WSL2, PyTorch, and selected engine; record the exact resolved versions in environment artifacts.
 - Failed install or verification: fail honestly and do not mark the component ready.
 
 ## Complexity Tracking
@@ -422,6 +422,6 @@ CLEANUP
 | Violation | Why Needed | Simpler Alternative Rejected Because |
 |-----------|------------|-------------------------------------|
 | Multiple launcher backends | SSH must remain first working backend while Kubernetes/Volcano are future platform backends | A single launcher would either block MVP on Kubernetes or make future platform integration invasive |
-| Multiple parallel engine adapters | Galvatron compatibility is unknown on RTX 4060 + GTX 1060 + WSL2 + one-GPU-per-host | A single hard-coded engine risks blocking real training if the first candidate fails |
+| Multiple parallel engine adapters | Galvatron compatibility is unknown on RTX 4060 + GTX 1650 + WSL2 + one-GPU-per-host | A single hard-coded engine risks blocking real training if the first candidate fails |
 | Platform abstraction layer | Commands span Ubuntu, Windows, and WSL2 with different shells and safety rules | Scattering platform checks would make doctor/bootstrap unsafe and hard to test |
 | ArtifactStore and ArtifactTransport interfaces | Stage C starts with local snapshots and SSH transfer, Stage D may need NFS, future stages may need object storage | Direct file copies everywhere would bind job semantics to one transport |

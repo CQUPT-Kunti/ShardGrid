@@ -38,7 +38,7 @@ Expected result:
 
 - Machine A reports Control readiness.
 - Machine C reports Windows + WSL2 + RTX 4060 runtime readiness.
-- Machine D reports Windows + WSL2 + GTX 1060 runtime readiness.
+- Machine D reports Windows + WSL2 + GTX 1650 runtime readiness.
 - Reports include Conda executable, selected environment, environment prefix,
   Python, PyTorch, and CUDA/runtime fields where checked.
 - Any manual action is explicit and not marked successful.
@@ -89,7 +89,7 @@ Expected result:
 Expected result:
 
 - Stage0 runs on RTX 4060.
-- Stage1 runs on GTX 1060.
+- Stage1 runs on GTX 1650.
 - Forward, activation transfer, backward, gradient transfer, optimizer step, loss decrease, and checkpoint are proven.
 
 ## Stage C - Formal SSH MVP

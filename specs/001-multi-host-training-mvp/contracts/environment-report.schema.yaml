@@ -1,0 +1,100 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+title: EnvironmentReport
+description: >-
+  Stable, retrievable environment evidence record for the control node and GPU
+  Workers.  Keeps the Windows physical host and the WSL2 training runtime
+  separate and records an explicit evidence_status so unverified platform
+  evidence is never presented as a pass.
+type: object
+additionalProperties: false
+required:
+  - report_id
+  - scope
+  - target
+  - machine_id
+  - hostname
+  - physical_os
+  - runtime_os
+  - timestamp
+  - health
+  - environment_manager
+  - commands
+  - manual_actions
+  - components
+  - evidence_status
+properties:
+  report_id:
+    type: string
+    minLength: 1
+  scope:
+    type: string
+    enum: [control, worker]
+  target:
+    type: string
+    minLength: 1
+  machine_id:
+    type: string
+    minLength: 1
+  hostname:
+    type: string
+    minLength: 1
+  physical_os:
+    type: string
+    enum: [linux, windows]
+  runtime_os:
+    type: string
+    enum: [linux, wsl2_linux, windows, unknown]
+  timestamp:
+    type: string
+    minLength: 1
+  health:
+    type: string
+    enum: [unknown, healthy, degraded, blocked_manual_action, unreachable, failed]
+  environment_manager:
+    type: string
+    minLength: 1
+  conda_executable:
+    type: [string, "null"]
+  conda_environment:
+    type: [string, "null"]
+  conda_prefix:
+    type: [string, "null"]
+  python_executable:
+    type: [string, "null"]
+  python_version:
+    type: [string, "null"]
+  torch_version:
+    type: [string, "null"]
+  torch_cuda_version:
+    type: [string, "null"]
+  cuda_version:
+    type: [string, "null"]
+  runtime_version:
+    type: [string, "null"]
+  gpu_name:
+    type: [string, "null"]
+  driver_version:
+    type: [string, "null"]
+  gpu_total_memory_mb:
+    type: [integer, "null"]
+  compute_capability:
+    type: [string, "null"]
+  evidence_path:
+    type: [string, "null"]
+  commands:
+    type: array
+    items:
+      type: string
+  manual_actions:
+    type: array
+    items:
+      type: string
+  components:
+    type: object
+    additionalProperties:
+      type: string
+  failure:
+    type: [object, "null"]
+  evidence_status:
+    type: string
+    enum: [live, mock, pending]

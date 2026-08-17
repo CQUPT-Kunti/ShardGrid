@@ -16,13 +16,13 @@
 
 **Why this priority**: 这是第一阶段不可替代的核心闭环。只要这个能力没有真实跑通，后续平台化、Kubernetes、Volcano、HAMi 都不能成为主执行路径。
 
-**Independent Test**: 在 Machine A 上运行一次 `shardgrid train <config>`，使用 Machine C 的 RTX 4060 和 Machine D 的 GTX 1060，共同完成一个可拆成两段的小模型训练，并验证 forward、activation transfer、loss、backward、gradient transfer、optimizer step、loss 下降和 checkpoint 保存。
+**Independent Test**: 在 Machine A 上运行一次 `shardgrid train <config>`，使用 Machine C 的 RTX 4060 和 Machine D 的 GTX 1650，共同完成一个可拆成两段的小模型训练，并验证 forward、activation transfer、loss、backward、gradient transfer、optimizer step、loss 下降和 checkpoint 保存。
 
 **Acceptance Scenarios**:
 
 1. **Given** Machine A 是可用的 Ubuntu Control/Login 节点，Machine C 和 Machine D 是可达的 Windows GPU Worker，且各自拥有可用的 Linux GPU training runtime，**When** 用户执行一次训练命令，**Then** 系统自动完成环境检查、Worker Probe、Network Probe、节点选择、训练方案获取、ExecutionPlan 生成、代码/配置分发、rank0/rank1 启动、distributed group 建立、跨主机训练、loss 下降和 checkpoint 保存。
 2. **Given** 优先通信路径在当前 Windows/WSL2/GPU/网络组合下失败，**When** 系统尝试训练，**Then** 系统必须保存诊断、尝试受支持配置、明确记录 `NCCL FAILED` 和 fallback 状态，并且不能把 fallback 成功描述为优先通信路径成功。
-3. **Given** 只有一台 GPU Worker 健康，或者 RTX 4060 与 GTX 1060 不能同时参与训练，**When** 用户提交第一阶段双 Worker 训练任务，**Then** 系统必须拒绝该任务或标记失败，并说明缺失的 Worker、GPU、网络或 runtime 条件。
+3. **Given** 只有一台 GPU Worker 健康，或者 RTX 4060 与 GTX 1650 不能同时参与训练，**When** 用户提交第一阶段双 Worker 训练任务，**Then** 系统必须拒绝该任务或标记失败，并说明缺失的 Worker、GPU、网络或 runtime 条件。
 
 ---
 
@@ -52,7 +52,7 @@
 
 **Acceptance Scenarios**:
 
-1. **Given** Worker 配置包含 RTX 4060、GTX 1060 和未来可选 RTX 4060 Worker，**When** 用户查看 workers，**Then** 系统显示每个 Worker 的 physical OS、runtime OS、GPU、VRAM、driver、CUDA、training runtime、backend 可用性、网络接口、带宽、延迟和健康状态。
+1. **Given** Worker 配置包含 RTX 4060、GTX 1650 和未来可选 RTX 4060 Worker，**When** 用户查看 workers，**Then** 系统显示每个 Worker 的 physical OS、runtime OS、GPU、VRAM、driver、CUDA、training runtime、backend 可用性、网络接口、带宽、延迟和健康状态。
 2. **Given** 用户提交训练任务，**When** 系统接受该任务，**Then** 系统保存 code、config、plan、logs、checkpoint 和 environment snapshot，并用 job ID 关联这些 artifact。
 3. **Given** Worker 启动或训练失败，**When** 用户查看 status 或 logs，**Then** 系统按 job、worker、rank、stage 展示启动输出、distributed 初始化状态、网络诊断和失败位置。
 
@@ -68,7 +68,7 @@
 
 **Acceptance Scenarios**:
 
-1. **Given** 首选并行引擎与当前 RTX 4060 + GTX 1060 + Windows/WSL2 + multi-host + one-GPU-per-host 环境兼容，**When** 用户提交支持模型，**Then** 系统复用该引擎生成或执行模型并行方案，并保存原始 plan。
+1. **Given** 首选并行引擎与当前 RTX 4060 + GTX 1650 + Windows/WSL2 + multi-host + one-GPU-per-host 环境兼容，**When** 用户提交支持模型，**Then** 系统复用该引擎生成或执行模型并行方案，并保存原始 plan。
 2. **Given** 首选并行引擎经真实兼容性 spike 证明不满足当前环境，**When** 系统选择替代方案，**Then** 系统保存安装、版本、GPU、runtime、multi-host、pipeline、profiler、runtime、checkpoint 等兼容性报告，并选择成熟的最小替代方案。
 3. **Given** 没有现成能力满足完整自动 partition，**When** 第一阶段仍需验证训练闭环，**Then** 系统可以使用明确支持的小模型和固定两阶段验证路径，但必须记录该限制，不能宣称支持任意模型自动切分。
 
@@ -109,7 +109,7 @@
 - 配置中某台 Worker 离线、IP 改变、SSH 认证失败或 hostname 解析到错误地址。
 - Windows Worker 可达但未安装 WSL2、Ubuntu WSL distro、OpenSSH、NVIDIA driver，或 WSL2 无法访问 GPU。
 - WSL2 runtime 能看到 GPU 但训练框架无法使用 CUDA，或版本组合与 GPU 不兼容。
-- RTX 4060 与 GTX 1060 的显存、算力、driver/runtime 版本差异导致支持模型无法按默认 batch 或 stage 运行。
+- RTX 4060 与 GTX 1650 的显存、算力、driver/runtime 版本差异导致支持模型无法按默认 batch 或 stage 运行。
 - TCP connectivity 成功但 distributed rendezvous 选择了错误网卡、错误地址或被端口冲突阻塞。
 - 带宽或延迟低于训练验证最低要求，Planner 仍试图启动训练。
 - 优先通信 backend 失败但 fallback 成功；系统必须如实记录，不能混淆结果。
@@ -139,7 +139,7 @@
 - **FR-001**: The system MUST provide CLI entry points for doctor, workers, probe, network-test, dist-test, train, status, logs, and stop.
 - **FR-002**: The system MUST support Machine A as the primary Ubuntu Login/Control node with no local GPU requirement.
 - **FR-003**: The system MUST treat Machine B as non-core for MVP success while allowing it to serve as client, development, test, or future backup login node.
-- **FR-004**: The system MUST support Machine C as a Windows GPU Worker with one RTX 4060 and Machine D as a Windows GPU Worker with one GTX 1060.
+- **FR-004**: The system MUST support Machine C as a Windows GPU Worker with one RTX 4060 and Machine D as a Windows GPU Worker with one GTX 1650.
 - **FR-005**: The system MUST allow Optional Machine E or future one-GPU Workers to join through configuration or registration without core code changes.
 - **FR-006**: The resource model MUST assume one GPU per physical Worker by default, with `local_world_size = 1` unless explicitly configured otherwise in a future phase.
 - **FR-007**: Any model using two GPUs in the first stage MUST be treated as a multi-host distributed training job.
@@ -174,7 +174,7 @@
 - **FR-032**: The first Planner MUST enforce memory eligibility, prefer fewer Workers, prefer faster networks, consider GPU performance as secondary, and allow manual override.
 - **FR-033**: The first Planner MUST NOT claim to implement general model graph partitioning unless a compatible mature engine provides it.
 - **FR-034**: The first stage MUST include a clearly supported small Transformer or Sequential validation model.
-- **FR-035**: The validation model MUST be able to run on one GPU and be split into two stages assigned to RTX 4060 Stage 0 and GTX 1060 Stage 1.
+- **FR-035**: The validation model MUST be able to run on one GPU and be split into two stages assigned to RTX 4060 Stage 0 and GTX 1650 Stage 1.
 - **FR-036**: The cross-host training test MUST execute real forward, activation transfer, forward continuation, loss, backward, gradient transfer, optimizer step, loss tracking, and checkpoint save.
 - **FR-037**: The system MUST prove optimizer-managed parameters changed on the relevant stages.
 - **FR-038**: The system MUST mark the job unsuccessful if loss does not decrease by the configured threshold for the deterministic validation workload.
@@ -183,7 +183,7 @@
 - **FR-041**: The Control Plane MUST remain a simple first-stage system and MUST NOT require microservices to complete the MVP.
 - **FR-042**: The Control Plane MUST cover training submission, job management, worker probing, resource management, network probing, planning, parallel engine adaptation, execution plan management, artifact management, and launch.
 - **FR-043**: A Galvatron compatibility spike MUST be performed before selecting the first parallel engine path.
-- **FR-044**: The compatibility spike MUST cover Conda environment identity, installation, runtime versions, RTX 4060, GTX 1060, Linux runtime on Windows, multi-host, heterogeneous GPU, one-GPU-per-host, pipeline parallel behavior, profiler, search, runtime, and checkpoint.
+- **FR-044**: The compatibility spike MUST cover Conda environment identity, installation, runtime versions, RTX 4060, GTX 1650, Linux runtime on Windows, multi-host, heterogeneous GPU, one-GPU-per-host, pipeline parallel behavior, profiler, search, runtime, and checkpoint.
 - **FR-045**: If Galvatron satisfies the compatibility spike, ShardGrid MUST use it through an adapter instead of reimplementing its planning/runtime capabilities.
 - **FR-046**: If Galvatron does not satisfy the spike, ShardGrid MUST evaluate mature alternatives and record why the selected alternative was chosen.
 - **FR-047**: The system MUST NOT implement autograd, collective communication, CUDA kernels, CUDA allocators, custom NCCL, a full model-parallel framework, Kubernetes itself, or GPU virtualization in the first stage.
@@ -227,9 +227,9 @@
 ### Measurable Outcomes
 
 - **SC-001**: From Machine A, a user can start one first-stage training run with a single command and complete discovery, planning, artifact snapshotting, worker launch, distributed initialization, training, status reporting, and checkpoint recording without manually logging into GPU Workers.
-- **SC-002**: The first-stage inventory correctly reports Machine C as RTX 4060 and Machine D as GTX 1060, including required OS, runtime, GPU, network, backend, and health fields in at least 95% of repeated discovery attempts on a stable local network.
+- **SC-002**: The first-stage inventory correctly reports Machine C as RTX 4060 and Machine D as GTX 1650, including required OS, runtime, GPU, network, backend, and health fields in at least 95% of repeated discovery attempts on a stable local network.
 - **SC-003**: Each selected GPU Worker completes individual GPU smoke validation before any two-Worker training job is launched.
-- **SC-004**: The selected RTX 4060 Worker and GTX 1060 Worker establish cross-host distributed communication within 2 minutes or produce a diagnostic report that identifies the failed step.
+- **SC-004**: The selected RTX 4060 Worker and GTX 1650 Worker establish cross-host distributed communication within 2 minutes or produce a diagnostic report that identifies the failed step.
 - **SC-005**: The supported validation model completes real forward, activation transfer, loss, backward, gradient transfer, optimizer step, and checkpoint save across two separate physical GPU hosts within 15 minutes on the target hardware.
 - **SC-006**: The deterministic validation workload records at least 5% loss reduction from initial measured loss to final measured loss, or the job is marked unsuccessful with the recorded values.
 - **SC-007**: Every accepted job stores a retrievable snapshot containing code, config, plan, logs, checkpoint or failure artifacts, environment records, and diagnostics.
@@ -248,10 +248,10 @@
 - Machine A is the primary Ubuntu Login/Control node for first-stage work.
 - Machine B is available for client, development, testing, or backup login usage but is not required for MVP acceptance.
 - Machine C and Machine D are the required first GPU Workers and are reachable from Machine A on the local network.
-- Machine C has one RTX 4060; Machine D has one GTX 1060; each first-stage GPU Worker is treated as one physical host with one GPU.
+- Machine C has one RTX 4060; Machine D has one GTX 1650; each first-stage GPU Worker is treated as one physical host with one GPU.
 - Optional Machine E may later join as another Windows RTX 4060 one-GPU Worker.
 - The operator can provide configuration for worker addresses, remote accounts, ports, paths, and credentials outside source code.
 - The operator is available to perform manual actions that cannot be safely automated, including administrator approval, reboots, BIOS settings, passwords, and risky firewall decisions.
-- The first supported training workload is intentionally small so GTX 1060 memory and performance do not block proof of the distributed closed loop.
+- The first supported training workload is intentionally small so GTX 1650 memory and performance do not block proof of the distributed closed loop.
 - The first stage values repeatable correctness, honest diagnostics, and architectural evolution over peak training performance.
 - Named technologies in this specification are explicit project constraints from the user and exist to prevent reinvention; detailed implementation decisions remain for planning.
