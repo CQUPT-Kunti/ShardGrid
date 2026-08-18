@@ -131,3 +131,19 @@
 - 测试结果：PASS（21/21 unit；全量 257 passed + 148 skipped，8 个 gpu_probe contract 失败为基线已有；ruff/mypy 通过，107 files）
 - docs/compatibility/galvatron.md 已更新；未写最终支持/不支持结论（属 T061）
 - T054 implementation：DONE；compatibility check（Machine A）：NOT INSTALLED（符合预期）
+
+## T055
+- 记录 Galvatron 官方声明要求（只允许官方来源，不猜测）：
+  - source：`github:PKU-DAIR/Hetu-Galvatron`（官方 setup.py，main）；version：2.4.1（hetu-galvatron）
+  - python_requires：`>=3.8`；torch>=2.0.1、torchvision>=0.15.2、numpy<2.0.0、transformers==4.49.0、h5py>=3.6.0、attrs>=21.4.0、yacs>=0.1.8、six>=1.15.0、sentencepiece>=0.1.95、pybind11>=2.9.1、scipy>=1.10.1；条件依赖（GALVATRON_FLASH_ATTN_INSTALL=TRUE）：packaging、flash-attn>=2.0.8
+  - CUDA：官方未声明显式 CUDA 要求（不猜）
+  - PyPI `galvatron`（0.0.3）确认是第三方非官方包（home_page=kyegomez/Galvatron）→ PyPI 安装被拒绝
+- 对比两台真实 Worker（SSH -> WSL2 -> selected Conda，live evidence）：
+  - gpu4060 RTX 4060：conda `shardgrid`（prefix /home/shardgrid/miniconda3/envs/shardgrid），python 3.12.13，torch 2.7.1+cu118，torch CUDA 11.8，driver 566.07，cap 8.9，Galvatron NOT INSTALLED
+  - gpu1060 GTX 1650：conda `shardgrid`，python 3.12.13，torch 2.7.1+cu118，torch CUDA 11.8，driver 527.41，cap 7.5，Galvatron NOT INSTALLED
+- comparison：python MATCH、pytorch MATCH、cuda REQUIREMENT UNKNOWN（无声明要求，实际 11.8 作事实记录）、Galvatron NOT INSTALLED；overall：NOT INSTALLED
+- blocker/发现：两台 Worker 上 Galvatron 声明依赖大多未安装（numpy/transformers/torchvision/yacs/sentencepiece/scipy/h5py/attrs/six/pybind11/flash_attn 均无，仅 packaging 26.3）；未做任何环境变更（不升级/降级 Python、PyTorch、CUDA，不重建 Conda env）
+- 复用 T054 harness + T040 WSL runtime + T041 probe 约定 + T016 run_process；未重新实现 SSH/WSL/Conda/GPU probe
+- 测试结果：PASS（integration 13/13 logic + 1/1 live 真实双 Worker；unit 30/30；ruff/mypy 通过 108 files）
+- evidence：/var/tmp/shardgrid/engines/galvatron-versions-latest.json
+- T055 implementation：DONE；live comparison：PASS（overall NOT INSTALLED，符合预期）

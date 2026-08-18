@@ -68,6 +68,73 @@ Unofficial forks, patched sources, or unverifiable locations are reported as
   T055-T057)
 - evidence: saved via `save_galvatron_evidence()` (run-id + `galvatron-latest.json`)
 
+## T055 - Declared requirements vs Worker runtimes (2026-08-18)
+
+### Galvatron declared requirements (official source only)
+
+- Source: `github:PKU-DAIR/Hetu-Galvatron` (official `setup.py`, main branch)
+- Version: `2.4.1` (package name `hetu-galvatron`)
+- Python: `>=3.8`
+- Declared install requirements (verbatim):
+  `torch>=2.0.1`, `torchvision>=0.15.2`, `numpy<2.0.0`,
+  `transformers==4.49.0`, `h5py>=3.6.0`, `attrs>=21.4.0`, `yacs>=0.1.8`,
+  `six>=1.15.0`, `sentencepiece>=0.1.95`, `pybind11>=2.9.1`, `scipy>=1.10.1`
+- Conditional (`GALVATRON_FLASH_ATTN_INSTALL=TRUE`): `packaging`,
+  `flash-attn>=2.0.8`
+- Build requirements: C++ compiler (`csrc/dp_core.cpp`, C++11, `-fPIC`),
+  `pybind11>=2.9.1` (setup)
+- CUDA: no explicit CUDA requirement declared (not guessed)
+- PyPI finding: the PyPI package `galvatron` (0.0.3) is **NOT** the official
+  PKU-DAIR project (home page `github.com/kyegomez/Galvatron`); PyPI install
+  is rejected as unofficial. Official source = GitHub only.
+
+### RTX 4060 Worker (gpu4060, WSL2 selected Conda `shardgrid`)
+
+- Conda: env `shardgrid`, prefix `/home/shardgrid/miniconda3/envs/shardgrid`
+- Python: 3.12.13 | PyTorch: 2.7.1+cu118 | torch CUDA runtime: 11.8
+- Driver: 566.07 | GPU: NVIDIA GeForce RTX 4060 Laptop GPU | cap 8.9
+- Galvatron: NOT INSTALLED
+
+### GTX 1650 Worker (gpu1060, WSL2 selected Conda `shardgrid`)
+
+- Conda: env `shardgrid`, prefix `/home/shardgrid/miniconda3/envs/shardgrid`
+- Python: 3.12.13 | PyTorch: 2.7.1+cu118 | torch CUDA runtime: 11.8
+- Driver: 527.41 | GPU: NVIDIA GeForce GTX 1650 | cap 7.5
+- Galvatron: NOT INSTALLED
+
+### Compatibility comparison
+
+| Worker | python (>=3.8) | pytorch (>=2.0.1) | cuda (declared) | Galvatron | status |
+|--------|----------------|-------------------|-----------------|-----------|--------|
+| gpu4060 | MATCH (3.12.13) | MATCH (2.7.1+cu118) | REQUIREMENT UNKNOWN (actual 11.8) | NOT INSTALLED | NOT INSTALLED |
+| gpu1060 | MATCH (3.12.13) | MATCH (2.7.1+cu118) | REQUIREMENT UNKNOWN (actual 11.8) | NOT INSTALLED | NOT INSTALLED |
+
+Overall: `NOT INSTALLED` - Python and PyTorch satisfy the declared
+requirements on both Workers; no Galvatron installation exists yet.
+
+### Blockers / findings
+
+- Galvatron is not installed on either Worker (expected; T056 install spike
+  decides).
+- Declared dependencies are mostly absent on both Workers: numpy,
+  transformers, torchvision, yacs, sentencepiece, scipy, h5py, attrs, six,
+  pybind11, flash_attn are NOT present; only `packaging` 26.3 is installed.
+  (Verified live via the WSL selected Conda runtime.)
+- PyPI `galvatron` is an unofficial third-party package; only the official
+  GitHub source is acceptable.
+- No environment change was made: no upgrade/downgrade of Python, PyTorch,
+  CUDA, and no Conda env creation/replacement (detect-first / reuse-first).
+- T055 PASS means "version compatibility comparison completed" only; it does
+  not mean Galvatron ran on the GPUs (that is T056-T060).
+- Final Galvatron support decision remains T061.
+
+### Evidence
+
+- `tests/integration/test_engine_versions.py` (13 logic cases + 1 live test)
+- `src/shardgrid/engines/compatibility.py` (declared-requirements collection,
+  worker version evidence, comparison)
+- Live evidence: `/var/tmp/shardgrid/engines/galvatron-versions-latest.json`
+
 ## Rules
 
 - Detect-first / reuse-first: an existing official Galvatron in the selected

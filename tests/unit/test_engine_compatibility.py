@@ -13,9 +13,13 @@ from shardgrid.engines.compatibility import (
     GalvatronEvidence,
     _parse_install_preflight,
     _parse_version,
+    build_worker_version_script,
+    collect_galvatron_declared_requirements,
     collect_galvatron_evidence,
+    collect_worker_version_evidence,
     evaluate_galvatron,
     load_galvatron_evidence,
+    parse_worker_version_evidence,
     run_galvatron_check,
     save_galvatron_evidence,
 )
@@ -552,3 +556,171 @@ def test_preflight_parser_extracts_packages() -> None:
     assert "transformers-4.45.1" in packages
     assert "torch-2.7.1+cu118" in packages
     assert _parse_install_preflight("nothing to say") == []
+
+
+SETUP_PY_SAMPLE = '''
+from setuptools import setup, find_packages, Extension
+
+_deps = [
+    "torch>=2.0.1",
+    "torchvision>=0.15.2",
+    "numpy<2.0.0",
+    "transformers==4.49.0",
+]
+
+if FLASH_ATTN_INSTALL:
+    _deps.append("flash-attn>=2.0.8")
+
+setup(
+    name="hetu-galvatron",
+    version="2.4.1",
+    python_requires=">=3.8",
+    install_requires=_deps,
+)
+'''
+
+PYPI_OFFICIAL_JSON = json.dumps(
+    {
+        "info": {
+            "name": "galvatron",
+            "version": "0.0.3",
+            "home_page": "https://github.com/kyegomez/Galvatron",
+            "project_urls": {"Homepage": "https://github.com/kyegomez/Galvatron"},
+            "requires_python": "",
+            "requires_dist": ["transformers", "torch"],
+        }
+    }
+)
+
+
+class _Fetch:
+    def __init__(self, mapping: dict[str, str | None]) -> None:
+        self.mapping = mapping
+
+    def __call__(self, url: str, timeout: float) -> str | None:
+        for pattern, text in self.mapping.items():
+            if pattern in url:
+                return text
+        return None
+
+
+def test_declared_requirements_from_official_github_setup_py() -> None:
+    fetch = _Fetch(
+        {
+            "raw.githubusercontent.com/PKU-DAIR/Hetu-Galvatron": SETUP_PY_SAMPLE,
+            "pypi.org": PYPI_OFFICIAL_JSON,
+        }
+    )
+    requirements = collect_galvatron_declared_requirements(fetcher=fetch, timeout=5)
+    assert requirements.obtained is True
+    assert requirements.source is not None and "PKU-DAIR/Hetu-Galvatron" in requirements.source
+    assert requirements.version == "2.4.1"
+    assert requirements.python_requires == ">=3.8"
+    assert requirements.torch_requirement == "torch>=2.0.1"
+    assert requirements.cuda_requirement is None
+    assert "torchvision>=0.15.2" in requirements.requires_dist
+    assert any("GALVATRON_FLASH_ATTN_INSTALL" in item for item in requirements.diagnostics)
+
+
+def test_declared_requirements_reject_unofficial_pypi() -> None:
+    fetch = _Fetch(
+        {
+            "raw.githubusercontent.com": None,
+            "pypi.org": PYPI_OFFICIAL_JSON,
+        }
+    )
+    requirements = collect_galvatron_declared_requirements(fetcher=fetch, timeout=5)
+    assert requirements.obtained is False
+    assert any("NOT the official PKU-DAIR" in item for item in requirements.pypi_findings)
+    assert requirements.torch_requirement is None
+
+
+def test_declared_requirements_unobtainable_no_guessing() -> None:
+    requirements = collect_galvatron_declared_requirements(
+        fetcher=_Fetch({}), timeout=5
+    )
+    assert requirements.obtained is False
+    assert requirements.source is None
+    assert requirements.version is None
+    assert requirements.python_requires is None
+    assert requirements.torch_requirement is None
+    assert requirements.diagnostics
+
+
+def test_split_requirement_parsing() -> None:
+    from shardgrid.engines.compatibility import _split_requirement
+
+    assert _split_requirement("torch>=2.0.1") == ("torch", ">=2.0.1")
+    assert _split_requirement("numpy<2.0.0") == ("numpy", "<2.0.0")
+    assert _split_requirement("six>=1.15.0") == ("six", ">=1.15.0")
+
+
+def test_parse_worker_version_evidence_marker() -> None:
+    payload = parse_worker_version_evidence(
+        'banner\nVERSION_EVIDENCE {"worker_id": "gpu4060", "python_version": "3.12.13"}\n'
+    )
+    assert payload == {"worker_id": "gpu4060", "python_version": "3.12.13"}
+    assert parse_worker_version_evidence("nothing here") is None
+    assert parse_worker_version_evidence("VERSION_EVIDENCE not-json") is None
+
+
+def test_worker_version_script_injects_worker_id() -> None:
+    script = build_worker_version_script(worker_id="gpu4060")
+    assert 'worker_id = "gpu4060"' in script
+    assert 'VERSION_EVIDENCE ' in script
+    assert "galvatron_installed" in script
+
+
+class _FakeWrapper:
+    def __init__(self, result: ProcessResult) -> None:
+        self.result = result
+
+    def run_script(self, script: str, *, timeout: float) -> ProcessResult:
+        return self.result
+
+
+def test_collect_worker_version_evidence_live_payload() -> None:
+    stdout = (
+        "VERSION_EVIDENCE "
+        + json.dumps(
+            {
+                "worker_id": "gpu1060",
+                "conda_environment": "shardgrid",
+                "conda_prefix": "/home/shardgrid/miniconda3/envs/shardgrid",
+                "python_version": "3.12.13",
+                "torch_version": "2.7.1+cu118",
+                "torch_cuda_version": "11.8",
+                "torch_cuda_available": True,
+                "gpu_name": "NVIDIA GeForce GTX 1650",
+                "compute_capability": "7.5",
+                "driver_version": "527.41",
+                "galvatron_installed": False,
+                "galvatron_source": None,
+            }
+        )
+    )
+    evidence = collect_worker_version_evidence(
+        _FakeWrapper(_FakeResult(stdout=stdout)), worker_id="gpu1060"
+    )
+    assert evidence.evidence_status == "live"
+    assert evidence.torch_version == "2.7.1+cu118"
+    assert evidence.compute_capability == "7.5"
+    assert evidence.galvatron_installed is False
+
+
+def test_collect_worker_version_evidence_missing_marker_is_pending() -> None:
+    evidence = collect_worker_version_evidence(
+        _FakeWrapper(_FakeResult(stdout="nothing", stderr="boom")), worker_id="gpu1060"
+    )
+    assert evidence.evidence_status == "pending"
+    assert any("no VERSION_EVIDENCE marker" in item for item in evidence.diagnostics)
+
+
+def test_collect_worker_version_evidence_wrapper_failure_is_pending() -> None:
+    class _BrokenWrapper:
+        def run_script(self, script: str, *, timeout: float) -> ProcessResult:
+            raise RuntimeError("ssh failed")
+
+    evidence = collect_worker_version_evidence(_BrokenWrapper(), worker_id="gpu4060")
+    assert evidence.evidence_status == "pending"
+    assert any("runtime wrapper failed" in item for item in evidence.diagnostics)

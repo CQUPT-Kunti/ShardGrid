@@ -9,6 +9,7 @@ description = "ShardGrid control-plane package"
 readme = "README.md"
 dependencies = [
     "PyYAML>=6,<7",
+    "packaging>=24,<26",
 ]
 
 [project.scripts]

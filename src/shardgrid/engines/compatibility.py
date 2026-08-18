@@ -22,14 +22,19 @@ profiler / search / pipeline / checkpoint) belongs to T056-T060, not here.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
+
+from packaging.specifiers import SpecifierSet
 
 from shardgrid.common.enums import BackendStatus, FailureStage, SerializableStrEnum
 from shardgrid.common.process import ProcessResult, run_process
@@ -44,6 +49,17 @@ GALVATRON_PYPI_INSTALL = "python -m pip install galvatron"
 GALVATRON_GITHUB_INSTALL = (
     f"git clone {GALVATRON_OFFICIAL_GITHUB} <dir> && python -m pip install -e <dir>"
 )
+
+GALVATRON_PYPI_JSON_URL = "https://pypi.org/pypi/galvatron/json"
+GALVATRON_GITHUB_SETUP_URLS = (
+    "https://raw.githubusercontent.com/PKU-DAIR/Hetu-Galvatron/main/setup.py",
+    "https://raw.githubusercontent.com/PKU-DAIR/Hetu-Galvatron/master/setup.py",
+)
+
+# Declared-dependency names that map to the CUDA comparison dimension.
+_CUDA_REQUIREMENT_NAMES = ("cudatoolkit", "cuda-python", "nvidia-cuda")
+
+VERSION_EVIDENCE_MARKER = "VERSION_EVIDENCE "
 
 # Packages whose upgrade/change inside the selected environment is treated as
 # destructive and therefore requires a manual action instead of automation.
@@ -1245,3 +1261,747 @@ def load_galvatron_evidence(path: str | Path) -> GalvatronCompatibilityResult:
         install_command_used=data.get("install_command_used"),
         limitations=tuple(str(item) for item in data.get("limitations", [])),
     )
+
+
+class ComparisonStatus(SerializableStrEnum):
+    MATCH = "MATCH"
+    VERSION_MISMATCH = "VERSION MISMATCH"
+    REQUIREMENT_UNKNOWN = "REQUIREMENT UNKNOWN"
+    NOT_INSTALLED = "NOT INSTALLED"
+    BLOCKED = "BLOCKED"
+
+
+@dataclass(frozen=True)
+class GalvatronDeclaredRequirements:
+    """Declared Galvatron requirements collected from official sources only."""
+
+    source: str | None
+    version: str | None
+    python_requires: str | None
+    requires_dist: tuple[str, ...]
+    torch_requirement: str | None
+    cuda_requirement: str | None
+    obtained: bool
+    pypi_findings: tuple[str, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "version": self.version,
+            "python_requires": self.python_requires,
+            "requires_dist": list(self.requires_dist),
+            "torch_requirement": self.torch_requirement,
+            "cuda_requirement": self.cuda_requirement,
+            "obtained": self.obtained,
+            "pypi_findings": list(self.pypi_findings),
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+def _fetch_text(url: str, timeout: float) -> str | None:
+    request = urllib.request.Request(url, headers={"User-Agent": "shardgrid-t055/0.1"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _split_requirement(requirement: str) -> tuple[str, str | None]:
+    match = re.match(r"^([A-Za-z0-9._-]+)\s*(.*)$", requirement.strip())
+    if not match:
+        return requirement.strip(), None
+    name, spec = match.group(1), match.group(2).strip()
+    return name, spec or None
+
+
+def _extract_setup_py(text: str) -> tuple[str | None, str | None, str | None, list[str]]:
+    name_match = re.search(r'name\s*=\s*"([^"]+)"', text)
+    version_match = re.search(r'version\s*=\s*"([^"]+)"', text)
+    python_match = re.search(r'python_requires\s*=\s*"([^"]+)"', text)
+    deps: list[str] = []
+    deps_match = re.search(r"_deps\s*=\s*\[(.*?)\]\n", text, re.DOTALL)
+    if deps_match:
+        deps = re.findall(r'"([^"]+)"', deps_match.group(1))
+    return (
+        name_match.group(1) if name_match else None,
+        version_match.group(1) if version_match else None,
+        python_match.group(1) if python_match else None,
+        deps,
+    )
+
+
+def _extract_declared_dimensions(
+    requires_dist: Sequence[str],
+) -> tuple[str | None, str | None, tuple[str, ...]]:
+    torch_requirement: str | None = None
+    cuda_requirement: str | None = None
+    other: list[str] = []
+    for requirement in requires_dist:
+        name, _ = _split_requirement(requirement)
+        if name == "torch" and torch_requirement is None:
+            torch_requirement = requirement
+        elif name in _CUDA_REQUIREMENT_NAMES or name.startswith("nvidia-cuda"):
+            cuda_requirement = requirement
+        else:
+            other.append(requirement)
+    return torch_requirement, cuda_requirement, tuple(other)
+
+
+def collect_galvatron_declared_requirements(
+    *,
+    fetcher: Callable[[str, float], str | None] | None = None,
+    timeout: float = 20.0,
+) -> GalvatronDeclaredRequirements:
+    """Collect Galvatron declared requirements from official sources.
+
+    Official sources only: the official GitHub ``PKU-DAIR/Hetu-Galvatron``
+    setup metadata first, then the PyPI JSON API only when its recorded
+    metadata matches the official project.  When no official information can be
+    obtained, ``obtained=False`` is reported and nothing is guessed.
+    """
+    fetch = fetcher or _fetch_text
+    diagnostics: list[str] = []
+    pypi_findings: list[str] = []
+    python_requires: str | None = None
+    requires_dist: list[str] = []
+    source: str | None = None
+    version: str | None = None
+
+    setup_text: str | None = None
+    for url in GALVATRON_GITHUB_SETUP_URLS:
+        setup_text = fetch(url, timeout)
+        if setup_text is not None:
+            break
+    if setup_text is not None:
+        name, setup_version, setup_python, deps = _extract_setup_py(setup_text)
+        if name and "galvatron" in name.lower() and deps:
+            source = f"github:PKU-DAIR/Hetu-Galvatron (setup.py, {setup_version or 'unknown'})"
+            version = setup_version
+            python_requires = setup_python
+            requires_dist = deps
+            if "FLASH_ATTN_INSTALL" in setup_text:
+                diagnostics.append(
+                    "setup.py declares conditional deps via GALVATRON_FLASH_ATTN_INSTALL"
+                    " (flash-attn>=2.0.8, packaging); recorded as declared conditional"
+                )
+        else:
+            diagnostics.append(
+                "official GitHub setup.py fetched but no parseable Galvatron metadata"
+            )
+    else:
+        diagnostics.append("official GitHub setup.py could not be fetched")
+
+    pypi_text = fetch(GALVATRON_PYPI_JSON_URL, timeout)
+    pypi: dict[str, Any] | None = None
+    if pypi_text is not None:
+        try:
+            payload = json.loads(pypi_text)
+        except ValueError:
+            payload = None
+        pypi = payload if isinstance(payload, dict) else None
+    if pypi is not None:
+        info = pypi.get("info") or {}
+        pypi_name = str(info.get("name") or "")
+        pypi_home = str(info.get("home_page") or "")
+        project_urls = {
+            str(key).lower(): str(value)
+            for key, value in (info.get("project_urls") or {}).items()
+        }
+        is_official_pypi = GALVATRON_OFFICIAL_GITHUB_ORIGIN in pypi_home or any(
+            GALVATRON_OFFICIAL_GITHUB_ORIGIN in value for value in project_urls.values()
+        )
+        if not is_official_pypi:
+            pypi_findings.append(
+                f"PyPI package {pypi_name!r} (version {info.get('version')}) is NOT the "
+                f"official PKU-DAIR project (home_page={pypi_home or 'none'}); "
+                "PyPI install is rejected as unofficial"
+            )
+        elif python_requires is None:
+            source = "pypi:galvatron"
+            version = str(info.get("version") or None)
+            python_requires = str(info.get("requires_python") or None) or None
+            requires_dist = [
+                str(item) for item in (info.get("requires_dist") or []) if item
+            ]
+    else:
+        pypi_findings.append("PyPI JSON API could not be fetched")
+
+    torch_requirement, cuda_requirement, other = _extract_declared_dimensions(
+        requires_dist
+    )
+    return GalvatronDeclaredRequirements(
+        source=source,
+        version=version,
+        python_requires=python_requires,
+        requires_dist=tuple(requires_dist),
+        torch_requirement=torch_requirement,
+        cuda_requirement=cuda_requirement,
+        obtained=source is not None and python_requires is not None,
+        pypi_findings=tuple(pypi_findings),
+        diagnostics=tuple(diagnostics),
+    )
+
+
+@dataclass(frozen=True)
+class WorkerVersionEvidence:
+    """Real runtime evidence for one physical GPU Worker (WSL selected Conda)."""
+
+    worker_id: str
+    physical_os: str | None = None
+    runtime_os: str | None = None
+    conda_environment: str | None = None
+    conda_prefix: str | None = None
+    python_executable: str | None = None
+    python_version: str | None = None
+    torch_version: str | None = None
+    torch_cuda_version: str | None = None
+    torch_cuda_available: bool | None = None
+    driver_version: str | None = None
+    gpu_name: str | None = None
+    compute_capability: str | None = None
+    galvatron_installed: bool = False
+    galvatron_version: str | None = None
+    galvatron_source: str | None = None
+    diagnostics: tuple[str, ...] = ()
+    evidence_status: str = "pending"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "physical_os": self.physical_os,
+            "runtime_os": self.runtime_os,
+            "conda_environment": self.conda_environment,
+            "conda_prefix": self.conda_prefix,
+            "python_executable": self.python_executable,
+            "python_version": self.python_version,
+            "torch_version": self.torch_version,
+            "torch_cuda_version": self.torch_cuda_version,
+            "torch_cuda_available": self.torch_cuda_available,
+            "driver_version": self.driver_version,
+            "gpu_name": self.gpu_name,
+            "compute_capability": self.compute_capability,
+            "galvatron_installed": self.galvatron_installed,
+            "galvatron_version": self.galvatron_version,
+            "galvatron_source": self.galvatron_source,
+            "diagnostics": list(self.diagnostics),
+            "evidence_status": self.evidence_status,
+        }
+
+
+@dataclass(frozen=True)
+class VersionComparisonItem:
+    component: str
+    status: ComparisonStatus
+    requirement: str | None = None
+    actual: str | None = None
+    detail: str | None = None
+    impact: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "component": self.component,
+            "status": self.status.value,
+            "requirement": self.requirement,
+            "actual": self.actual,
+            "detail": self.detail,
+            "impact": self.impact,
+        }
+
+
+@dataclass(frozen=True)
+class WorkerVersionComparison:
+    worker_id: str
+    status: ComparisonStatus
+    items: tuple[VersionComparisonItem, ...]
+    mismatches: tuple[VersionComparisonItem, ...]
+    diagnostics: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "status": self.status.value,
+            "items": [item.to_dict() for item in self.items],
+            "mismatches": [item.to_dict() for item in self.mismatches],
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+@dataclass(frozen=True)
+class GalvatronVersionComparison:
+    run_id: str
+    created_at: str
+    requirements: GalvatronDeclaredRequirements
+    workers: tuple[WorkerVersionComparison, ...]
+    overall_status: ComparisonStatus
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "created_at": self.created_at,
+            "requirements": self.requirements.to_dict(),
+            "workers": [worker.to_dict() for worker in self.workers],
+            "overall_status": self.overall_status.value,
+        }
+
+    def to_spike_report(self) -> CompatibilitySpikeReport:
+        return CompatibilitySpikeReport(
+            report_id=self.run_id,
+            component="galvatron-versions",
+            stage=FailureStage.PROBE,
+            machines_tested=[worker.worker_id for worker in self.workers],
+            versions={
+                "galvatron_requirement_source": self.requirements.source or "unknown",
+                "galvatron_requirement_version": self.requirements.version or "unknown",
+                "galvatron_python_requires": self.requirements.python_requires or "unknown",
+                "galvatron_torch_requirement": self.requirements.torch_requirement
+                or "unknown",
+                "galvatron_cuda_requirement": self.requirements.cuda_requirement
+                or "unknown",
+            },
+            commands=[],
+            results=[self.overall_status.value],
+            status=_spike_status_for_comparison(self.overall_status),
+            blockers=self._blockers(),
+            decision=(
+                None
+                if self.overall_status
+                in {ComparisonStatus.MATCH, ComparisonStatus.NOT_INSTALLED}
+                else f"galvatron version comparison: {self.overall_status.value}"
+            ),
+            recommended_next_action=self._recommended_action(),
+            created_at=self.created_at,
+        )
+
+    def _blockers(self) -> list[str]:
+        blockers: list[str] = []
+        for worker in self.workers:
+            for item in worker.mismatches:
+                blockers.append(
+                    f"{worker.worker_id}/{item.component}: {item.status.value} "
+                    f"(requirement={item.requirement!r}, actual={item.actual!r})"
+                )
+        return blockers
+
+    def _recommended_action(self) -> str | None:
+        if self.overall_status == ComparisonStatus.VERSION_MISMATCH:
+            return "record mismatch details; do not auto-upgrade the environment"
+        if self.overall_status == ComparisonStatus.REQUIREMENT_UNKNOWN:
+            return "obtain official Galvatron declared requirements and re-check"
+        if self.overall_status == ComparisonStatus.NOT_INSTALLED:
+            return "no official Galvatron installed on the Workers; T056 install spike decides"
+        if self.overall_status == ComparisonStatus.BLOCKED:
+            return "fix the blocked Worker evidence and re-check"
+        return None
+
+
+def _spike_status_for_comparison(status: ComparisonStatus) -> BackendStatus:
+    if status == ComparisonStatus.MATCH:
+        return BackendStatus.AVAILABLE
+    if status == ComparisonStatus.NOT_INSTALLED:
+        return BackendStatus.NOT_CHECKED
+    if status == ComparisonStatus.BLOCKED:
+        return BackendStatus.BLOCKED
+    return BackendStatus.FAILED
+
+
+def _requirement_satisfied(
+    requirement: str | None, actual: str | None
+) -> tuple[bool, str | None]:
+    if not requirement or not actual:
+        return False, "requirement or actual value missing"
+    _, specifier_text = _split_requirement(requirement)
+    specifier_text = specifier_text or requirement
+    try:
+        specifier = SpecifierSet(specifier_text, prereleases=True)
+    except ValueError as exc:
+        return False, f"declared requirement {requirement!r} is not parseable: {exc}"
+    try:
+        return specifier.contains(actual, prereleases=True), None
+    except ValueError as exc:
+        return False, f"actual version {actual!r} is not parseable: {exc}"
+
+
+def compare_galvatron_versions(
+    requirements: GalvatronDeclaredRequirements,
+    workers: Sequence[WorkerVersionEvidence | Mapping[str, Any]],
+) -> GalvatronVersionComparison:
+    """Compare declared requirements against real per-Worker runtime evidence.
+
+    Pure decision logic: no network, no environment changes, no guessing.
+    """
+    now = _now()
+    comparisons: list[WorkerVersionComparison] = []
+
+    for worker in workers:
+        evidence = (
+            worker
+            if isinstance(worker, WorkerVersionEvidence)
+            else WorkerVersionEvidence(
+                worker_id=str(worker.get("worker_id") or "unknown"),
+                physical_os=_opt_str(worker.get("physical_os")),
+                runtime_os=_opt_str(worker.get("runtime_os")),
+                conda_environment=_opt_str(worker.get("conda_environment")),
+                conda_prefix=_opt_str(worker.get("conda_prefix")),
+                python_executable=_opt_str(worker.get("python_executable")),
+                python_version=_opt_str(worker.get("python_version")),
+                torch_version=_opt_str(worker.get("torch_version")),
+                torch_cuda_version=_opt_str(worker.get("torch_cuda_version")),
+                torch_cuda_available=worker.get("torch_cuda_available"),
+                driver_version=_opt_str(worker.get("driver_version")),
+                gpu_name=_opt_str(worker.get("gpu_name")),
+                compute_capability=_opt_str(worker.get("compute_capability")),
+                galvatron_installed=bool(worker.get("galvatron_installed", False)),
+                galvatron_version=_opt_str(worker.get("galvatron_version")),
+                galvatron_source=_opt_str(worker.get("galvatron_source")),
+                diagnostics=tuple(
+                    str(item) for item in worker.get("diagnostics", [])
+                ),
+                evidence_status=str(worker.get("evidence_status") or "pending"),
+            )
+        )
+        comparisons.append(_compare_worker(evidence, requirements))
+
+    if not comparisons:
+        overall = ComparisonStatus.BLOCKED
+    elif any(c.status == ComparisonStatus.BLOCKED for c in comparisons):
+        overall = ComparisonStatus.BLOCKED
+    elif any(c.status == ComparisonStatus.VERSION_MISMATCH for c in comparisons):
+        overall = ComparisonStatus.VERSION_MISMATCH
+    elif any(c.status == ComparisonStatus.REQUIREMENT_UNKNOWN for c in comparisons):
+        overall = ComparisonStatus.REQUIREMENT_UNKNOWN
+    elif all(c.status == ComparisonStatus.NOT_INSTALLED for c in comparisons):
+        overall = ComparisonStatus.NOT_INSTALLED
+    else:
+        overall = ComparisonStatus.MATCH
+
+    return GalvatronVersionComparison(
+        run_id=f"galvatron-versions-{uuid.uuid4().hex[:12]}",
+        created_at=now,
+        requirements=requirements,
+        workers=tuple(comparisons),
+        overall_status=overall,
+    )
+
+
+def _opt_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _compare_worker(
+    evidence: WorkerVersionEvidence, requirements: GalvatronDeclaredRequirements
+) -> WorkerVersionComparison:
+    if evidence.evidence_status != "live" or evidence.worker_id == "unknown":
+        return WorkerVersionComparison(
+            worker_id=evidence.worker_id,
+            status=ComparisonStatus.BLOCKED,
+            items=(
+                VersionComparisonItem(
+                    component="evidence",
+                    status=ComparisonStatus.BLOCKED,
+                    detail="worker runtime evidence missing or not live",
+                    impact="cannot compare versions without real Worker evidence",
+                ),
+            ),
+            mismatches=(
+                VersionComparisonItem(
+                    component="evidence",
+                    status=ComparisonStatus.BLOCKED,
+                    detail="worker runtime evidence missing or not live",
+                    impact="cannot compare versions without real Worker evidence",
+                ),
+            ),
+            diagnostics=evidence.diagnostics,
+        )
+
+    items: list[VersionComparisonItem] = []
+    mismatches: list[VersionComparisonItem] = []
+
+    installed_item = VersionComparisonItem(
+        component="galvatron",
+        status=(
+            ComparisonStatus.MATCH
+            if evidence.galvatron_installed
+            else ComparisonStatus.NOT_INSTALLED
+        ),
+        requirement="official source only",
+        actual=(
+            f"installed {evidence.galvatron_version or 'unknown'} "
+            f"({evidence.galvatron_source or 'unknown'})"
+            if evidence.galvatron_installed
+            else "not installed"
+        ),
+        impact=(
+            None
+            if evidence.galvatron_installed
+            else "Galvatron is not installed in this WSL Conda training runtime"
+        ),
+    )
+    items.append(installed_item)
+
+    for component, requirement, actual in (
+        ("python", requirements.python_requires, evidence.python_version),
+        ("pytorch", requirements.torch_requirement, evidence.torch_version),
+        ("cuda", requirements.cuda_requirement, evidence.torch_cuda_version),
+    ):
+        if requirement is None:
+            items.append(
+                VersionComparisonItem(
+                    component=component,
+                    status=ComparisonStatus.REQUIREMENT_UNKNOWN,
+                    actual=actual,
+                    detail="no explicit declared requirement; actual value recorded as fact",
+                    impact="cannot verify this dimension without a declared requirement",
+                )
+            )
+            continue
+        if actual is None:
+            item = VersionComparisonItem(
+                component=component,
+                status=ComparisonStatus.BLOCKED,
+                requirement=requirement,
+                actual=actual,
+                detail="Worker evidence for this component is missing",
+                impact="version comparison impossible without the actual value",
+            )
+            items.append(item)
+            mismatches.append(item)
+            continue
+        satisfied, error = _requirement_satisfied(requirement, actual)
+        if error is not None:
+            item = VersionComparisonItem(
+                component=component,
+                status=ComparisonStatus.REQUIREMENT_UNKNOWN,
+                requirement=requirement,
+                actual=actual,
+                detail=f"comparison could not be evaluated: {error}",
+                impact="neither match nor mismatch can be claimed",
+            )
+            items.append(item)
+            continue
+        if satisfied:
+            items.append(
+                VersionComparisonItem(
+                    component=component,
+                    status=ComparisonStatus.MATCH,
+                    requirement=requirement,
+                    actual=actual,
+                )
+            )
+        else:
+            item = VersionComparisonItem(
+                component=component,
+                status=ComparisonStatus.VERSION_MISMATCH,
+                requirement=requirement,
+                actual=actual,
+                detail=(
+                    f"declared {requirement!r} is not satisfied by actual "
+                    f"{actual!r}"
+                ),
+                impact="declared and actual versions differ; no environment change is made",
+            )
+            items.append(item)
+            mismatches.append(item)
+
+    items.append(
+        VersionComparisonItem(
+            component="dependencies",
+            status=ComparisonStatus.REQUIREMENT_UNKNOWN,
+            requirement=(
+                "; ".join(requirements.requires_dist) if requirements.requires_dist else None
+            ),
+            actual="worker dependency versions not collected in T055",
+            detail="declared deps recorded verbatim; per-package Worker evidence is T056+",
+            impact="not verified and not guessed",
+        )
+    )
+
+    if mismatches:
+        worker_status = ComparisonStatus.VERSION_MISMATCH
+    elif any(
+        item.status == ComparisonStatus.BLOCKED for item in items
+    ):
+        worker_status = ComparisonStatus.BLOCKED
+    elif not requirements.obtained or any(
+        item.component in {"python", "pytorch"}
+        and item.status == ComparisonStatus.REQUIREMENT_UNKNOWN
+        for item in items
+    ):
+        worker_status = ComparisonStatus.REQUIREMENT_UNKNOWN
+    elif not evidence.galvatron_installed:
+        worker_status = ComparisonStatus.NOT_INSTALLED
+    else:
+        worker_status = ComparisonStatus.MATCH
+
+    return WorkerVersionComparison(
+        worker_id=evidence.worker_id,
+        status=worker_status,
+        items=tuple(items),
+        mismatches=tuple(mismatches),
+        diagnostics=evidence.diagnostics,
+    )
+
+
+_WORKER_VERSION_SCRIPT = """
+import json
+import os
+import platform
+import subprocess
+import sys
+
+worker_id = "__WORKER_ID__"
+out = {
+    "worker_id": worker_id,
+    "physical_os": "windows",
+    "runtime_os": "wsl2_linux",
+    "conda_environment": os.environ.get("CONDA_DEFAULT_ENV"),
+    "conda_prefix": os.environ.get("CONDA_PREFIX"),
+    "python_executable": sys.executable,
+    "python_version": platform.python_version(),
+    "torch_version": None,
+    "torch_cuda_version": None,
+    "torch_cuda_available": None,
+    "gpu_name": None,
+    "compute_capability": None,
+    "driver_version": None,
+    "galvatron_installed": False,
+    "galvatron_version": None,
+    "galvatron_source": None,
+    "diagnostics": [],
+    "error": None,
+}
+try:
+    import torch
+
+    out["torch_version"] = torch.__version__
+    out["torch_cuda_version"] = str(torch.version.cuda)
+    out["torch_cuda_available"] = bool(torch.cuda.is_available())
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        device = torch.cuda.current_device()
+        out["gpu_name"] = torch.cuda.get_device_name(device)
+        out["compute_capability"] = ".".join(
+            str(part) for part in torch.cuda.get_device_capability(device)
+        )
+except Exception as exc:
+    out["error"] = str(exc)
+    out["diagnostics"].append("torch probe failed: %s" % exc)
+try:
+    import galvatron
+
+    out["galvatron_installed"] = True
+    out["galvatron_version"] = getattr(galvatron, "__version__", None)
+    out["galvatron_source"] = galvatron.__file__
+except ModuleNotFoundError:
+    pass
+except Exception as exc:
+    out["diagnostics"].append("galvatron import failed: %s" % exc)
+try:
+    smi = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+        text=True,
+        timeout=30,
+    )
+    lines = [line.strip() for line in smi.splitlines() if line.strip()]
+    out["driver_version"] = lines[0] if lines else None
+except Exception as exc:
+    out["diagnostics"].append("nvidia-smi failed: %s" % exc)
+print("VERSION_EVIDENCE " + json.dumps(out, sort_keys=True))
+"""
+
+
+def build_worker_version_script(*, worker_id: str) -> str:
+    return _WORKER_VERSION_SCRIPT.replace("__WORKER_ID__", worker_id)
+
+
+def parse_worker_version_evidence(stdout: str) -> dict[str, Any] | None:
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(VERSION_EVIDENCE_MARKER):
+            try:
+                payload = json.loads(stripped.split(" ", 1)[1])
+            except ValueError:
+                return None
+            if isinstance(payload, dict):
+                return payload
+    return None
+
+
+def _classify_worker_galvatron_source(file_path: str | None) -> str | None:
+    if not file_path:
+        return None
+    if GALVATRON_OFFICIAL_GITHUB_ORIGIN in file_path or "Hetu-Galvatron" in file_path:
+        return "github:PKU-DAIR/Hetu-Galvatron (local clone)"
+    return "pypi:galvatron (unverified)"
+
+
+def collect_worker_version_evidence(
+    wrapper: Any,
+    *,
+    worker_id: str,
+    timeout: float = 120.0,
+) -> WorkerVersionEvidence:
+    """Collect real runtime evidence from a Worker's WSL selected Conda runtime.
+
+    Reuses the existing SSH + WSL runtime wrapper (T040) and probe conventions
+    (T041); no transport, WSL, Conda, or GPU probing is reimplemented here.
+    """
+    script = build_worker_version_script(worker_id=worker_id)
+    try:
+        result = wrapper.run_script(script, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - surfaced as BLOCKED evidence
+        return WorkerVersionEvidence(
+            worker_id=worker_id,
+            diagnostics=(f"runtime wrapper failed: {exc}",),
+            evidence_status="pending",
+        )
+    payload = parse_worker_version_evidence(result.stdout)
+    if payload is None:
+        return WorkerVersionEvidence(
+            worker_id=worker_id,
+            diagnostics=(
+                "no VERSION_EVIDENCE marker in runtime output",
+                f"stdout tail: {result.stdout[-500:]}",
+                f"stderr tail: {result.stderr[-500:]}",
+            ),
+            evidence_status="pending",
+        )
+    payload.setdefault("physical_os", "windows")
+    payload.setdefault("runtime_os", "wsl2_linux")
+    galvatron_source = _classify_worker_galvatron_source(payload.get("galvatron_source"))
+    return WorkerVersionEvidence(
+        worker_id=str(payload.get("worker_id") or worker_id),
+        physical_os=_opt_str(payload.get("physical_os")),
+        runtime_os=_opt_str(payload.get("runtime_os")),
+        conda_environment=_opt_str(payload.get("conda_environment")),
+        conda_prefix=_opt_str(payload.get("conda_prefix")),
+        python_executable=_opt_str(payload.get("python_executable")),
+        python_version=_opt_str(payload.get("python_version")),
+        torch_version=_opt_str(payload.get("torch_version")),
+        torch_cuda_version=_opt_str(payload.get("torch_cuda_version")),
+        torch_cuda_available=payload.get("torch_cuda_available"),
+        driver_version=_opt_str(payload.get("driver_version")),
+        gpu_name=_opt_str(payload.get("gpu_name")),
+        compute_capability=_opt_str(payload.get("compute_capability")),
+        galvatron_installed=bool(payload.get("galvatron_installed", False)),
+        galvatron_version=_opt_str(payload.get("galvatron_version")),
+        galvatron_source=galvatron_source,
+        diagnostics=tuple(str(item) for item in payload.get("diagnostics", [])),
+        evidence_status="live",
+    )
+
+
+def save_galvatron_version_comparison(
+    comparison: GalvatronVersionComparison,
+    output_dir: str | Path,
+) -> Path:
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = comparison.to_dict()
+    payload["timestamp"] = _now()
+    path = directory / f"{comparison.run_id}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    (directory / "galvatron-versions-latest.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True)
+    )
+    return path
