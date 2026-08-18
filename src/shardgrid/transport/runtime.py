@@ -44,6 +44,7 @@ class HostExecutor(Protocol):
         command: Sequence[str] | str,
         *,
         stdin: str | bytes | None = None,
+        timeout: float | None = None,
     ) -> ProcessResult: ...
 
 
@@ -78,7 +79,8 @@ class WSLRuntimeWrapper:
     def _selection_preamble(self) -> list[str]:
         if self.config.conda_prefix:
             prefix_bin = shlex.quote(f"{self.config.conda_prefix}/bin")
-            lines = [f"export PATH={prefix_bin}:$PATH"]
+            prefix = shlex.quote(self.config.conda_prefix)
+            lines = [f"export PATH={prefix_bin}:\"$PATH\"", f"export CONDA_PREFIX={prefix}"]
             if self.config.conda_environment:
                 lines.append(
                     f"export CONDA_DEFAULT_ENV={shlex.quote(self.config.conda_environment)}"
@@ -142,7 +144,7 @@ class WSLRuntimeWrapper:
             )
         payload = self.build_payload(command, cwd=cwd, env=env)
         remote_command = self.build_remote_command(payload)
-        return self.executor.run(remote_command)
+        return self.executor.run(remote_command, timeout=timeout)
 
     def run_script(
         self,
@@ -165,10 +167,16 @@ class WSLRuntimeWrapper:
         if not self.config.conda_prefix:
             raise ValueError("no Conda prefix configured for runtime script execution")
         python_executable = shlex.quote(f"{self.config.conda_prefix}/bin/python")
-        payload = (
-            "source ~/.bashrc >/dev/null 2>&1 || true; "
-            f"{python_executable} -"
-        )
+        parts = [
+            "source ~/.bashrc >/dev/null 2>&1 || true",
+            f"export CONDA_PREFIX={shlex.quote(self.config.conda_prefix)}",
+        ]
+        if self.config.conda_environment:
+            parts.append(
+                f"export CONDA_DEFAULT_ENV={shlex.quote(self.config.conda_environment)}"
+            )
+        parts.append(f"{python_executable} -")
+        payload = "; ".join(parts)
         remote_command = wrap_wsl_direct_command(
             self.config.distro,
             self.config.user or "root",
@@ -177,6 +185,7 @@ class WSLRuntimeWrapper:
         return self.executor.run(
             remote_command,
             stdin=script,
+            timeout=timeout,
         )
 
     def classify_runtime_failure(

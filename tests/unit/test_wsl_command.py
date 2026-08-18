@@ -55,15 +55,18 @@ class FakeExecutor:
         self.responses = list(responses)
         self.calls: list[str] = []
         self.scripts: list[str] = []
+        self.timeouts: list[float | None] = []
 
     def run(
         self,
         command: Sequence[str] | str,
         *,
         stdin: str | bytes | None = None,
+        timeout: float | None = None,
     ) -> ProcessResult:
         text = command if isinstance(command, str) else " ".join(command)
         self.calls.append(text)
+        self.timeouts.append(timeout)
         if isinstance(stdin, str):
             self.scripts.append(stdin)
         return self.responses.pop(0)
@@ -91,7 +94,7 @@ def test_payload_uses_configured_conda_prefix_without_activate_or_run() -> None:
 
     assert "conda activate" not in payload
     assert "conda run" not in payload
-    assert "export PATH=/home/shardgrid/miniconda3/envs/shardgrid/bin:$PATH" in payload
+    assert 'export PATH=/home/shardgrid/miniconda3/envs/shardgrid/bin:"$PATH"' in payload
     assert "export CONDA_DEFAULT_ENV=shardgrid" in payload
     assert payload.endswith("python -V")
 
@@ -156,9 +159,7 @@ def test_remote_command_uses_powershell_encoded_wsl_wrapper() -> None:
 
 
 def test_run_preserves_stdout_stderr_and_exit_code() -> None:
-    executor = FakeExecutor(
-        [_result(stdout="out line\n", stderr="err line\n", exit_code=3)]
-    )
+    executor = FakeExecutor([_result(stdout="out line\n", stderr="err line\n", exit_code=3)])
     wrapper = _wrapper(executor=executor)
 
     result = wrapper.run(["python", "-V"])
@@ -169,6 +170,7 @@ def test_run_preserves_stdout_stderr_and_exit_code() -> None:
     assert result.ok is False
     assert executor.calls
     assert executor.calls[0].startswith("powershell -NoProfile")
+    assert executor.timeouts == [None]
 
 
 def test_run_requires_configured_distro() -> None:
@@ -270,7 +272,10 @@ def test_run_script_feeds_script_via_stdin_and_uses_conda_python() -> None:
     executor = FakeExecutor([_result(stdout="3.12.13\n")])
     wrapper = _wrapper(executor=executor)
 
-    result = wrapper.run_script("import sys\nprint(sys.version.split()[0])\n")
+    result = wrapper.run_script(
+        "import sys\nprint(sys.version.split()[0])\n",
+        timeout=45.0,
+    )
 
     assert result.stdout.strip() == "3.12.13"
     remote = executor.calls[0]
@@ -278,6 +283,7 @@ def test_run_script_feeds_script_via_stdin_and_uses_conda_python() -> None:
     assert "/home/shardgrid/miniconda3/envs/shardgrid/bin/python -" in remote
     assert "powershell" not in remote
     assert executor.scripts == ["import sys\nprint(sys.version.split()[0])\n"]
+    assert executor.timeouts == [45.0]
 
 
 def test_run_script_requires_distro_and_prefix() -> None:
