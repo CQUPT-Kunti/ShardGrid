@@ -9,8 +9,11 @@ from shardgrid.common.models import as_hostname
 from shardgrid.distributed.backend import BackendSelection
 from shardgrid.distributed.collectives import (
     build_collectives_script,
+    build_partial_collective_result,
     collectives_outcome,
+    parse_collective_bootstrap,
     parse_collective_result,
+    parse_collective_stages,
     run_pair_collectives,
     save_collectives_evidence,
 )
@@ -51,16 +54,22 @@ def _runtime() -> RuntimeConfig:
 def test_build_collectives_script_injects_parameters() -> None:
     script = build_collectives_script(
         worker_id="gpu1060",
+        worker_ip="10.87.5.15",
+        peer_ip="10.87.5.155",
         rank=1,
         world_size=2,
         master_addr="10.87.5.155",
         master_port=29500,
         backend="nccl",
         interface="eth0",
+        run_id="run-123",
         local_rank=0,
     )
 
     assert 'worker_id = "gpu1060"' in script
+    assert 'worker_ip = "10.87.5.15"' in script
+    assert 'peer_ip = "10.87.5.155"' in script
+    assert 'run_id = "run-123"' in script
     assert "rank = 1" in script
     assert "world_size = 2" in script
     assert '"10.87.5.155"' in script
@@ -69,6 +78,7 @@ def test_build_collectives_script_injects_parameters() -> None:
     assert "NCCL_SOCKET_IFNAME" in script
     assert "GLOO_SOCKET_IFNAME" in script
     assert "eth0" in script
+    assert '["ip", "route", "get", peer_ip]' in script
     assert "python_executable" in script
     assert "torch.cuda.set_device" in script
     assert "dist.init_process_group" in script
@@ -86,6 +96,66 @@ def test_parse_collective_result() -> None:
 def test_parse_collective_result_missing() -> None:
     assert parse_collective_result("no result here") is None
     assert parse_collective_result('COLLECTIVE_RESULT not-json') is None
+
+
+def test_parse_collective_bootstrap_and_stages_without_final_result() -> None:
+    bootstrap = {
+        "peer_ip": "10.87.5.15",
+        "route_output": "10.87.5.15 dev eth3 src 10.87.5.155 uid 1000",
+        "port_range": "net.ipv4.ip_local_port_range = 44620 48715",
+        "run_id": "run-a",
+        "network_interface": "eth3",
+    }
+    stdout = (
+        f"COLLECTIVE_BOOTSTRAP {json.dumps(bootstrap, sort_keys=True)}\n"
+        "BEFORE_INIT\n"
+        "AFTER_INIT\n"
+        "BEFORE_BROADCAST\n"
+    )
+    stderr = "ignored line\n"
+
+    parsed_bootstrap = parse_collective_bootstrap(stdout)
+    stages = parse_collective_stages(stdout, stderr)
+    partial = build_partial_collective_result(
+        stdout=stdout,
+        stderr=stderr,
+        defaults={"rank": 0, "worker_id": "gpu4060"},
+    )
+
+    assert parsed_bootstrap is not None
+    assert parsed_bootstrap["peer_ip"] == "10.87.5.15"
+    assert "dev eth3" in parsed_bootstrap["route_output"]
+    assert stages == ["BEFORE_INIT", "AFTER_INIT", "BEFORE_BROADCAST"]
+    assert partial["last_stage"] == "BEFORE_BROADCAST"
+    assert partial["route_output"] == parsed_bootstrap["route_output"]
+
+
+def test_partial_collective_result_keeps_peer_route_not_master_self() -> None:
+    bootstrap = {
+        "peer_ip": "10.87.5.15",
+        "route_output": "10.87.5.15 dev eth3 src 10.87.5.155 uid 1000",
+        "port_range": "net.ipv4.ip_local_port_range = 44620 48715",
+        "worker_host_ip": "10.87.5.155",
+        "run_id": "run-b",
+        "network_interface": "eth3",
+    }
+    stdout = (
+        f"COLLECTIVE_BOOTSTRAP {json.dumps(bootstrap, sort_keys=True)}\n"
+        "BEFORE_INIT\n"
+    )
+    partial = build_partial_collective_result(
+        stdout=stdout,
+        stderr="",
+        defaults={
+            "rank": 0,
+            "worker_id": "gpu4060",
+            "master_addr": "10.87.5.155",
+        },
+    )
+
+    assert partial["peer_ip"] == "10.87.5.15"
+    assert partial["master_addr"] == "10.87.5.155"
+    assert partial["route_output"].startswith("10.87.5.15 dev eth3")
 
 
 def _rank_result(result: dict | None) -> object:
@@ -327,10 +397,12 @@ def test_live_pair_nccl_collectives_records_real_result() -> None:
         w0,
         w1,
         rank0_worker_id=id0, rank1_worker_id=id1,
+        rank0_worker_ip=str(entry0["ip"]), rank1_worker_ip=str(entry1["ip"]),
         master_addr=selection.master_addr, master_port=selection.master_port,
         backend=selection.backend,
         rank0_interface=rank0_interface,
         rank1_interface=rank1_interface,
+        run_id="test-live-collectives",
         timeout=90.0,
     )
     if rank0.timed_out or rank1.timed_out:
@@ -338,8 +410,13 @@ def test_live_pair_nccl_collectives_records_real_result() -> None:
         rank_metadata[1]["timeout_sockets"] = _socket_snapshot(w1)
 
     evidence = save_collectives_evidence(
-        rank0, rank1, backend=selection.backend, master_addr=selection.master_addr,
-        master_port=selection.master_port, interface=selection.interface,
+        rank0,
+        rank1,
+        run_id="test-live-collectives",
+        backend=selection.backend,
+        master_addr=selection.master_addr,
+        master_port=selection.master_port,
+        interface=selection.interface,
         output_dir="/var/tmp/shardgrid/distributed",
         rank_metadata=rank_metadata,
     )

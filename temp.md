@@ -1,117 +1,208 @@
 # Agent Handoff
 
-Updated: 2026-08-17 (before T049 execution)
+Updated: 2026-08-18
 
-This file is the short handoff for the next agent. Read this before touching
-the worker-access path or the distributed path.
+这个文件只写交接重点。下一位 Agent 先看这里，再碰 Windows / WSL / NCCL / multi-host。
 
-## Status pollution warning
+## 当前真实状态
 
-Earlier agent conclusions were polluted by stale state.
+- `T049` 已真实跑通，已经标记为 `[X]`
+- Machine A 可以通过 SSH 到两台 Windows GPU Worker
+- 真实训练 runtime 是：
+  - `Windows Host`
+  - `WSL2 Ubuntu`
+  - `shardgrid` Conda env
+  - `/home/shardgrid/miniconda3/envs/shardgrid/bin/python`
+- 不要把 Windows Python / Windows Conda 当成训练 runtime
 
-What happened:
+当前 GPU Worker：
 
-- old conversational state was reused after the real worker state had already
-  changed
-- older notes said Windows/WSL/Conda or worker access was still blocked
-- later real verification had already proved part of that was no longer true
+- `10.87.5.155` / `LDJ` / `shardgrid` / RTX 4060 / rank0
+- `10.87.5.15` / `LAPTOP-5G3QUOGM` / `shardgrid` / GTX 1650 / rank1
 
-Concrete stale conclusions that already happened:
-
-- `T029` / `T030` were treated as still incomplete after they had already been
-  completed
-- the RTX 4060 worker was treated as "not prepared" after WSL runtime
-  verification was already real and recorded
-- `T038` was treated as still blocked on SSH after Machine A public-key access
-  had already been fixed
-
-Rule for the next agent:
-
-- do not trust older conversational summaries over current repo evidence
-- re-read `tasks.md`, `docs/operations/bootstrap-findings.md`,
-  `docs/operations/remote-access.md`, and `record.md` before declaring a
-  platform blocked
-- if a current file and an older conversation disagree, trust the current file
-  and rerun the live command if needed
-
-## Current task state
-
-- `T046` `[X]` (distributed smoke program)
-- `T047` `[X]` (multi-host runner dry-run)
-- `T048` `[X]` (NCCL-first backend/interface/rendezvous selection)
-- `T049` `[ ]` (live two-host NCCL collectives) - the active task
-
-Do not regress completed tasks back to blocked without fresh live evidence.
-
-## Current worker reality
-
-Source of truth for machine addresses:
+地址来源：
 
 - `tests/address.json`
 
-Current GPU workers:
+## 前面真正踩过的坑
 
-- `10.87.5.155`
-  - hostname: `LDJ`
-  - Windows user: `shardgrid`
-  - GPU: `NVIDIA GeForce RTX 4060` (rank 0)
-- `10.87.5.15`
-  - hostname: `LAPTOP-5G3QUOGM`
-  - Windows user: `shardgrid`
-  - GPU: `NVIDIA GeForce GTX 1650` (rank 1)
+### 1. 状态污染
 
-Non-GPU Windows machine:
+之前有过旧结论污染当前判断的问题：
 
-- `10.87.5.228`
-  - hostname: `DESKTOP-DFVMAH9`
-  - Windows user: `lei`
+- 明明 T029 / T030 已完成，却被旧上下文继续判成未完成
+- 明明 Worker 已准备好，却被旧状态说成还没准备
+- 明明 SSH 已修好，却还在按旧结论说访问 blocked
 
-Both GPU workers are reachable from Machine A as of 2026-08-17:
+结论：
 
-- SSH + WSL2 Ubuntu respond on both hosts
-- `shardgrid` Conda env on each WSL runtime has torch 2.7.1+cu118
-- `torch.cuda.is_available() == True` on both
-- GPU names verified: `NVIDIA GeForce RTX 4060 Laptop GPU`, `NVIDIA GeForce GTX 1650`
+- 不要盲信旧聊天摘要
+- 先看当前文件：
+  - `specs/001-multi-host-training-mvp/tasks.md`
+  - `record.md`
+  - `docs/operations/*.md`
 
-## WSL runtime truth
+### 2. SSH 通了，不等于训练链路通了
 
-For both GPU workers, the real training runtime is:
+真正要分层看：
 
-- Windows host
-- `WSL2 Ubuntu`
-- Conda executable: `/home/shardgrid/miniconda3/bin/conda`
-- selected env: `shardgrid`
-- prefix: `/home/shardgrid/miniconda3/envs/shardgrid`
-- runtime Python: `/home/shardgrid/miniconda3/envs/shardgrid/bin/python`
+1. Machine A -> Windows SSH
+2. Windows -> WSL Ubuntu
+3. WSL -> selected Conda env
+4. runtime Python 身份
+5. raw TCP
+6. TCPStore
+7. NCCL
 
-Do not treat Windows Python or Windows Conda as the training runtime.
+不要把 SSH 成功误写成 distributed 成功。
 
-## Known blocker for T049 (recorded honestly)
+### 3. Windows Host IP、WSL 路由、历史缓存 IP 容易混
 
-WSL2 currently runs in **NAT networking mode** on both workers:
+前面出过的问题：
 
-- gpu4060 WSL IP: `172.20.208.137/20` (peer unreachable)
-- gpu1060 WSL IP: `192.168.132.81/20` (peer unreachable)
-- Windows LAN IPs (`10.87.5.155` / `10.87.5.15`) are NOT local addresses
-  inside the WSL VMs, so a TCPStore master cannot bind them there
-- `tcp://10.87.5.155:29500` rendezvous therefore hangs
+- 旧 `NetworkState` 污染了新的 rendezvous 选择
+- `master_addr` 曾经被选错
 
-Known clean fix candidates (not yet applied unless a later agent applies them):
+这次真实跑通时的关键值：
 
-- WSL mirrored networking: add `networkingMode=mirrored` to
-  `C:\Users\shardgrid\.wslconfig` on both workers, then `wsl --shutdown`
-- or Windows `netsh interface portproxy` + firewall rules (more fragile for
-  NCCL because of dynamic data-channel ports)
+- `master_addr=10.87.5.155`
+- `master_port=29500`
 
-Do not claim NCCL success without a real two-host process group and real
-tensor-validated collectives.
+### 4. 网卡名不能写死
 
-## Files to trust
+这是实机里最容易误判的一层。
 
-- `docs/wsl-worker.md`
-- `docs/operations/bootstrap-findings.md`
-- `docs/operations/remote-access.md`
-- `docs/operations/hardware-findings.md`
-- `attention.md`
+前面出现过：
+
+- 以为接口固定是 `eth0` 或 `eth3`
+- 实际上必须按本轮路由动态取
+
+本次真实成功时：
+
+- `10.87.5.155 -> 10.87.5.15` 走 `eth3`
+- `10.87.5.15 -> 10.87.5.155` 走 `eth0`
+
+结论：
+
+- 不要写死 `NCCL_SOCKET_IFNAME`
+- 每次都用：
+
+```bash
+ip route get <peer_ip>
+```
+
+取 `dev`
+
+### 5. 不要默认强制改 `ip_local_port_range`
+
+之前试过强制改成 `50000 51000`，结果并不稳定。
+
+这次最终真实跑通时，两台成功使用的是：
+
+```text
+44620 48715
+```
+
+结论：
+
+- 现在代码里没有强制 `sysctl -w`
+- 不要默认在启动前改端口范围
+- 先记录当前值，再判断
+
+### 6. 旧 Python 进程会污染下一轮测试
+
+前面出现过：
+
+- 上一轮失败留下 `python -`
+- `29500` 被占用
+- 看起来像网络问题，实际是残留进程问题
+
+检查方式：
+
+```bash
+ps -ef | grep '[p]ython'
+ss -ltnp | grep ':29500'
+```
+
+### 7. 真正的训练 Python 必须来自 WSL Conda
+
+必须明确记录：
+
+- `CONDA_PREFIX`
+- `CONDA_DEFAULT_ENV`
+- `python_executable`
+
+正确 runtime Python：
+
+```text
+/home/shardgrid/miniconda3/envs/shardgrid/bin/python
+```
+
+### 8. 一个真实代码坑：WSL 直连命令 quoting
+
+之前不是网络坏了，是命令包装层被改坏了。
+
+出错点：
+
+- `run_script()` payload 里拼了 `PATH="$PATH"`
+- 破坏了 `wsl.exe ... /bin/bash -lc` 的 quoting
+
+修复后：
+
+- 不再给 stdin-fed 脚本强塞 `PATH="$PATH"`
+- 只保留：
+  - `CONDA_PREFIX`
+  - `CONDA_DEFAULT_ENV`
+  - 绝对 Conda Python 路径
+
+## T049 真实通过时的结果
+
+- backend：`nccl`
+- rank0：RTX 4060
+- rank1：GTX 1650
+- `broadcast`：PASS
+- `send/recv`：PASS
+- `barrier`：PASS
+- `all_reduce`：PASS
+
+证据文件：
+
+- `/var/tmp/shardgrid/distributed/collectives-latest.json`
+
+这里面有：
+
+- rank0/rank1 的 WSL runtime 证据
+- conda env / prefix
+- runtime Python
+- torch / CUDA
+- network interface
+- 各阶段日志：
+  - `BEFORE_INIT`
+  - `AFTER_INIT`
+  - `BEFORE_BROADCAST`
+  - `AFTER_BROADCAST`
+  - `BEFORE_SEND_RECV`
+  - `AFTER_SEND_RECV`
+  - `BEFORE_BARRIER`
+  - `AFTER_BARRIER`
+  - `BEFORE_ALL_REDUCE`
+  - `AFTER_ALL_REDUCE`
+
+## 建议先看的文件
+
+- `tests/address.json`
 - `specs/001-multi-host-training-mvp/tasks.md`
 - `record.md`
+- `docs/operations/windows-wsl-nccl-troubleshooting.md`
+- `docs/operations/remote-access.md`
+- `docs/operations/bootstrap-findings.md`
+
+## 下一位 Agent 不要再犯的错
+
+1. 不要把旧摘要当成最新事实
+2. 不要把 SSH 成功当成训练链路成功
+3. 不要写死 `eth0` / `eth3`
+4. 不要默认强制改端口范围
+5. 不要忽略旧 `python` 残留进程
+6. 不要把 Windows Python 当成训练 Python
+7. 不要看到 NCCL timeout 就直接判 GPU/CUDA 问题

@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import Never
 
 from shardgrid.cli.commands import register_placeholder_commands
+from shardgrid.cli.commands.dist_test import register_dist_test_command
 from shardgrid.cli.commands.doctor import register_doctor_command
 from shardgrid.cli.commands.network_test import register_network_test_command
 from shardgrid.cli.context import (
@@ -41,6 +42,7 @@ def build_parser() -> CLIArgumentParser:
     parser.add_argument("--json", action="store_true", help="Emit structured JSON output")
     subparsers = parser.add_subparsers(dest="command")
     register_placeholder_commands(subparsers)
+    register_dist_test_command(subparsers)
     register_doctor_command(subparsers)
     register_network_test_command(subparsers)
     return parser

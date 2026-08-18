@@ -19,6 +19,21 @@ from typing import Any
 
 from shardgrid.transport.runtime import WSLRuntimeWrapper
 
+_STAGE_MARKERS = (
+    "BEFORE_INIT",
+    "AFTER_INIT",
+    "BEFORE_BROADCAST",
+    "AFTER_BROADCAST",
+    "BEFORE_SEND_RECV",
+    "AFTER_SEND_RECV",
+    "BEFORE_BARRIER",
+    "AFTER_BARRIER",
+    "BEFORE_ALL_REDUCE",
+    "AFTER_ALL_REDUCE",
+)
+_BOOTSTRAP_PREFIX = "COLLECTIVE_BOOTSTRAP "
+_RESULT_PREFIX = "COLLECTIVE_RESULT "
+
 _COLLECTIVES_SCRIPT = """
 import json
 import os
@@ -39,6 +54,9 @@ master = "__MASTER__"
 port = __PORT__
 backend = "__BACKEND__"
 interface = "__INTERFACE__"
+worker_ip = "__WORKER_IP__"
+peer_ip = "__PEER_IP__"
+run_id = "__RUN_ID__"
 start = time.time()
 stages = []
 
@@ -56,8 +74,11 @@ def mark(stage: str) -> None:
     print(stage, flush=True)
 
 out = {
+    "run_id": run_id,
     "worker_id": worker_id,
     "hostname": socket.gethostname(),
+    "worker_host_ip": worker_ip,
+    "peer_ip": peer_ip,
     "rank": rank,
     "world_size": world_size,
     "local_rank": local_rank,
@@ -78,6 +99,7 @@ out = {
     "route_output": None,
     "port_range": None,
     "stages": stages,
+    "last_stage": None,
     "init_ok": False,
     "broadcast_ok": False,
     "broadcast_tensor": None,
@@ -93,16 +115,39 @@ try:
     if not torch.cuda.is_available():
         raise RuntimeError("torch.cuda.is_available() is False inside selected WSL Conda runtime")
     out["route_output"] = subprocess.check_output(
-        ["ip", "route", "get", master],
+        ["ip", "route", "get", peer_ip],
         text=True,
     ).strip()
     out["port_range"] = subprocess.check_output(
         ["sysctl", "net.ipv4.ip_local_port_range"],
         text=True,
     ).strip()
+    bootstrap = {
+        "run_id": run_id,
+        "rank": rank,
+        "worker_host_ip": worker_ip,
+        "peer_ip": peer_ip,
+        "hostname": out["hostname"],
+        "master_addr": master,
+        "master_port": port,
+        "backend": backend,
+        "network_interface": interface,
+        "route_output": out["route_output"],
+        "port_range": out["port_range"],
+        "cuda_device": f"cuda:{local_rank}",
+        "NCCL_SOCKET_IFNAME": os.environ.get("NCCL_SOCKET_IFNAME"),
+        "GLOO_SOCKET_IFNAME": os.environ.get("GLOO_SOCKET_IFNAME"),
+        "NCCL_SOCKET_FAMILY": os.environ.get("NCCL_SOCKET_FAMILY"),
+        "NCCL_IB_DISABLE": os.environ.get("NCCL_IB_DISABLE"),
+        "NCCL_NET": os.environ.get("NCCL_NET"),
+    }
+    print("COLLECTIVE_BOOTSTRAP " + json.dumps(bootstrap, sort_keys=True), flush=True)
     out["effective_env"] = {
+        "run_id": run_id,
         "rank": rank,
         "interface": interface,
+        "worker_host_ip": worker_ip,
+        "peer_ip": peer_ip,
         "NCCL_SOCKET_IFNAME": os.environ.get("NCCL_SOCKET_IFNAME"),
         "GLOO_SOCKET_IFNAME": os.environ.get("GLOO_SOCKET_IFNAME"),
         "NCCL_SOCKET_FAMILY": os.environ.get("NCCL_SOCKET_FAMILY"),
@@ -112,26 +157,29 @@ try:
         "MASTER_PORT": port,
     }
     print("NCCL_EFFECTIVE_ENV " + json.dumps(out["effective_env"], sort_keys=True), flush=True)
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
-    out["current_device"] = int(torch.cuda.current_device())
+    device = torch.device(f"cuda:{local_rank}" if backend == "nccl" else "cpu")
+    if backend == "nccl":
+        torch.cuda.set_device(device)
+        out["current_device"] = int(torch.cuda.current_device())
     out["gpu_name"] = torch.cuda.get_device_name(local_rank)
     mark("BEFORE_INIT")
-    dist.init_process_group(
-        backend="nccl",
+    init_kwargs = dict(
+        backend=backend,
         init_method="tcp://%s:%d" % (master, port),
         rank=rank,
         world_size=world_size,
-        device_id=device,
     )
+    if backend == "nccl":
+        init_kwargs["device_id"] = device
+    dist.init_process_group(**init_kwargs)
     out["init_ok"] = True
     mark("AFTER_INIT")
 
-    expected_broadcast = torch.tensor([11.0, 22.0, 33.0, 44.0], device="cuda")
+    expected_broadcast = torch.tensor([11.0, 22.0, 33.0, 44.0], device=device)
     broadcast_tensor = (
         expected_broadcast.clone()
         if rank == 0
-        else torch.zeros(4, dtype=torch.float32, device="cuda")
+        else torch.zeros(4, dtype=torch.float32, device=device)
     )
     mark("BEFORE_BROADCAST")
     dist.broadcast(broadcast_tensor, src=0)
@@ -140,14 +188,14 @@ try:
     out["broadcast_tensor"] = broadcast_tensor.detach().cpu().tolist()
     out["broadcast_ok"] = bool(torch.equal(broadcast_tensor, expected_broadcast))
 
-    expected_send = torch.tensor([5.0, 6.0, 7.0, 8.0], device="cuda")
+    expected_send = torch.tensor([5.0, 6.0, 7.0, 8.0], device=device)
     mark("BEFORE_SEND_RECV")
     if rank == 0:
         dist.send(expected_send, dst=1)
         out["send_recv_tensor"] = expected_send.detach().cpu().tolist()
         out["send_recv_ok"] = True
     else:
-        recv_tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
+        recv_tensor = torch.zeros(4, dtype=torch.float32, device=device)
         dist.recv(recv_tensor, src=0)
         torch.cuda.synchronize()
         out["send_recv_tensor"] = recv_tensor.detach().cpu().tolist()
@@ -155,22 +203,26 @@ try:
     torch.cuda.synchronize()
     mark("AFTER_SEND_RECV")
     mark("BEFORE_BARRIER")
-    dist.barrier(device_ids=[local_rank])
+    barrier_kwargs: dict[str, object] = {}
+    if backend == "nccl":
+        barrier_kwargs["device_ids"] = [local_rank]
+    dist.barrier(**barrier_kwargs)
     torch.cuda.synchronize()
     mark("AFTER_BARRIER")
 
-    all_reduce_tensor = torch.full((4,), float(rank + 1), dtype=torch.float32, device="cuda")
+    all_reduce_tensor = torch.full((4,), float(rank + 1), dtype=torch.float32, device=device)
     mark("BEFORE_ALL_REDUCE")
     dist.all_reduce(all_reduce_tensor, op=dist.ReduceOp.SUM)
     torch.cuda.synchronize()
     mark("AFTER_ALL_REDUCE")
-    expected_reduce = torch.full((4,), 3.0, dtype=torch.float32, device="cuda")
+    expected_reduce = torch.full((4,), 3.0, dtype=torch.float32, device=device)
     out["all_reduce_tensor"] = all_reduce_tensor.detach().cpu().tolist()
     out["all_reduce_ok"] = bool(torch.equal(all_reduce_tensor, expected_reduce))
 except Exception as exc:
     out["error"] = str(exc)
 finally:
     out["elapsed_s"] = round(time.time() - start, 3)
+    out["last_stage"] = stages[-1] if stages else None
     print("COLLECTIVE_RESULT " + json.dumps(out, sort_keys=True))
     try:
         if dist.is_initialized():
@@ -195,16 +247,22 @@ class RankCollectiveResult:
 def build_collectives_script(
     *,
     worker_id: str,
+    worker_ip: str,
+    peer_ip: str,
     rank: int,
     world_size: int,
     master_addr: str,
     master_port: int,
     backend: str,
     interface: str,
+    run_id: str,
     local_rank: int = 0,
 ) -> str:
     script = _COLLECTIVES_SCRIPT.replace("__WORKER_ID__", worker_id)
     script = script.replace("__INTERFACE__", interface)
+    script = script.replace("__WORKER_IP__", worker_ip)
+    script = script.replace("__PEER_IP__", peer_ip)
+    script = script.replace("__RUN_ID__", run_id)
     script = script.replace("__RANK__", str(rank))
     script = script.replace("__WORLD_SIZE__", str(world_size))
     script = script.replace("__LOCAL_RANK__", str(local_rank))
@@ -217,9 +275,9 @@ def build_collectives_script(
 def parse_collective_result(stdout: str) -> dict[str, Any] | None:
     for line in stdout.splitlines():
         stripped = line.strip()
-        if stripped.startswith("COLLECTIVE_RESULT "):
+        if stripped.startswith(_RESULT_PREFIX):
             try:
-                payload = json.loads(stripped.split(" ", 1)[1])
+                payload = json.loads(stripped[len(_RESULT_PREFIX) :])
             except ValueError:
                 return None
             if isinstance(payload, dict):
@@ -227,35 +285,110 @@ def parse_collective_result(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def parse_collective_bootstrap(stdout: str) -> dict[str, Any] | None:
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_BOOTSTRAP_PREFIX):
+            try:
+                payload = json.loads(stripped[len(_BOOTSTRAP_PREFIX) :])
+            except ValueError:
+                return None
+            if isinstance(payload, dict):
+                return payload
+    return None
+
+
+def parse_collective_stages(*outputs: str) -> list[str]:
+    stages: list[str] = []
+    seen: set[str] = set()
+    for output in outputs:
+        for line in output.splitlines():
+            marker = line.strip()
+            if marker not in _STAGE_MARKERS or marker in seen:
+                continue
+            seen.add(marker)
+            stages.append(marker)
+    return stages
+
+
+def build_partial_collective_result(
+    *,
+    stdout: str,
+    stderr: str,
+    defaults: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {**defaults}
+    bootstrap = parse_collective_bootstrap(stdout)
+    if bootstrap:
+        payload.update(bootstrap)
+    stages = parse_collective_stages(stdout, stderr)
+    payload["stages"] = stages
+    payload["last_stage"] = stages[-1] if stages else None
+    return payload
+
+
 def launch_rank(
     wrapper: WSLRuntimeWrapper,
     *,
     worker_id: str,
+    worker_ip: str,
+    peer_ip: str,
     rank: int,
     world_size: int,
     master_addr: str,
     master_port: int,
     backend: str,
     interface: str,
+    run_id: str,
     timeout: float = 180.0,
 ) -> RankCollectiveResult:
     script = build_collectives_script(
         worker_id=worker_id,
+        worker_ip=worker_ip,
+        peer_ip=peer_ip,
         rank=rank,
         world_size=world_size,
         master_addr=master_addr,
         master_port=master_port,
         backend=backend,
         interface=interface,
+        run_id=run_id,
         local_rank=0,
     )
     result = wrapper.run_script(script, timeout=timeout)
+    partial = build_partial_collective_result(
+        stdout=result.stdout,
+        stderr=result.stderr,
+        defaults={
+            "run_id": run_id,
+            "rank": rank,
+            "worker_id": worker_id,
+            "worker_host_ip": worker_ip,
+            "peer_ip": peer_ip,
+            "master_addr": master_addr,
+            "master_port": master_port,
+            "backend": backend,
+            "network_interface": interface,
+        },
+    )
+    parsed = parse_collective_result(result.stdout)
+    if parsed is None:
+        parsed = partial
+    else:
+        parsed = {
+            **partial,
+            **parsed,
+            "stages": parsed.get("stages") or partial["stages"],
+            "last_stage": parsed.get("last_stage") or partial["last_stage"],
+            "route_output": parsed.get("route_output") or partial.get("route_output"),
+            "port_range": parsed.get("port_range") or partial.get("port_range"),
+        }
     return RankCollectiveResult(
         rank=rank,
         worker_id=worker_id,
         exit_code=result.exit_code,
         timed_out=result.timed_out,
-        result=parse_collective_result(result.stdout),
+        result=parsed,
         stdout=result.stdout,
         stderr=result.stderr,
         recorded_command=result.recorded_command,
@@ -268,23 +401,29 @@ def run_pair_collectives(
     *,
     rank0_worker_id: str,
     rank1_worker_id: str,
+    rank0_worker_ip: str,
+    rank1_worker_ip: str,
     master_addr: str,
     master_port: int,
     backend: str,
     rank0_interface: str,
     rank1_interface: str,
+    run_id: str,
     timeout: float = 180.0,
 ) -> tuple[RankCollectiveResult, RankCollectiveResult]:
     def run_rank0() -> None:
         nonlocal_holder["rank0"] = launch_rank(
             rank0_wrapper,
             worker_id=rank0_worker_id,
+            worker_ip=rank0_worker_ip,
+            peer_ip=rank1_worker_ip,
             rank=0,
             world_size=2,
             master_addr=master_addr,
             master_port=master_port,
             backend=backend,
             interface=rank0_interface,
+            run_id=run_id,
             timeout=timeout,
         )
 
@@ -292,12 +431,15 @@ def run_pair_collectives(
         nonlocal_holder["rank1"] = launch_rank(
             rank1_wrapper,
             worker_id=rank1_worker_id,
+            worker_ip=rank1_worker_ip,
+            peer_ip=rank0_worker_ip,
             rank=1,
             world_size=2,
             master_addr=master_addr,
             master_port=master_port,
             backend=backend,
             interface=rank1_interface,
+            run_id=run_id,
             timeout=timeout,
         )
 
@@ -340,6 +482,7 @@ def save_collectives_evidence(
     rank0: RankCollectiveResult,
     rank1: RankCollectiveResult,
     *,
+    run_id: str,
     backend: str,
     master_addr: str,
     master_port: int,
@@ -351,6 +494,7 @@ def save_collectives_evidence(
     directory.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).isoformat()
     payload = {
+        "run_id": run_id,
         "timestamp": timestamp,
         "backend": backend,
         "master_addr": master_addr,
