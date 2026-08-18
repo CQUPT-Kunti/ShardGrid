@@ -118,3 +118,16 @@
   - 保留的 NCCL 真实失败：`socketStartConnect: Connect to 10.87.5.155<60728> failed : Software caused connection abort`
 - 结果：FAIL
 - T053 状态：未标记 `[X]`；Gate 2 本轮未真实通过；不能进入 T054
+
+## T054
+- Galvatron compatibility spike harness（src/shardgrid/engines/compatibility.py）
+- detect-first / reuse-first：只检查 selected Conda 环境，默认 check-only，不改 backend、不装包、不替换环境
+- 记录：检测命令、Galvatron 是否存在、version/source、Conda env/prefix、Python executable/version、PyTorch version、CUDA runtime version、执行时间、result/failure diagnostics（每命令 stdout/stderr tail）
+- 状态明确区分：AVAILABLE / NOT INSTALLED / INCOMPATIBLE / BLOCKED / CHECK FAILED；import 成功不等于完全兼容（AVAILABLE 仅 detection-level，能力验证是 T056-T060）
+- 只允许官方来源：PyPI `galvatron`（pip 元数据验证）或 `https://github.com/PKU-DAIR/Hetu-Galvatron`（Home-page / git origin 验证）；unofficial/未验证来源 → BLOCKED + manual action
+- 安装路径 opt-in（allow_install）：`pip install --dry-run` preflight，若会改动 torch/nvidia/triton/cuda/tensorrt → BLOCKED；GitHub editable 安装需 Conda 身份；安装失败保留 diagnostics + manual action
+- 复用 T016 run_process、T036 detect_conda/detect_python、T014 CompatibilitySpikeReport（to_spike_report 映射）
+- 现场 check 结果（Machine A，base env）：NOT INSTALLED（Galvatron 不存在；torch 未安装于控制平面环境，已记录 diagnostics）
+- 测试结果：PASS（21/21 unit；全量 257 passed + 148 skipped，8 个 gpu_probe contract 失败为基线已有；ruff/mypy 通过，107 files）
+- docs/compatibility/galvatron.md 已更新；未写最终支持/不支持结论（属 T061）
+- T054 implementation：DONE；compatibility check（Machine A）：NOT INSTALLED（符合预期）
