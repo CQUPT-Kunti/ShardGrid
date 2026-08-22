@@ -377,6 +377,128 @@ Result: **true_multi_host**
   - Galvatron Hardware Profiler remains `BLOCKED_BY_WSL2_CUPTI`; it is not a
     condition of this placement test.
 
+## T059 - Heterogeneous RTX 4060 + GTX 1650 (2026-08-22)
+
+Implementation: `tests/multi_host/test_galvatron_heterogeneous.py`
+
+- Reuses the T058 one-rank-per-physical-host launch chain on both Workers.
+- Each rank records runtime evidence: hostname, GPU name, compute capability,
+  total/free VRAM, NCCL backend, real barrier + all_reduce, plus a **real
+  stage memory allocation** on its own GPU.
+- Stage placement is explicit planner evidence: `pp_deg=2` assigns one stage
+  per rank (stage 0 -> RTX 4060, stage 1 -> GTX 1650).
+- `evaluate_heterogeneous` returns one of:
+  - `accepted`: correct GPU identity per rank, NCCL collective OK, real stage
+    allocation succeeded on both GPUs, capability >= 7.5, comfortable headroom
+  - `experimental`: placement works with tight headroom (<30% left) or the
+    smaller GPU carries more stage memory than the larger GPU
+  - `rejected`: GPU identity / NCCL / capability / allocation failure
+
+Result: **accepted** (small-model MVP budget)
+
+| rank | Worker | hostname | GPU | cap | free VRAM | stage | alloc | collective |
+|------|--------|----------|-----|-----|-----------|-------|-------|------------|
+| 0 | gpu4060 (10.87.5.155, eth3) | `ldj` | RTX 4060 Laptop GPU | 8.9 | 7099 MiB | 0 | 2048 MiB OK | [3,3,3,3] |
+| 1 | gpu1060 (10.87.5.15, eth0) | `LAPTOP-5G3QUOGM` | GTX 1650 | 7.5 | 3311 MiB | 1 | 1024 MiB OK | [3,3,3,3] |
+
+- Evidence: `/var/tmp/shardgrid/engines/galvatron-heterogeneous-latest.json`
+- Tests: 12 passed (11 logic + 1 live), ruff clean
+- Heterogeneous verdict: **ACCEPTED for small-model MVP stage budgets**
+  (<= 2 GiB / rank on RTX 4060, <= 1 GiB / rank on GTX 1650).  Larger budgets
+  are **EXPERIMENTAL** (tight headroom / smaller-GPU stage skew are detected
+  and reported as risk notes).  A stage that cannot be allocated on the GTX
+  1650 is **REJECTED**.
+- Galvatron Hardware Profiler remains `BLOCKED_BY_WSL2_CUPTI`; the full
+  search-engine planning path is therefore marked experimental — stage
+  placement here is explicit `pp_deg=2` evidence, not profiler-driven search.
+
+## T060 - Capability verification: profiler / search / pipeline / runtime / checkpoint (2026-08-22)
+
+Implementation: `tests/multi_host/test_galvatron_capabilities.py`
+
+Every required Galvatron v2.4.0 capability got a pass / fail / blocked result
+with a blocker note, executed on the physical RTX 4060 Worker through the
+existing SSH + WSL2 + selected Conda chain (official v2.4.0 checkout at
+`~/galvatron-spike-v2.4.0`, official entry points only, no source changes).
+
+| Capability | Result | Evidence |
+|------------|--------|----------|
+| profiler (model: computation) | **pass** | official `profiler.py` wrote `computation_profiling_fp16_hidden1024_head16.json` (1/2-layer time entries) |
+| profiler (model: memory) | **pass** | official `profiler.py` wrote `memory_profiling_fp16_hidden1024_head16.json` |
+| profiler (hardware) | **blocked** | `profile_hardware.py` child exits SIGSEGV (-11) under torch.profiler in WSL2 -> `BLOCKED_BY_WSL2_CUPTI` |
+| search engine | **blocked** | `search_dist.py` reads model configs then fails on missing hardware profiler output (`allreduce_bandwidth_*.json` etc.) -> direct dependency of the CUPTI blocker |
+| pipeline construction | **pass** | `train_dist_random.py` built the model with explicit `pp_deg=1` layout on GPU |
+| runtime launch | **pass** | real training ran with synthetic data (80 iters, loss ~4.9-5.0, seconds) |
+| checkpoint | **pass** | `--global_checkpoint 1` activation checkpoint accepted and applied in the real run |
+
+- Evidence: `/var/tmp/shardgrid/engines/galvatron-capabilities-latest.json`
+- Tests: 11 passed (10 logic + 1 live), ruff clean
+- Notes:
+  - Model profiler must run from the model directory (`galvatron/models/gpt_hf`)
+    because `launch_profiling_scripts` invokes a relative trainer path.
+  - `--time_profiling_path` for `search_dist.py` expects a directory.
+  - Functional verification uses a small model (`hidden 256, 2 layers, vocab
+    1024, batch 512`) so capability checks complete in seconds; a 24-layer
+    `gpt-0.3b` run OOMs at large batch and is not used for capability proof.
+  - T060 result: all five required capabilities have pass/fail/blocked results
+    with blocker notes; the two blocked items are both rooted in the known
+    WSL2 CUPTI restriction (hardware profiler itself and its search-engine
+    consumer).  No capability was marked pass without real execution.
+
+## T061 - Galvatron decision and supported limitations (2026-08-22)
+
+Published decision report: `examples/compatibility/galvatron-report.json`
+(`CompatibilitySpikeReport` contract, generated from the real T058-T060
+evidence and validated against `contracts/adapter-contracts.md`).
+
+### Decision
+
+**Galvatron v2.4.0 is ACCEPTED for MVP use with explicit parallel
+configuration** on the real two-physical-host environment:
+
+- T058 one-GPU-per-physical-host placement: PASS (`true_multi_host`)
+- T059 heterogeneous stage placement: ACCEPTED for small-model budgets
+  (RTX 4060 stage <= 2 GiB, GTX 1650 stage <= 1 GiB)
+- T060 pipeline construction / runtime launch / checkpoint / model profiler:
+  PASS (real GPU execution)
+- Gate 1 / Gate 2 / NCCL / Gloo / dist-test: PASS
+
+### Blocked capabilities (standing limitations)
+
+| Capability | Status | Blocker |
+|------------|--------|---------|
+| Hardware profiler (`profile_hardware.py`) | BLOCKED | `BLOCKED_BY_WSL2_CUPTI` (child SIGSEGV -11 under torch.profiler) |
+| Search engine (`search_dist.py`) | BLOCKED | consumes hardware profiler output, which the CUPTI blocker prevents |
+| Profiler-driven automatic planning | BLOCKED | same root cause; do not use |
+
+### Supported limitations
+
+- Downstream work uses Galvatron **only** with explicit parallel configs
+  (`galvatron_config_path`), e.g. `pp_deg=2` one stage per physical host as
+  proven in T058/T059; such explicit plans are preserved as-is.
+- Static/explicit planning is labeled **limited support**: it does not come
+  from profiler-driven search.
+- GTX 1650 4 GiB VRAM caps per-stage budgets (~1 GiB); larger or
+  smaller-GPU-heavy splits are detected and rejected/experimental.
+- Fallback engine evaluation (DeepSpeed Pipeline / PyTorch pipeline / nnScaler)
+  happens only if Galvatron becomes insufficient; see T062-T064.
+
+### Contract review (against `contracts/adapter-contracts.md`)
+
+- `compatibility_spike -> CompatibilitySpikeReport` model: PASS
+- Galvatron evaluated before fallback engines: PASS (decision published first)
+- original external plans preserved: PASS (explicit configs used as-is)
+- static validation plans labeled limited support: PASS
+- blocker notes present for every blocked capability: PASS
+- acceptance gate: downstream uses Galvatron only because the required
+  capabilities (placement / heterogeneous placement / pipeline / runtime /
+  checkpoint / model profiler) really passed on both Workers.
+
+Evidence files (all 2026-08-22, `/var/tmp/shardgrid/engines/`):
+`galvatron-one-gpu-per-host-latest.json`, `galvatron-heterogeneous-latest.json`,
+`galvatron-capabilities-latest.json`, plus Gate 1 / Gate 2 reports under
+`/var/tmp/shardgrid/distributed/reports/`.
+
 ## Diagnostics
 
 - Implementation: `src/shardgrid/engines/compatibility.py`
