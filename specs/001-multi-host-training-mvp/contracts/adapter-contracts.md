@@ -48,11 +48,32 @@ Methods:
 - `prepare(job_snapshot, execution_plan) -> EnginePreparation`
 - `launch_metadata(parallel_plan) -> dict`
 
+Adapter identity and capability:
+
+- Every adapter exposes `engine_id` and a `candidate` record
+  (`ParallelEngineCandidate`) carrying `name`, `version`, `source`,
+  `status` (BackendStatus), `capabilities`, `limitations`, and the
+  compatibility report path.
+- Registered statuses express SUPPORTED (AVAILABLE / EXPERIMENTAL),
+  BLOCKED, and NOT_SELECTED without probing adapter internals; selection is
+  adapter-driven and never hard-codes a framework name in business logic.
+
+Contract errors:
+
+- A method the concrete engine does not support MUST raise
+  `UnsupportedEngineMethodError`; silent fallback is forbidden.
+
 Rules:
 
 - Galvatron must be evaluated before fallback engines.
-- Original external plans must be preserved.
-- Static validation model plans must be labeled as limited support.
+- Original external plans must be preserved (`ParallelPlan.engine_plan_path`).
+- Static validation model plans (explicit parallel configs without
+  profiler-driven search) must be labeled as limited support.
+
+Implemented by: `src/shardgrid/engines/base.py` (`ParallelEngine` protocol,
+`EngineRegistry`, `registered_engine_registry`) and `src/shardgrid/engines/
+models.py` (`ParallelEngineCandidate`, `ProfileResult`, `EnginePreparation`).
+Contract tests: `tests/contract/test_parallel_engine.py`.
 
 ## Planner
 

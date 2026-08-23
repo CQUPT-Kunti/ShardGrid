@@ -1,0 +1,54 @@
+{
+  "acceptance_gates": {
+    "gate1": "PASS (both Workers real CUDA/PyTorch smoke)",
+    "gate2": "PASS (real two-host NCCL process group + collectives)",
+    "hardware_evidence": "T058-T060 + T062-T064 real two-host execution records under /var/tmp/shardgrid/engines/ and /var/tmp/shardgrid/distributed/reports/"
+  },
+  "created_at": "2026-08-23T02:52:43.641636+00:00",
+  "decision": "Galvatron v2.4.0 is the selected MVP parallel engine, used with explicit parallel configuration (one stage per physical host, small stage budgets) as proven by T058/T059/T060 and Gate 1/Gate 2. PyTorch's mature torch.distributed.pipelining is a supported fallback candidate (T063). DeepSpeed Pipeline (T062) and nnScaler (T064) are blocked/not-selected on this environment. The static validation path (explicit plans, no profiler-driven search) is labeled limited MVP support. ShardGrid does NOT reimplement autograd, collectives, CUDA kernels/allocators, or a full pipeline framework: all are delegated to PyTorch, NCCL/Gloo, and the selected engine's documented APIs.",
+  "decision_id": "parallel-engine-decision-2026-08-22",
+  "default_engine": "galvatron",
+  "engines": [
+    {
+      "evidence": "T058 one-GPU-per-host placement true_multi_host; T059 heterogeneous accepted; T060 pipeline/runtime/checkpoint/model-profiler pass; Gate1/Gate2 pass; examples/compatibility/galvatron-report.json (experimental, accepted for MVP with explicit parallel configuration)",
+      "limitations": [
+        "hardware profiler BLOCKED_BY_WSL2_CUPTI",
+        "search engine blocked (depends on hardware profiler)",
+        "static/explicit parallel configs labeled limited support",
+        "GTX 1650 stage budgets <= ~1 GiB"
+      ],
+      "name": "galvatron",
+      "role": "primary_selected",
+      "status": "SELECTED"
+    },
+    {
+      "evidence": "T063 torch.distributed.pipelining two-host GPipe spike PASS (0.9s, both ranks); docs/compatibility/pytorch-pipeline.md",
+      "limitations": [
+        "mature PyTorch API; not required while Galvatron is selected"
+      ],
+      "name": "pytorch_pipeline",
+      "role": "fallback_candidate",
+      "status": "SUPPORTED"
+    },
+    {
+      "evidence": "T062 smallest pp=2 two-host spike: engine.train_batch deadlock >90s; native torch NCCL isend/irecv succeeds on same hosts; TCP snapshot all ESTABLISHED (not firewall/port); docs/compatibility/deepspeed-pipeline.md",
+      "limitations": [
+        "WSL2 two-host NCCL pipeline scheduling deadlock"
+      ],
+      "name": "deepspeed_pipeline",
+      "role": "blocked_candidate",
+      "status": "BLOCKED"
+    },
+    {
+      "evidence": "T064 official 0.8 install resolution replaces torch 2.7.1+cu118 with torch 2.6.0 and the full nvidia-cu12 stack; environment compatibility fails; docs/compatibility/nnscaler.md",
+      "limitations": [
+        "official package requires torch/CUDA stack replacement"
+      ],
+      "name": "nnscaler",
+      "role": "blocked_candidate",
+      "status": "NOT_SELECTED"
+    }
+  ],
+  "scope": "MVP one-GPU-per-physical-host, two WSL2 hosts (RTX 4060 + GTX 1650)",
+  "task": "T065"
+}

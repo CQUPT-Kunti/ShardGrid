@@ -40,8 +40,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from shardgrid.common.enums import SerializableStrEnum
+from shardgrid.common.enums import BackendStatus, SerializableStrEnum
 from shardgrid.common.process import ProcessResult
+from shardgrid.engines.base import UnsupportedEngineMethodError
+from shardgrid.engines.models import (
+    CompatibilitySpikeReport,
+    EnginePreparation,
+    ParallelEngineCandidate,
+    ParallelPlan,
+    ProfileResult,
+)
 
 GALVATRON_OFFICIAL_REPO = "https://github.com/PKU-DAIR/Hetu-Galvatron"
 GALVATRON_OFFICIAL_REF = "v2.4.0"
@@ -1478,3 +1486,110 @@ def load_galvatron_spike_evidence(path: str | Path) -> GalvatronSpikeResult:
         stdout_tail=data.get("stdout_tail"),
         stderr_tail=data.get("stderr_tail"),
     )
+
+
+# ---------------------------------------------------------------------------
+# ParallelEngine adapter (T067)
+# ---------------------------------------------------------------------------
+
+
+class GalvatronEngine:
+    """ParallelEngine adapter for Galvatron (T067).
+
+    Exposes the selected Galvatron engine through the T066 ParallelEngine
+    contract so upper layers never depend on Galvatron internals.  ``plan``
+    produces a static-validation ParallelPlan (limited support label) that
+    preserves the original external plan reference from the job.  Methods
+    that are not implemented on this MVP adapter raise
+    ``UnsupportedEngineMethodError`` instead of silently falling back.
+    """
+
+    engine_id = "galvatron"
+
+    def __init__(self, candidate: ParallelEngineCandidate | None = None) -> None:
+        from shardgrid.engines.base import registered_engine_registry
+
+        self.candidate = candidate or registered_engine_registry().by_name(
+            self.engine_id
+        )
+        if self.candidate is None:
+            raise ValueError("galvatron engine candidate is not registered")
+
+    def compatibility_spike(self, context: object) -> CompatibilitySpikeReport:
+        from shardgrid.common.enums import FailureStage
+        from shardgrid.engines.models import CompatibilitySpikeReport
+
+        del context
+        return CompatibilitySpikeReport(
+            report_id="galvatron-mvp",
+            component="galvatron",
+            stage=FailureStage.PROBE,
+            status=self.candidate.status,
+            machines_tested=[
+                "gpu4060@10.87.5.155 (RTX 4060, cap 8.9)",
+                "gpu1060@10.87.5.15 (GTX 1650, cap 7.5)",
+            ],
+            results=[
+                "T058 one-GPU-per-host placement: true_multi_host",
+                "T059 heterogeneous stage placement: accepted",
+                "T060 pipeline/runtime/checkpoint/model-profiler: pass",
+            ],
+            blockers=list(self.candidate.limitations),
+            decision=(
+                "Galvatron v2.4.0 ACCEPTED for MVP with explicit parallel "
+                "configuration; hardware profiler and search engine blocked "
+                "by WSL2 CUPTI"
+            ),
+            created_at=None,
+        )
+
+    def profile(self, job: object, workers: object) -> ProfileResult:
+        raise UnsupportedEngineMethodError(
+            "galvatron profile integration is not implemented on the MVP "
+            "adapter; hardware profiler is BLOCKED_BY_WSL2_CUPTI"
+        )
+
+    def plan(self, job: object, resources: object, network: object) -> ParallelPlan:
+        from shardgrid.common.models import as_engine_name
+
+        del resources, network
+        world_size = getattr(job, "requested_world_size", 2)
+        external_plan_path = getattr(job, "execution_plan_path", None)
+        return ParallelPlan(
+            parallel_plan_id="galvatron-static-plan",
+            engine=as_engine_name(self.engine_id),
+            engine_plan_path=external_plan_path,
+            model_name=getattr(job, "model", "") or "",
+            world_size=int(world_size),
+            stages=[f"stage{index}" for index in range(int(world_size))],
+            requirements={
+                "plan_mode": "static",
+                "one_gpu_per_host": "1",
+                "gtx1650_stage_budget_mb": "1024",
+            },
+            limitations=[
+                "static validation plan labeled limited support "
+                "(no profiler-driven search; hardware profiler "
+                "BLOCKED_BY_WSL2_CUPTI)"
+            ],
+        )
+
+    def prepare(self, job_snapshot: object, execution_plan: object) -> EnginePreparation:
+        refs: list[str] = []
+        if getattr(job_snapshot, "plan_path", None):
+            refs.append(str(job_snapshot.plan_path))
+        return EnginePreparation(
+            engine_id=self.engine_id,
+            status=BackendStatus.AVAILABLE,
+            snapshot_artifact_refs=refs,
+            diagnostics=["prepare is metadata-only on the MVP adapter"],
+        )
+
+    def launch_metadata(self, parallel_plan: ParallelPlan) -> dict[str, object]:
+        return {
+            "engine": self.engine_id,
+            "plan_mode": "static",
+            "original_plan_path": parallel_plan.engine_plan_path,
+            "world_size": parallel_plan.world_size,
+            "stages": list(parallel_plan.stages),
+        }

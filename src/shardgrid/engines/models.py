@@ -127,6 +127,54 @@ class ParallelPlan:
 
 
 @dataclass(frozen=True)
+class ProfileResult:
+    """Engine profiler output contract (T066 ``profile``)."""
+
+    engine_id: str
+    status: BackendStatus
+    evidence_paths: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProfileResult":
+        return cls(
+            engine_id=str(data["engine_id"]),
+            status=BackendStatus(data.get("status", BackendStatus.NOT_CHECKED.value)),
+            evidence_paths=[str(item) for item in data.get("evidence_paths", [])],
+            diagnostics=[str(item) for item in data.get("diagnostics", [])],
+            notes=[str(item) for item in data.get("notes", [])],
+        )
+
+
+@dataclass(frozen=True)
+class EnginePreparation:
+    """Engine runtime-preparation contract (T066 ``prepare``)."""
+
+    engine_id: str
+    status: BackendStatus
+    snapshot_artifact_refs: list[str] = field(default_factory=list)
+    manual_actions: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EnginePreparation":
+        return cls(
+            engine_id=str(data["engine_id"]),
+            status=BackendStatus(data.get("status", BackendStatus.NOT_CHECKED.value)),
+            snapshot_artifact_refs=[str(item) for item in data.get("snapshot_artifact_refs", [])],
+            manual_actions=[str(item) for item in data.get("manual_actions", [])],
+            diagnostics=[str(item) for item in data.get("diagnostics", [])],
+        )
+
+
+@dataclass(frozen=True)
 class GPUShare:
     worker_id: str
     gpu_index: int = 0
