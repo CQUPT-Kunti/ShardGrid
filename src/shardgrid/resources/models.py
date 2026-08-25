@@ -135,6 +135,9 @@ class NetworkLink:
     tcp_reachable: bool
     latency_ms: float | None = None
     bandwidth_mbps: float | None = None
+    interface_mtu: int | None = None
+    expected_mtu: int | None = None
+    mtu_status: str | None = None
     port: int = 29500
     measured_at: str | None = None
     failure_reason: str | None = None
@@ -153,6 +156,9 @@ class NetworkLink:
             tcp_reachable=bool(data["tcp_reachable"]),
             latency_ms=_optional_float(data, "latency_ms"),
             bandwidth_mbps=_optional_float(data, "bandwidth_mbps"),
+            interface_mtu=_optional_int(data, "interface_mtu"),
+            expected_mtu=_optional_int(data, "expected_mtu"),
+            mtu_status=data.get("mtu_status"),
             port=int(data.get("port", 29500)),
             measured_at=data.get("measured_at"),
             failure_reason=data.get("failure_reason"),

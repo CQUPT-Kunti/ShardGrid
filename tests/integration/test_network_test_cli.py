@@ -27,6 +27,9 @@ def _probe(
         tcp_reachable=tcp,
         latency_ms=latency,
         bandwidth_mbps=bandwidth,
+        interface_mtu=1500,
+        expected_mtu=1500,
+        mtu_status="PASS",
         status=status,
         failure_reason=reason,
         commands=("ping -c 3 10.87.5.15",),
@@ -107,6 +110,8 @@ def test_network_test_json_output(monkeypatch, capsys) -> None:
     assert link["tcp_reachable"] is True
     assert link["bandwidth_mbps"] == 940.0
     assert link["interface"] == "eth0"
+    assert link["expected_mtu"] == 1500
+    assert link["mtu_status"] == "PASS"
 
 
 def test_network_test_all_covers_both_directions(monkeypatch, capsys) -> None:
@@ -185,6 +190,7 @@ def test_network_test_human_output(monkeypatch, capsys) -> None:
     assert exit_code == 0
     assert "gpu4060 -> gpu1060" in captured.out
     assert "940.000" in captured.out
+    assert "mtu: 1500/1500 (PASS)" in captured.out
     assert "network state saved" in captured.out
 
 

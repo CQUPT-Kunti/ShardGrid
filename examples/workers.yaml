@@ -23,6 +23,7 @@ network:
   rendezvous_port: 29500
   iperf3_port: 5201
   interface_preference: null
+  nccl_mtu: 1500
 backend_preference:
   launcher: ssh
   communication_backend: auto
@@ -41,7 +42,7 @@ workers:
   host: machine-c.local
   ssh_user: shardgrid
   ssh_port: 22
-  runtime_distro: Ubuntu
+  runtime_distro: Ubuntu-22.04
   conda_environment: shardgrid
   conda_prefix: /home/shardgrid/miniconda3/envs/shardgrid
   local_world_size: 1
@@ -57,7 +58,7 @@ workers:
   host: machine-d.local
   ssh_user: shardgrid
   ssh_port: 22
-  runtime_distro: Ubuntu
+  runtime_distro: Ubuntu-22.04
   conda_environment: shardgrid
   conda_prefix: /home/shardgrid/miniconda3/envs/shardgrid
   local_world_size: 1

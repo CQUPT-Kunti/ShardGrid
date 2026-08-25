@@ -10,9 +10,10 @@
 #     no existing environment provides a CUDA-ready PyTorch runtime.
 #   - Never installs a Linux NVIDIA display driver inside WSL.
 #   - Never overwrites or deletes an existing Conda environment.
-#   - Never runs sudo/apt or any elevated/reboot/password action.
+#   - Never runs sudo/apt or any password-prompting action.
 #   - Safe automatic mutation is limited to user-space Conda/pip operations
-#     inside the selected WSL training environment.
+#     inside the selected WSL training environment, plus optional MTU
+#     configuration when the script is already running with root privileges.
 #
 # Exit codes:
 #   0 healthy
@@ -31,6 +32,9 @@ RUNTIME_ENV_NAME="${SHARDGRID_RUNTIME_ENV_NAME:-shardgrid}"
 RUNTIME_PYTHON_SPEC="${SHARDGRID_RUNTIME_PYTHON_SPEC:-python=3.12}"
 TORCH_INDEX_URL="${SHARDGRID_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu118}"
 TORCH_PACKAGE_SPEC="${SHARDGRID_TORCH_PACKAGE_SPEC:-torch==2.7.1+cu118}"
+SHARDGRID_NCCL_MTU="${SHARDGRID_NCCL_MTU:-1500}"
+SHARDGRID_NCCL_PEER_IP="${SHARDGRID_NCCL_PEER_IP:-}"
+SHARDGRID_WSL_PERSIST_NCCL_MTU="${SHARDGRID_WSL_PERSIST_NCCL_MTU:-0}"
 
 usage() {
     cat <<'EOF'
@@ -80,6 +84,192 @@ add_manual_action() {
 
 record_command() {
     COMMANDS_RUN+=("$*")
+}
+
+parse_route_dev() {
+    local route_info="${1:-}"
+    awk '
+{
+    for (i = 1; i <= NF; i++) {
+        if ($i == "dev" && i + 1 <= NF) {
+            print $(i + 1)
+            exit
+        }
+    }
+}' <<<"$route_info"
+}
+
+parse_link_mtu() {
+    local link_info="${1:-}"
+    awk '
+{
+    for (i = 1; i <= NF; i++) {
+        if ($i == "mtu" && i + 1 <= NF) {
+            print $(i + 1)
+            exit
+        }
+    }
+}' <<<"$link_info"
+}
+
+build_wsl_boot_mtu_command() {
+    local peer_ip="${1:-}"
+    local mtu="${2:-1500}"
+    printf '%s' "/bin/sh -lc 'peer_ip=$peer_ip; mtu=$mtu; dev=\$(ip route get \"\$peer_ip\" | awk '\''{for(i=1;i<=NF;i++) if(\$i==\"dev\" && i+1<=NF){print \$(i+1); exit}}'\''); [ -n \"\$dev\" ] && ip link set dev \"\$dev\" mtu \"\$mtu\"'"
+}
+
+persist_wsl_mtu_command() {
+    local peer_ip="${1:-}"
+    local mtu="${2:-1500}"
+    local wsl_conf="/etc/wsl.conf"
+    local backup="/etc/wsl.conf.bak.t072_mtu"
+    local boot_command=""
+    boot_command="$(build_wsl_boot_mtu_command "$peer_ip" "$mtu")"
+    [[ -n "$boot_command" ]] || return 1
+
+    if [[ -f "$wsl_conf" ]] && [[ ! -f "$backup" ]]; then
+        cp "$wsl_conf" "$backup" || return 1
+    fi
+
+    if [[ -f "$wsl_conf" ]] && grep -Eq '^[[:space:]]*command[[:space:]]*=' "$wsl_conf"; then
+        return 2
+    fi
+
+    if [[ ! -f "$wsl_conf" ]]; then
+        cat >"$wsl_conf" <<EOF
+[boot]
+command=$boot_command
+EOF
+        return 0
+    fi
+
+    if grep -Eq '^[[:space:]]*\[boot\][[:space:]]*$' "$wsl_conf"; then
+        printf '\ncommand=%s\n' "$boot_command" >>"$wsl_conf" || return 1
+        return 0
+    fi
+
+    cat >>"$wsl_conf" <<EOF
+
+[boot]
+command=$boot_command
+EOF
+}
+
+configure_nccl_path_mtu() {
+    NCCL_ROUTE_OUTPUT=""
+    NCCL_INTERFACE=""
+    NCCL_INTERFACE_MTU_BEFORE=""
+    NCCL_INTERFACE_MTU_AFTER=""
+    NCCL_MTU_STATUS="not_checked"
+    NCCL_DF_1472_STATUS="not_checked"
+    NCCL_DF_1473_STATUS="not_checked"
+    NCCL_WSL_BOOT_STATUS="not_requested"
+    NCCL_WSL_BOOT_COMMAND=""
+
+    if [[ -z "$SHARDGRID_NCCL_PEER_IP" ]]; then
+        return 0
+    fi
+
+    if [[ -z "${SHARDGRID_NCCL_MTU:-}" ]]; then
+        add_manual_action "set SHARDGRID_NCCL_MTU to a valid integer (default is 1500)"
+        NCCL_MTU_STATUS="invalid_config"
+        return 0
+    fi
+
+    NCCL_ROUTE_OUTPUT="$(ip route get "$SHARDGRID_NCCL_PEER_IP" 2>&1 || true)"
+    record_command ip route get "$SHARDGRID_NCCL_PEER_IP"
+    NCCL_INTERFACE="$(parse_route_dev "$NCCL_ROUTE_OUTPUT")"
+    if [[ -z "$NCCL_INTERFACE" ]]; then
+        add_manual_action \
+            "resolve the WSL2 NCCL route to peer $SHARDGRID_NCCL_PEER_IP (ip route get must return a dev)"
+        NCCL_MTU_STATUS="route_dev_missing"
+        return 0
+    fi
+
+    local link_before=""
+    link_before="$(ip link show dev "$NCCL_INTERFACE" 2>&1 || true)"
+    record_command ip link show dev "$NCCL_INTERFACE"
+    NCCL_INTERFACE_MTU_BEFORE="$(parse_link_mtu "$link_before")"
+    if [[ -z "$NCCL_INTERFACE_MTU_BEFORE" ]]; then
+        add_manual_action "read MTU for WSL2 interface $NCCL_INTERFACE"
+        NCCL_MTU_STATUS="mtu_read_failed"
+        return 0
+    fi
+
+    if [[ "$MODE" != "check" && "$NCCL_INTERFACE_MTU_BEFORE" != "$SHARDGRID_NCCL_MTU" ]]; then
+        if [[ "$(id -u)" == "0" ]]; then
+            record_command ip link set dev "$NCCL_INTERFACE" mtu "$SHARDGRID_NCCL_MTU"
+            if ! ip link set dev "$NCCL_INTERFACE" mtu "$SHARDGRID_NCCL_MTU" >/dev/null 2>&1; then
+                add_manual_action \
+                    "set interface $NCCL_INTERFACE MTU to $SHARDGRID_NCCL_MTU for NCCL peer $SHARDGRID_NCCL_PEER_IP"
+                NCCL_MTU_STATUS="set_failed"
+            fi
+        else
+            add_manual_action \
+                "set interface $NCCL_INTERFACE MTU to $SHARDGRID_NCCL_MTU for NCCL peer $SHARDGRID_NCCL_PEER_IP (requires root/CAP_NET_ADMIN)"
+            NCCL_MTU_STATUS="needs_root"
+        fi
+    fi
+
+    local link_after=""
+    link_after="$(ip link show dev "$NCCL_INTERFACE" 2>&1 || true)"
+    record_command ip link show dev "$NCCL_INTERFACE"
+    NCCL_INTERFACE_MTU_AFTER="$(parse_link_mtu "$link_after")"
+    if [[ "$NCCL_INTERFACE_MTU_AFTER" == "$SHARDGRID_NCCL_MTU" ]]; then
+        NCCL_MTU_STATUS="PASS"
+    elif [[ "$NCCL_INTERFACE_MTU_AFTER" =~ ^[0-9]+$ ]]; then
+        NCCL_MTU_STATUS="NCCL_PATH_MTU_UNSAFE"
+        add_manual_action \
+            "NCCL_PATH_MTU_UNSAFE: peer=$SHARDGRID_NCCL_PEER_IP interface=$NCCL_INTERFACE interface_mtu=$NCCL_INTERFACE_MTU_AFTER expected_mtu=$SHARDGRID_NCCL_MTU"
+    fi
+
+    local df1472=""
+    df1472="$(ping -M do -c 1 -s 1472 "$SHARDGRID_NCCL_PEER_IP" 2>&1 || true)"
+    record_command ping -M do -c 1 -s 1472 "$SHARDGRID_NCCL_PEER_IP"
+    if grep -qiE 'command not found|operation not permitted' <<<"$df1472"; then
+        NCCL_DF_1472_STATUS="MTU_PROBE_UNAVAILABLE"
+    elif grep -qi '1 received' <<<"$df1472"; then
+        NCCL_DF_1472_STATUS="PASS"
+    else
+        NCCL_DF_1472_STATUS="FAIL"
+    fi
+
+    local df1473=""
+    df1473="$(ping -M do -c 1 -s 1473 "$SHARDGRID_NCCL_PEER_IP" 2>&1 || true)"
+    record_command ping -M do -c 1 -s 1473 "$SHARDGRID_NCCL_PEER_IP"
+    if grep -qiE 'command not found|operation not permitted' <<<"$df1473"; then
+        NCCL_DF_1473_STATUS="MTU_PROBE_UNAVAILABLE"
+    elif grep -qi '1 received' <<<"$df1473"; then
+        NCCL_DF_1473_STATUS="UNEXPECTED_PASS"
+    else
+        NCCL_DF_1473_STATUS="EXPECTED_BLOCK"
+    fi
+
+    NCCL_WSL_BOOT_COMMAND="$(build_wsl_boot_mtu_command "$SHARDGRID_NCCL_PEER_IP" "$SHARDGRID_NCCL_MTU")"
+    if [[ "$SHARDGRID_WSL_PERSIST_NCCL_MTU" == "1" ]]; then
+        if [[ "$(id -u)" != "0" ]]; then
+            NCCL_WSL_BOOT_STATUS="needs_root"
+            add_manual_action "persist WSL boot MTU fix in /etc/wsl.conf (requires root)"
+        else
+            local persist_rc=0
+            if persist_wsl_mtu_command "$SHARDGRID_NCCL_PEER_IP" "$SHARDGRID_NCCL_MTU"; then
+                NCCL_WSL_BOOT_STATUS="configured"
+            else
+                persist_rc=$?
+                case "$persist_rc" in
+                    2)
+                        NCCL_WSL_BOOT_STATUS="manual_merge_required"
+                        add_manual_action \
+                            "merge the WSL [boot] command in /etc/wsl.conf without overwriting an existing command"
+                        ;;
+                    *)
+                        NCCL_WSL_BOOT_STATUS="persist_failed"
+                        add_manual_action "persist WSL boot MTU fix in /etc/wsl.conf"
+                        ;;
+                esac
+            fi
+        fi
+    fi
 }
 
 find_conda() {
@@ -318,6 +508,8 @@ if [[ "$IPERF3_VERSION" == "not_installed" ]]; then
         "install iperf3 inside the Ubuntu WSL2 runtime (operator action: sudo apt-get install -y iperf3)"
 fi
 
+configure_nccl_path_mtu
+
 # --- NVIDIA / CUDA visibility ------------------------------------------------
 NVIDIA_SMI_PATH="$(command -v nvidia-smi 2>/dev/null || true)"
 NVIDIA_SMI_VERSION=""
@@ -465,6 +657,17 @@ export BOOTSTRAP_TORCH_CUDA_AVAILABLE="$TORCH_CUDA_AVAILABLE"
 export BOOTSTRAP_DECISION_REUSE="$DECISION_REUSE"
 export BOOTSTRAP_DECISION_CREATE_NEEDED="$DECISION_CREATE_NEEDED"
 export BOOTSTRAP_HEALTH="$HEALTH"
+export BOOTSTRAP_NCCL_MTU="$SHARDGRID_NCCL_MTU"
+export BOOTSTRAP_NCCL_PEER_IP="$SHARDGRID_NCCL_PEER_IP"
+export BOOTSTRAP_NCCL_ROUTE_OUTPUT="$NCCL_ROUTE_OUTPUT"
+export BOOTSTRAP_NCCL_INTERFACE="$NCCL_INTERFACE"
+export BOOTSTRAP_NCCL_INTERFACE_MTU_BEFORE="$NCCL_INTERFACE_MTU_BEFORE"
+export BOOTSTRAP_NCCL_INTERFACE_MTU_AFTER="$NCCL_INTERFACE_MTU_AFTER"
+export BOOTSTRAP_NCCL_MTU_STATUS="$NCCL_MTU_STATUS"
+export BOOTSTRAP_NCCL_DF_1472_STATUS="$NCCL_DF_1472_STATUS"
+export BOOTSTRAP_NCCL_DF_1473_STATUS="$NCCL_DF_1473_STATUS"
+export BOOTSTRAP_NCCL_WSL_BOOT_STATUS="$NCCL_WSL_BOOT_STATUS"
+export BOOTSTRAP_NCCL_WSL_BOOT_COMMAND="$NCCL_WSL_BOOT_COMMAND"
 MANUAL_ACTIONS_JOINED="$(IFS=$'\x1f'; printf '%s' "${MANUAL_ACTIONS[*]}")"
 COMMANDS_RUN_JOINED="$(IFS=$'\x1f'; printf '%s' "${COMMANDS_RUN[*]}")"
 export BOOTSTRAP_MANUAL_ACTIONS="$MANUAL_ACTIONS_JOINED"
@@ -538,6 +741,19 @@ data = {
         "reuse_environment": optional(os.environ.get("BOOTSTRAP_DECISION_REUSE")),
         "create_needed": os.environ.get("BOOTSTRAP_DECISION_CREATE_NEEDED") == "true",
     },
+    "nccl_path_mtu": {
+        "peer_ip": optional(os.environ.get("BOOTSTRAP_NCCL_PEER_IP")),
+        "expected_mtu": optional(os.environ.get("BOOTSTRAP_NCCL_MTU")),
+        "route_output": optional(os.environ.get("BOOTSTRAP_NCCL_ROUTE_OUTPUT")),
+        "interface": optional(os.environ.get("BOOTSTRAP_NCCL_INTERFACE")),
+        "interface_mtu_before": optional(os.environ.get("BOOTSTRAP_NCCL_INTERFACE_MTU_BEFORE")),
+        "interface_mtu_after": optional(os.environ.get("BOOTSTRAP_NCCL_INTERFACE_MTU_AFTER")),
+        "status": optional(os.environ.get("BOOTSTRAP_NCCL_MTU_STATUS")),
+        "df_1472": optional(os.environ.get("BOOTSTRAP_NCCL_DF_1472_STATUS")),
+        "df_1473": optional(os.environ.get("BOOTSTRAP_NCCL_DF_1473_STATUS")),
+        "wsl_boot_status": optional(os.environ.get("BOOTSTRAP_NCCL_WSL_BOOT_STATUS")),
+        "wsl_boot_command": optional(os.environ.get("BOOTSTRAP_NCCL_WSL_BOOT_COMMAND")),
+    },
     "health": os.environ.get("BOOTSTRAP_HEALTH", "unknown"),
     "manual_actions": get_list("BOOTSTRAP_MANUAL_ACTIONS"),
     "commands_run": get_list("BOOTSTRAP_COMMANDS_RUN"),
@@ -565,6 +781,16 @@ fi
     echo "torch: version=$TORCH_VERSION cuda_version=$TORCH_CUDA_VERSION cuda_available=$TORCH_CUDA_AVAILABLE"
     echo "nvidia-smi: ${NVIDIA_SMI_PATH:-not_found} ${NVIDIA_GPU_SUMMARY:+($NVIDIA_GPU_SUMMARY)}"
     echo "runtime tools: bash=$BASH_VERSION_LINE lsb_release=$LSB_RELEASE git=$GIT_VERSION iperf3=$IPERF3_VERSION"
+    if [[ -n "$SHARDGRID_NCCL_PEER_IP" ]]; then
+        echo "ShardGrid NCCL network check"
+        echo "  peer: $SHARDGRID_NCCL_PEER_IP"
+        echo "  interface: ${NCCL_INTERFACE:-unknown}"
+        echo "  interface_mtu: ${NCCL_INTERFACE_MTU_AFTER:-unknown}"
+        echo "  expected_mtu: $SHARDGRID_NCCL_MTU"
+        echo "  status: $NCCL_MTU_STATUS"
+        echo "  df_1472: $NCCL_DF_1472_STATUS"
+        echo "  df_1473: $NCCL_DF_1473_STATUS"
+    fi
     echo "decision: reuse=${DECISION_REUSE:-none} create_needed=$DECISION_CREATE_NEEDED"
     echo "health: $HEALTH"
     if ((${#MANUAL_ACTIONS[@]} > 0)); then

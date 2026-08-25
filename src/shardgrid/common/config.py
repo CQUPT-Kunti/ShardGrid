@@ -215,6 +215,7 @@ class NetworkConfig:
     rendezvous_port: int = 29500
     iperf3_port: int = 5201
     interface_preference: str | None = None
+    nccl_mtu: int = 1500
 
     @classmethod
     def from_dict(cls, data: object) -> NetworkConfig:
@@ -230,6 +231,10 @@ class NetworkConfig:
             interface_preference=_optional_string(
                 payload.get("interface_preference"),
                 field_name="network.interface_preference",
+            ),
+            nccl_mtu=_require_int(
+                payload.get("nccl_mtu", 1500),
+                field_name="network.nccl_mtu",
             ),
         )
 

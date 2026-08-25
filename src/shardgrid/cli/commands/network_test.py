@@ -99,10 +99,15 @@ def _human_report(state: Any) -> str:
         bandwidth = "n/a" if link.bandwidth_mbps is None else f"{link.bandwidth_mbps:.3f}"
         status = "reachable" if link.tcp_reachable else "unreachable"
         reason = f" | reason: {link.failure_reason}" if link.failure_reason else ""
+        mtu = (
+            f" | mtu: {link.interface_mtu}/{link.expected_mtu} ({link.mtu_status})"
+            if link.expected_mtu is not None
+            else ""
+        )
         lines.append(
             f"{link.source_worker_id} -> {link.target_worker_id} | "
             f"{'yes' if link.tcp_reachable else 'no'} | {latency} | {bandwidth} | "
-            f"{link.interface or 'n/a'} | {status}{reason}"
+            f"{link.interface or 'n/a'} | {status}{mtu}{reason}"
         )
     return "\n".join(lines)
 
@@ -131,6 +136,7 @@ def _probe_pair(config: Any, source_id: str, target_id: str) -> LinkProbeResult:
         target_ip=target_ip,
         tcp_port=config.network.rendezvous_port,
         iperf3_port=config.network.iperf3_port,
+        expected_mtu=config.network.nccl_mtu,
     )
 
 

@@ -17,6 +17,14 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from shardgrid.common.process import ProcessResult
+from shardgrid.network.mtu import (
+    DF_OVERSIZE_PAYLOAD_IPV4,
+    DF_SAFE_PAYLOAD_IPV4,
+    STATUS_PASS,
+    STATUS_UNAVAILABLE,
+    check_nccl_path_mtu,
+    classify_df_ping,
+)
 from shardgrid.transport.runtime import WSLRuntimeWrapper
 
 Runner = Callable[[Sequence[str] | str], ProcessResult]
@@ -33,6 +41,9 @@ class LinkProbeResult:
     tcp_reachable: bool
     latency_ms: float | None
     bandwidth_mbps: float | None
+    interface_mtu: int | None
+    expected_mtu: int | None
+    mtu_status: str | None
     status: str
     failure_reason: str | None = None
     commands: tuple[str, ...] = ()
@@ -49,6 +60,9 @@ class LinkProbeResult:
             "tcp_reachable": self.tcp_reachable,
             "latency_ms": self.latency_ms,
             "bandwidth_mbps": self.bandwidth_mbps,
+            "interface_mtu": self.interface_mtu,
+            "expected_mtu": self.expected_mtu,
+            "mtu_status": self.mtu_status,
             "status": self.status,
             "failure_reason": self.failure_reason,
             "commands": list(self.commands),
@@ -95,6 +109,11 @@ def discover_interface(runner: Runner, target_ip: str) -> str | None:
     return match.group(1) if match else None
 
 
+def read_interface_link(runner: Runner, interface: str) -> str | None:
+    result = _run(runner, ["ip", "link", "show", "dev", interface])
+    return result.stdout.strip() if result.ok else None
+
+
 def probe_tcp(runner: Runner, target_ip: str, port: int) -> tuple[bool, str]:
     code = (
         "import socket; "
@@ -117,6 +136,12 @@ def probe_ping(runner: Runner, target_ip: str, count: int = 3) -> tuple[float | 
     result = _run(runner, ["ping", "-c", str(count), target_ip])
     raw = result.stdout.strip() or result.stderr.strip()
     return parse_ping_latency(raw), raw
+
+
+def probe_df_ping(runner: Runner, target_ip: str, payload_size: int) -> tuple[str, str]:
+    result = _run(runner, ["ping", "-M", "do", "-c", "1", "-s", str(payload_size), target_ip])
+    raw = result.stdout.strip() or result.stderr.strip()
+    return classify_df_ping(raw, result.exit_code), raw
 
 
 def parse_iperf3_json(output: str) -> float | None:
@@ -177,6 +202,7 @@ def probe_direction(
     target_ip: str,
     tcp_port: int,
     iperf3_port: int,
+    expected_mtu: int = 1500,
     ping_count: int = 3,
     iperf_duration: int = 5,
 ) -> LinkProbeResult:
@@ -184,13 +210,41 @@ def probe_direction(
     failures: list[str] = []
 
     source_ip = discover_source_ip(source_runner)
+    route_result = _run(source_runner, ["ip", "route", "get", target_ip])
+    route_output = route_result.stdout.strip() or route_result.stderr.strip()
     interface = discover_interface(source_runner, target_ip)
+    link_output = read_interface_link(source_runner, interface) if interface else None
+    mtu_check = check_nccl_path_mtu(
+        peer_ip=target_ip,
+        route_output=route_output,
+        link_output=link_output,
+        expected_mtu=expected_mtu,
+    )
     commands.extend(
         [
             "hostname -I",
             f"ip route get {target_ip}",
         ]
     )
+    if interface:
+        commands.append(f"ip link show dev {interface}")
+    if mtu_check.failure_reason():
+        failures.append(mtu_check.failure_reason() or "")
+
+    df_1472_status, df_1472_raw = probe_df_ping(source_runner, target_ip, DF_SAFE_PAYLOAD_IPV4)
+    df_1473_status, df_1473_raw = probe_df_ping(source_runner, target_ip, DF_OVERSIZE_PAYLOAD_IPV4)
+    commands.extend(
+        [
+            f"ping -M do -c 1 -s {DF_SAFE_PAYLOAD_IPV4} {target_ip}",
+            f"ping -M do -c 1 -s {DF_OVERSIZE_PAYLOAD_IPV4} {target_ip}",
+        ]
+    )
+    if df_1472_status not in {STATUS_PASS, STATUS_UNAVAILABLE}:
+        failures.append(f"df ping {DF_SAFE_PAYLOAD_IPV4} failed toward {target_ip}")
+    if df_1473_status == STATUS_PASS:
+        failures.append(
+            f"df ping {DF_OVERSIZE_PAYLOAD_IPV4} unexpectedly passed toward {target_ip}"
+        )
 
     tcp_reachable, tcp_raw = probe_tcp(source_runner, target_ip, tcp_port)
     commands.append(f"tcp {target_ip}:{tcp_port}")
@@ -210,7 +264,17 @@ def probe_direction(
         failures.append(f"iperf3 throughput unavailable: {iperf_raw[:120]}")
 
     raw_output = "\n".join(
-        part for part in (tcp_raw, ping_raw, iperf_raw) if part
+        part
+        for part in (
+            route_output,
+            link_output or "",
+            f"DF_PING_{DF_SAFE_PAYLOAD_IPV4}={df_1472_status} {df_1472_raw}".strip(),
+            f"DF_PING_{DF_OVERSIZE_PAYLOAD_IPV4}={df_1473_status} {df_1473_raw}".strip(),
+            tcp_raw,
+            ping_raw,
+            iperf_raw,
+        )
+        if part
     )
     if tcp_reachable and failures:
         status = "degraded"
@@ -228,6 +292,9 @@ def probe_direction(
         tcp_reachable=tcp_reachable,
         latency_ms=latency_ms,
         bandwidth_mbps=bandwidth_mbps,
+        interface_mtu=mtu_check.interface_mtu,
+        expected_mtu=expected_mtu,
+        mtu_status=mtu_check.status,
         status=status,
         failure_reason="; ".join(failures) if failures else None,
         commands=tuple(commands),
@@ -244,6 +311,7 @@ def run_pairwise_probe(
     target_ip: str,
     tcp_port: int,
     iperf3_port: int,
+    expected_mtu: int = 1500,
 ) -> LinkProbeResult:
     """Run one direction, managing the iperf3 server on the target."""
     start_iperf3_server(target_wrapper.run, iperf3_port)
@@ -254,6 +322,7 @@ def run_pairwise_probe(
         target_ip=target_ip,
         tcp_port=tcp_port,
         iperf3_port=iperf3_port,
+        expected_mtu=expected_mtu,
     )
     stop_iperf3_server(target_wrapper.run, iperf3_port)
     return result

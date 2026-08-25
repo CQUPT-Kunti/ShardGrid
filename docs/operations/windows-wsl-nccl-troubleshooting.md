@@ -1,6 +1,6 @@
 # Windows + WSL2 + NCCL 多机排障记录
 
-更新日期：2026-08-18
+更新日期：2026-08-25
 
 本文档记录 ShardGrid 在真实双 Windows GPU Worker 上做 WSL2 + Conda + PyTorch Distributed / NCCL 联调时，已经实际遇到过的问题、判断方法和处理结论。
 
@@ -428,3 +428,111 @@ export NCCL_DEBUG=INFO
 6. 不要把 Windows Python 或 WSL 系统 Python 当成训练 runtime。
 7. 不要看到 NCCL 超时就直接判 GPU/CUDA 问题，先分层确认 raw TCP 和接口选择。
 8. 不要在 `wsl.exe ... /bin/bash -lc` 的 payload 里随便拼会破坏 quoting 的内容。
+
+## WSL2 / NCCL 跨主机通信必须检查 MTU / PMTU
+
+### 当前已验证配置
+
+ShardGrid 在真实双 WSL2 GPU Worker 上确认可用的默认环境配置是：
+
+- NCCL 实际出口接口 MTU：`1500`
+- 目标 PMTU：`1500`
+
+不要手工固定 TCP MSS。
+
+### 不要硬编码接口名
+
+不要假设接口永远是 `eth0` / `eth1` / `eth3`。
+
+必须每次根据 peer IP 动态解析：
+
+```bash
+ip route get <peer_ip>
+```
+
+从输出里取 `dev`，然后再查看和配置：
+
+```bash
+ip link show <dev>
+```
+
+### 已知故障症状
+
+如果出现：
+
+- `dist.send()` 返回
+- `dist.recv()` 返回
+- receiver 侧 `torch.cuda.synchronize()` 卡住
+
+并且 `ss -tinp` / socket 诊断里出现：
+
+- `Send-Q` 堆积
+- `retrans` 增长
+- `ACK` 不推进
+- `pmtu` 明显大于真实物理路径
+
+优先检查 MTU / PMTU mismatch，不要先怀疑：
+
+- GPU 型号差异
+- tensor shape
+- `lm_head`
+- `Stage1`
+- CUDA 计算
+- NCCL send/recv API 语义
+
+### 快速诊断命令
+
+```bash
+ip route get <peer_ip>
+ip link show <dev>
+ping -M do -s 1472 <peer_ip>
+ping -M do -s 1473 <peer_ip>
+ss -tinp
+```
+
+### 已知成功边界
+
+IPv4 下：
+
+- `1472` payload + `28` 字节 IP/ICMP 头 = `1500`
+
+因此：
+
+- `1472` DF PASS
+- `1473` DF FAIL
+
+是 `MTU=1500` 的正常边界表现。
+
+### NCCL 卡死链路
+
+错误状态：
+
+```text
+WSL2 interface MTU > actual path MTU
+↓
+错误/过大的 PMTU
+↓
+TCP segment 无法稳定经过真实路径
+↓
+retrans / ACK stall
+↓
+NCCL Socket progress 无法完成
+↓
+Recv GPU completion 不结束
+↓
+torch.cuda.synchronize() 看起来像 CUDA/NCCL 卡死
+```
+
+### 不推荐 workaround
+
+不要用这些方式掩盖问题：
+
+- `sleep()`
+- 额外 ACK 包
+- 强制切换 Gloo
+- 修改 tensor shape 让数据变小
+- 固定 TCP MSS
+- 关闭 PMTU discovery
+- 无限增大 NCCL timeout
+
+正确方向是修正实际 NCCL 出口接口 MTU。

@@ -34,6 +34,8 @@ selected findings directory.
 - PyTorch version and `torch.cuda.is_available()` from the selected Conda environment
 - CUDA driver-layer visibility through `nvidia-smi`
 - `iperf3`, `git`, `lsb_release`, and basic runtime metadata
+- optional NCCL path MTU validation/configuration when `SHARDGRID_NCCL_PEER_IP`
+  is provided
 
 ## Runtime Boundary
 
@@ -66,6 +68,45 @@ The script stops with a manual action when it finds any of these:
 - `iperf3` is missing
 
 The script never overwrites or deletes an existing Conda environment.
+
+## WSL2 NCCL MTU
+
+T072 real two-host acceptance confirmed a WSL2 MTU/PMTU mismatch root cause
+for cross-host NCCL hangs. ShardGrid now uses these defaults for WSL2 NCCL
+paths:
+
+- `SHARDGRID_NCCL_MTU=1500`
+- target PMTU: `1500`
+- no fixed TCP MSS override
+
+The bootstrap script can validate or configure the live NCCL path interface
+dynamically from the peer IP:
+
+```bash
+SHARDGRID_NCCL_PEER_IP=10.87.5.15 scripts/bootstrap-wsl.sh --check
+SHARDGRID_NCCL_PEER_IP=10.87.5.15 sudo -E scripts/bootstrap-wsl.sh
+SHARDGRID_NCCL_PEER_IP=10.87.5.15 SHARDGRID_WSL_PERSIST_NCCL_MTU=1 sudo -E scripts/bootstrap-wsl.sh
+```
+
+Behavior:
+
+- resolves the real egress interface with `ip route get <peer_ip>`
+- never hard-codes `eth0` / `eth1` / `eth3`
+- reads the current interface MTU and compares it to the expected `1500`
+- probes the DF boundary:
+  - `1472` should pass
+  - `1473` should not pass on a 1500 path
+- fails honestly when route parsing fails, MTU is unsafe, or root permission is
+  required and unavailable
+
+Persistence support:
+
+- when `SHARDGRID_WSL_PERSIST_NCCL_MTU=1` is set and the script already runs as
+  root, it backs up `/etc/wsl.conf` to `/etc/wsl.conf.bak.t072_mtu`
+- it only writes a `[boot] command=...` when that can be done safely without
+  overwriting an existing `command=`
+- the persisted boot command still resolves the interface dynamically from the
+  peer IP; it does not hard-code an `ethX` name
 
 ## Verification Status
 

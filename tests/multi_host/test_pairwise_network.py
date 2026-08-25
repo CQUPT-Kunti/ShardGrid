@@ -54,7 +54,12 @@ def test_probe_direction_ok_with_live_values() -> None:
         {
             "hostname -I": _result(stdout="10.87.5.30 172.17.0.1\n"),
             "ip route get": _result(stdout="10.87.5.15 via 10.87.5.1 dev eth0 src 10.87.5.30\n"),
+            "ip link show dev eth0": _result(
+                stdout="2: eth0: <BROADCAST> mtu 1500 qdisc mq state UP mode DEFAULT\n"
+            ),
             "create_connection": _result(stdout="tcp_ok\n"),
+            "ping -M do -c 1 -s 1472": _result(stdout="1 packets transmitted, 1 received\n"),
+            "ping -M do -c 1 -s 1473": _result(stderr="100% packet loss", exit_code=1),
             "ping -c": _result(
                 stdout=(
                     "64 bytes from 10.87.5.15: icmp_seq=1 time=0.85 ms\n"
@@ -80,6 +85,9 @@ def test_probe_direction_ok_with_live_values() -> None:
     assert link.latency_ms == 0.88
     assert link.bandwidth_mbps == 940.0
     assert link.interface == "eth0"
+    assert link.interface_mtu is None or link.interface_mtu == 1500
+    assert link.expected_mtu == 1500
+    assert link.mtu_status == "PASS"
     assert link.source_ip == "10.87.5.30"
     assert link.failure_reason is None
     assert link.raw_output
@@ -90,9 +98,14 @@ def test_probe_direction_tcp_unreachable_is_unreachable() -> None:
         {
             "hostname -I": _result(stdout="10.87.5.30\n"),
             "ip route get": _result(stdout="dev eth0"),
+            "ip link show dev eth0": _result(
+                stdout="2: eth0: <BROADCAST> mtu 1500 qdisc mq state UP mode DEFAULT\n"
+            ),
             "create_connection": _result(
                 stderr="ConnectionRefusedError", exit_code=1
             ),
+            "ping -M do -c 1 -s 1472": _result(stdout="1 packets transmitted, 1 received\n"),
+            "ping -M do -c 1 -s 1473": _result(stderr="100% packet loss", exit_code=1),
         }
     )
 
@@ -116,7 +129,12 @@ def test_probe_direction_ping_blocked_keeps_latency_missing() -> None:
         {
             "hostname -I": _result(stdout="10.87.5.30\n"),
             "ip route get": _result(stdout="dev eth0"),
+            "ip link show dev eth0": _result(
+                stdout="2: eth0: <BROADCAST> mtu 1500 qdisc mq state UP mode DEFAULT\n"
+            ),
             "create_connection": _result(stdout="tcp_ok\n"),
+            "ping -M do -c 1 -s 1472": _result(stdout="1 packets transmitted, 1 received\n"),
+            "ping -M do -c 1 -s 1473": _result(stderr="100% packet loss", exit_code=1),
             "ping -c": _result(stderr="Request timeout for icmp_seq 0", exit_code=1),
             "iperf3 -c": _result(stdout=_iperf_json(500_000_000.0)),
         }
@@ -144,7 +162,12 @@ def test_probe_direction_iperf3_failure_keeps_bandwidth_missing() -> None:
         {
             "hostname -I": _result(stdout="10.87.5.30\n"),
             "ip route get": _result(stdout="dev eth0"),
+            "ip link show dev eth0": _result(
+                stdout="2: eth0: <BROADCAST> mtu 1500 qdisc mq state UP mode DEFAULT\n"
+            ),
             "create_connection": _result(stdout="tcp_ok\n"),
+            "ping -M do -c 1 -s 1472": _result(stdout="1 packets transmitted, 1 received\n"),
+            "ping -M do -c 1 -s 1473": _result(stderr="100% packet loss", exit_code=1),
             "ping -c": _result(stdout="64 bytes from 10.87.5.15: time=0.5 ms\n"),
             "iperf3 -c": _result(stderr="unable to connect to server", exit_code=1),
         }
@@ -163,6 +186,38 @@ def test_probe_direction_iperf3_failure_keeps_bandwidth_missing() -> None:
     assert link.bandwidth_mbps is None
     assert link.failure_reason is not None
     assert "iperf3 throughput unavailable" in link.failure_reason
+
+
+def test_probe_direction_reports_unsafe_mtu() -> None:
+    runner = FakeRunner(
+        {
+            "hostname -I": _result(stdout="10.87.5.30\n"),
+            "ip route get": _result(stdout="10.87.5.15 dev eth3 src 10.87.5.155 uid 1000\n"),
+            "ip link show dev eth3": _result(
+                stdout="2: eth3: <BROADCAST> mtu 2800 qdisc mq state UP mode DEFAULT\n"
+            ),
+            "create_connection": _result(stdout="tcp_ok\n"),
+            "ping -M do -c 1 -s 1472": _result(stdout="1 packets transmitted, 1 received\n"),
+            "ping -M do -c 1 -s 1473": _result(stderr="100% packet loss", exit_code=1),
+            "ping -c": _result(stdout="64 bytes from 10.87.5.15: time=0.5 ms\n"),
+            "iperf3 -c": _result(stdout=_iperf_json(500_000_000.0)),
+        }
+    )
+
+    link = probe_direction(
+        runner.run,
+        source_worker_id="gpu4060",
+        target_worker_id="gpu1060",
+        target_ip="10.87.5.15",
+        tcp_port=29500,
+        iperf3_port=5201,
+    )
+
+    assert link.status == "degraded"
+    assert link.interface_mtu == 2800
+    assert link.mtu_status == "NCCL_PATH_MTU_UNSAFE"
+    assert link.failure_reason is not None
+    assert "NCCL_PATH_MTU_UNSAFE" in link.failure_reason
 
 
 def test_ping_latency_parsing() -> None:

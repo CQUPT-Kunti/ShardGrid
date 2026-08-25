@@ -32,6 +32,9 @@ def _probe(
         tcp_reachable=tcp,
         latency_ms=latency,
         bandwidth_mbps=bandwidth,
+        interface_mtu=1500,
+        expected_mtu=1500,
+        mtu_status="PASS",
         status=status,
         failure_reason=reason,
         commands=("ping -c 3 10.87.5.15",),
@@ -49,6 +52,9 @@ def test_link_from_probe_maps_fields() -> None:
     assert link.latency_ms == 0.9
     assert link.bandwidth_mbps == 940.0
     assert link.port == 5201
+    assert link.interface_mtu == 1500
+    assert link.expected_mtu == 1500
+    assert link.mtu_status == "PASS"
     assert link.measured_at
     assert link.failure_reason is None
 

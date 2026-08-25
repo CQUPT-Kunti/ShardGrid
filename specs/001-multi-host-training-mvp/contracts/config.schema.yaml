@@ -95,6 +95,9 @@ schemas:
         default: 5201
       interface_preference:
         type: [string, "null"]
+      nccl_mtu:
+        type: integer
+        default: 1500
 
   BackendPreferenceConfig:
     type: object

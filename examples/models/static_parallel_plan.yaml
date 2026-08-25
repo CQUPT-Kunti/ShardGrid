@@ -1,0 +1,100 @@
+# Static validation ParallelPlan for the supported minimal Transformer (T070).
+#
+# This plan describes REAL two-stage execution of the T068/T069 model:
+# Stage0 (RTX 4060, rank 0) and Stage1 (GTX 1650, rank 1), each owning a
+# non-empty, disjoint set of trainable parameters whose union equals the full
+# model.  It does NOT claim to solve arbitrary graph partitioning: it is a
+# static-validation plan labeled limited_support.
+
+plan_id: static-parallel-plan-minimal
+plan_mode: static
+support_label: limited_support
+engine: galvatron
+# Original external engine plan reference preserved as-is.
+engine_plan_path: /var/tmp/shardgrid/original-external-plan.json
+world_size: 2
+stage_count: 2
+
+model:
+  name: minimal_transformer
+  source: examples/models/minimal_transformer.py
+  total_parameter_count: 664832
+  config:
+    vocab_size: 1024
+    hidden_size: 128
+    num_hidden_layers: 2
+    num_attention_heads: 4
+    max_seq_length: 64
+
+stages:
+  - id: stage0
+    rank: 0
+    worker_id: gpu4060
+    device_hint: "cuda:0 (RTX 4060, verified in T071)"
+    modules: [embed, pos, block0]
+    parameter_count: 336384
+    parameter_ownership:
+      - embed.weight
+      - pos.weight
+      - block0.qkv.weight
+      - block0.proj.weight
+      - block0.ln1.weight
+      - block0.ln1.bias
+      - block0.ln2.weight
+      - block0.ln2.bias
+      - block0.ffn.0.weight
+      - block0.ffn.2.weight
+    activation_out:
+      name: hidden
+      shape: [batch, seq, 128]
+      dtype: float32
+    gradient_boundary:
+      activation: hidden
+      gradient: hidden.grad
+      shape: [batch, seq, 128]
+      dtype: float32
+
+  - id: stage1
+    rank: 1
+    worker_id: gpu1060
+    device_hint: "cuda:0 (GTX 1650, verified in T071)"
+    modules: [block1, ln, lm_head]
+    parameter_count: 328448
+    parameter_ownership:
+      - block1.qkv.weight
+      - block1.proj.weight
+      - block1.ln1.weight
+      - block1.ln1.bias
+      - block1.ln2.weight
+      - block1.ln2.bias
+      - block1.ffn.0.weight
+      - block1.ffn.2.weight
+      - ln.weight
+      - ln.bias
+      - lm_head.weight
+    activation_in:
+      name: hidden
+      shape: [batch, seq, 128]
+      dtype: float32
+    logits_out:
+      name: logits
+      shape: [batch, seq, 1024]
+      dtype: float32
+
+tensor_boundary:
+  activation:
+    producer_stage: stage0
+    consumer_stage: stage1
+    name: hidden
+    shape: [batch, seq, 128]
+    dtype: float32
+  gradient:
+    producer_stage: stage1
+    consumer_stage: stage0
+    name: hidden.grad
+    shape: [batch, seq, 128]
+    dtype: float32
+
+limitations:
+  - "static validation plan labeled limited_support (no profiler-driven search)"
+  - "does not solve arbitrary graph partitioning; explicit two-stage split only"
