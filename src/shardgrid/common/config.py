@@ -468,6 +468,7 @@ class TrainingResourcesConfig:
 class TrainingArtifactsConfig:
     snapshot_name: str | None = None
     keep_failed_snapshots: bool = True
+    transport: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -543,6 +544,10 @@ class TrainingConfig:
                 keep_failed_snapshots=_require_bool(
                     artifacts_payload.get("keep_failed_snapshots", True),
                     field_name="artifacts.keep_failed_snapshots",
+                ),
+                transport=_require_string(
+                    artifacts_payload.get("transport", "auto"),
+                    field_name="artifacts.transport",
                 ),
             ),
         )

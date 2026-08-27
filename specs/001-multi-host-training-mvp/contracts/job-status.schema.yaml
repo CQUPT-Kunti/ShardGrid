@@ -31,6 +31,64 @@ properties:
     type: array
     items:
       type: string
+  assignments:
+    type: array
+    items:
+      type: object
+      required:
+        - worker_id
+        - rank
+      properties:
+        worker_id:
+          type: string
+        rank:
+          type: integer
+          minimum: 0
+        local_rank:
+          type: integer
+          minimum: 0
+        stage:
+          type:
+            - string
+            - "null"
+        gpu_index:
+          type: integer
+          minimum: 0
+        conda_environment:
+          type:
+            - string
+            - "null"
+        conda_prefix:
+          type:
+            - string
+            - "null"
+        python_executable:
+          type:
+            - string
+            - "null"
+        launch_command:
+          type:
+            - string
+            - "null"
+        environment:
+          type: object
+          additionalProperties:
+            type: string
+        status:
+          type: string
+        pid:
+          type:
+            - integer
+            - "null"
+        log_path:
+          type:
+            - string
+            - "null"
+      additionalProperties: false
+  runtime_environment_refs:
+    type: object
+    additionalProperties:
+      type: string
   latest_loss:
     type:
       - number
@@ -38,6 +96,10 @@ properties:
   loss_history:
     type: array
     items:
+      type: number
+  final_metrics:
+    type: object
+    additionalProperties:
       type: number
   backend:
     type:
@@ -156,7 +218,15 @@ allOf:
     then:
       required:
         - checkpoint_ref
+        - final_metrics
       properties:
         checkpoint_ref:
           type: string
           minLength: 1
+        final_metrics:
+          type: object
+          required:
+            - final_loss
+          properties:
+            final_loss:
+              type: number

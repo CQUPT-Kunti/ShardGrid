@@ -99,16 +99,41 @@ def test_training_job_and_status_lifecycle_transitions() -> None:
         model="tiny-sequential",
         requested_world_size=2,
         backend_preference=as_backend_name("ssh"),
+        runtime_environment_ref="env:worker-pair/shardgrid",
     )
     job = job.transition_to(JobState.PROBING)
     job = job.transition_to(JobState.PLANNING)
     assert job.state is JobState.PLANNING
+    assert job.runtime_environment_ref == "env:worker-pair/shardgrid"
+    assert job.updated_at is not None
 
-    status = JobStatus(job_id=as_job_id("job-0001"), state=JobState.CREATED, phase="created")
+    assignments = [
+        WorkerAssignment(
+            worker_id=as_worker_id("gpu4060"),
+            rank=0,
+            stage="0",
+            conda_environment="shardgrid-worker",
+        ),
+        WorkerAssignment(
+            worker_id=as_worker_id("gpu1060"),
+            rank=1,
+            stage="1",
+            conda_environment="shardgrid-worker",
+        ),
+    ]
+    status = JobStatus(
+        job_id=as_job_id("job-0001"),
+        state=JobState.CREATED,
+        phase="created",
+        workers=[as_worker_id("gpu4060"), as_worker_id("gpu1060")],
+        assignments=assignments,
+        runtime_environment_refs={"0": "env:gpu4060/shardgrid", "1": "env:gpu1060/shardgrid"},
+    )
     status = status.transition_to(JobState.PROBING, phase="probe")
     status = status.transition_to(JobState.PLANNING, phase="plan")
     assert status.state is JobState.PLANNING
     assert status.phase == "plan"
+    assert status.assignments == assignments
 
 
 def test_invalid_lifecycle_transitions_are_rejected() -> None:
@@ -118,6 +143,7 @@ def test_invalid_lifecycle_transitions_are_rejected() -> None:
         model="tiny-sequential",
         requested_world_size=2,
         backend_preference=as_backend_name("ssh"),
+        runtime_environment_ref="env:worker-pair/shardgrid",
     )
     with pytest.raises(ValueError):
         job.transition_to(JobState.TRAINING)
@@ -149,6 +175,7 @@ def test_failure_and_completion_requirements_are_enforced() -> None:
         state=JobState.COMPLETED,
         phase="checkpoint",
         checkpoint_ref="jobs/job-0001/checkpoint",
+        final_metrics={"final_loss": 0.42},
     )
 
     assert failed_status.failure == failure
@@ -159,6 +186,35 @@ def test_failure_and_completion_requirements_are_enforced() -> None:
 
     with pytest.raises(ValueError):
         JobStatus(job_id=as_job_id("job-0001"), state=JobState.COMPLETED, phase="done")
+
+
+def test_job_status_rejects_invalid_assignment_runtime_and_metric_data() -> None:
+    assignment = WorkerAssignment(worker_id=as_worker_id("gpu4060"), rank=0)
+
+    with pytest.raises(ValueError, match="duplicate ranks"):
+        JobStatus(
+            job_id=as_job_id("job-0001"),
+            state=JobState.CREATED,
+            phase="created",
+            assignments=[assignment, assignment],
+        )
+
+    with pytest.raises(ValueError, match="assignment ranks"):
+        JobStatus(
+            job_id=as_job_id("job-0001"),
+            state=JobState.CREATED,
+            phase="created",
+            assignments=[assignment],
+            runtime_environment_refs={"worker": "env:gpu4060/shardgrid"},
+        )
+
+    with pytest.raises(ValueError, match="finite"):
+        JobStatus(
+            job_id=as_job_id("job-0001"),
+            state=JobState.CREATED,
+            phase="created",
+            loss_history=[0.5, float("nan")],
+        )
 
 
 def test_engine_and_platform_models_cover_experimental_fallback_and_blocked() -> None:

@@ -123,11 +123,18 @@ def _validate_job_status_payload(payload: dict[str, Any]) -> None:
     state = payload.get("state")
     failure = payload.get("failure")
     checkpoint_ref = payload.get("checkpoint_ref")
+    final_metrics = payload.get("final_metrics")
 
     if state == JobState.FAILED.value and not isinstance(failure, dict):
         raise SchemaValidationError("failed job status must include failure record")
     if state == JobState.COMPLETED.value and not checkpoint_ref:
         raise SchemaValidationError("completed job status must include checkpoint_ref")
+    if state == JobState.COMPLETED.value and (
+        not isinstance(final_metrics, dict) or "final_loss" not in final_metrics
+    ):
+        raise SchemaValidationError(
+            "completed job status must include final_metrics.final_loss"
+        )
 
 
 

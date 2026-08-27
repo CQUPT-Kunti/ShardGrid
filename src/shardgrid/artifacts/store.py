@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Mapping
 
 from shardgrid.common.models import JobId, as_job_id
+from shardgrid.jobs.models import JobSnapshot, TrainingJob
 
 _JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SNAPSHOT_DIRS = (
@@ -61,7 +63,28 @@ class ArtifactStore:
         root = Path(jobs_root)
         if not root.is_absolute():
             raise ValueError("jobs_root must be an absolute path")
-        self.jobs_root = root
+        self.jobs_root = root.resolve()
+
+    def create_snapshot(self, job: TrainingJob) -> JobSnapshot:
+        paths = self.snapshot_paths(job.job_id)
+        expected_root = str(paths.root)
+        if job.snapshot_path is not None and Path(job.snapshot_path).resolve() != paths.root:
+            raise ValueError("job snapshot_path does not match configured jobs_root")
+        self._prepare_job_root(paths)
+        paths.create()
+        created_at = job.created_at or datetime.now(tz=UTC).isoformat()
+        return JobSnapshot(
+            job_id=job.job_id,
+            root_path=expected_root,
+            code_path=str(paths.code),
+            config_path=str(paths.config),
+            plan_path=str(paths.plan),
+            logs_path=str(paths.logs),
+            environment_path=str(paths.environment),
+            checkpoint_path=str(paths.checkpoint),
+            diagnostics_path=str(paths.diagnostics),
+            created_at=created_at,
+        )
 
     def snapshot_paths(self, job_id: JobId | str) -> JobSnapshotPaths:
         normalized = validate_job_id(job_id)
@@ -79,8 +102,25 @@ class ArtifactStore:
         )
 
     def _ensure_contained(self, path: Path) -> None:
-        if self.jobs_root not in path.parents and path != self.jobs_root:
+        candidate = path.resolve(strict=False)
+        if self.jobs_root not in candidate.parents and candidate != self.jobs_root:
             raise ValueError("snapshot path escaped jobs_root")
+
+    def _prepare_job_root(self, paths: JobSnapshotPaths) -> None:
+        if paths.root.exists() and not paths.root.is_dir():
+            raise ValueError("snapshot root is occupied by a non-directory path")
+        for path in (
+            paths.code,
+            paths.config,
+            paths.plan,
+            paths.logs,
+            paths.checkpoint,
+            paths.environment,
+            paths.diagnostics,
+        ):
+            if path.exists() and not path.is_dir():
+                raise ValueError("snapshot path conflict with existing non-directory artifact")
+            self._ensure_contained(path)
 
 
 def build_job_snapshot_paths(

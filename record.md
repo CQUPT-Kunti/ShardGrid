@@ -258,10 +258,193 @@ Date: 2026-08-27
     selected GPU `0`, memory `4096 MiB`, CC `7.5`, driver `527.41`,
     CUDA `11.8`, PyTorch `2.7.1+cu118`, NCCL `2.21.5`, Gloo available
 - Probe failure handling validation:
+
+# T087 Artifact Transport Selection
+
+Date: 2026-08-27
+
+- Implemented a single artifact transport contract in `src/shardgrid/artifacts/transport.py` over mature tools only: `rsync`, `scp`, and `sftp`.
+- Added `transport: auto` to training artifact config so callers can request an explicit transport or let ShardGrid pick the first available tool in this order: `rsync`, `scp`, `sftp`.
+- The transport result now preserves unavailable, failed, and partial outcomes without pretending overall success, and command/stderr output stays on the existing redaction path.
+- Added unit coverage in `tests/unit/test_artifact_transport_selection.py` for explicit selection, auto selection, missing tools, permission failure, partial transfer, invalid config, path containment, argument safety, and credential redaction.
+- Added `docs/operations/artifact-transport.md` documenting supported transports, auto-selection, missing-tool behavior, partial/permission semantics, and the no-custom-protocol boundary for T087.
+- Local validation passed:
+  - `python -m py_compile src/shardgrid/artifacts/transport.py tests/unit/test_artifact_transport_selection.py src/shardgrid/common/config.py tests/unit/test_config.py`
+  - `ruff check src/shardgrid/artifacts/transport.py tests/unit/test_artifact_transport_selection.py src/shardgrid/common/config.py tests/unit/test_config.py`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/unit/test_artifact_transport_selection.py tests/unit/test_config.py`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/integration/test_snapshot_store.py tests/integration/test_code_snapshot.py --run-integration`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/contract/test_snapshot_metadata.py`
+
+# T088 Immutable JobSnapshot Distribution
+
+Date: 2026-08-27
+
+- Implemented snapshot distribution in `src/shardgrid/artifacts/ssh_transport.py` by reusing the T087 transport contract plus the existing SSH and WSL runtime wrappers.
+- Distribution behavior stays narrow:
+  - package the already-created immutable `jobs/<job-id>/` snapshot as one archive
+  - stage it on the Windows SSH home with `scp`
+  - unpack it into the runtime-visible WSL jobs root
+  - verify remote `job_id`, required metadata files, and a whole-tree checksum
+  - refuse to overwrite a conflicting immutable snapshot
+  - skip retransmission when the same remote snapshot already matches
+- Added `tests/integration/test_snapshot_distribution.py` for:
+  - successful two-worker distribution
+  - checksum conflict failure
+  - partial failure preservation
+  - repeated distribution idempotency
+  - real two-worker distribution with password-injected local wrappers for `ssh` and `scp`
+- Local validation passed:
+  - `python -m py_compile src/shardgrid/artifacts/ssh_transport.py tests/integration/test_snapshot_distribution.py`
+  - `ruff check src/shardgrid/artifacts/ssh_transport.py tests/integration/test_snapshot_distribution.py`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/unit/test_artifact_transport_selection.py tests/integration/test_snapshot_store.py tests/integration/test_code_snapshot.py tests/contract/test_snapshot_metadata.py tests/integration/test_snapshot_distribution.py --run-integration`
+- Real two-worker validation passed on 2026-08-27:
+  - transport: `scp`
+  - RTX 4060 worker: PASS
+  - GTX 1650 worker: PASS
+  - control checksum == RTX 4060 checksum == GTX 1650 checksum
+  - remote `job_id` matched on both workers
+  - second distribution for the same `job_id` was skipped on both workers
   - [`tests/integration/test_probe_cli.py`](/home/yangjilei/Code/ShardGrid/tests/integration/test_probe_cli.py)
     covers a failed probe report with `FailureRecord.stage == PROBE`
   - the same test confirms failure output is explicit and structured instead of
     silently retaining a healthy result
+
+# T083 TrainingJob Lifecycle Foundation
+
+Date: 2026-08-27
+
+- Implemented the minimal T083 job lifecycle layer in
+  [`src/shardgrid/control/job_manager.py`](/home/yangjilei/Code/ShardGrid/src/shardgrid/control/job_manager.py)
+  and kept it limited to job creation, ID generation, launch eligibility checks,
+  state transitions, and JSON persistence.
+- Extended
+  [`src/shardgrid/jobs/models.py`](/home/yangjilei/Code/ShardGrid/src/shardgrid/jobs/models.py)
+  so `TrainingJob` now carries `runtime_environment_ref`, validates non-empty
+  core fields, and updates `updated_at` on every legal state transition.
+- Added focused unit coverage in
+  [`tests/unit/test_job_model.py`](/home/yangjilei/Code/ShardGrid/tests/unit/test_job_model.py)
+  for valid and invalid job creation, unique `job_id`, timestamp initialization
+  and transition updates, launch eligibility success/failure, and persistence
+  round-trip.
+- Kept existing lifecycle regression coverage in
+  [`tests/unit/test_job_models.py`](/home/yangjilei/Code/ShardGrid/tests/unit/test_job_models.py)
+  and updated it to assert the runtime environment reference still round-trips
+  through normal `TrainingJob` usage.
+- Local validation passed:
+  - `python -m py_compile src/shardgrid/control/job_manager.py src/shardgrid/jobs/models.py tests/unit/test_job_model.py tests/unit/test_job_models.py`
+  - `ruff check src/shardgrid/control/job_manager.py src/shardgrid/jobs/models.py tests/unit/test_job_model.py tests/unit/test_job_models.py`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/unit/test_job_model.py tests/unit/test_job_models.py`
+    -> `12 passed`
+
+# T084 JobSnapshot Store
+
+Date: 2026-08-27
+
+- Extended
+  [`src/shardgrid/artifacts/store.py`](/home/yangjilei/Code/ShardGrid/src/shardgrid/artifacts/store.py)
+  from path helpers into the minimal T084 snapshot store: configurable absolute
+  jobs root, deterministic `jobs/<job-id>/` mapping, standard subdirectory
+  creation, same-job snapshot reuse, and rejection of conflicting non-directory
+  occupants or mismatched `snapshot_path`.
+- Reused the existing `JobSnapshot` and `TrainingJob` models; no code snapshot,
+  metadata write, transport, or launcher behavior was added.
+- Added focused integration coverage in
+  [`tests/integration/test_snapshot_store.py`](/home/yangjilei/Code/ShardGrid/tests/integration/test_snapshot_store.py)
+  for:
+  - legal snapshot creation
+  - configurable jobs root
+  - per-job isolation
+  - same-job identity stability
+  - traversal rejection
+  - existing valid snapshot reuse
+  - conflicting existing path safety
+- Existing unit path coverage in
+  [`tests/unit/test_artifact_paths.py`](/home/yangjilei/Code/ShardGrid/tests/unit/test_artifact_paths.py)
+  still passes against the updated store.
+- Local validation passed:
+  - `python -m py_compile src/shardgrid/artifacts/store.py tests/integration/test_snapshot_store.py tests/unit/test_artifact_paths.py`
+  - `ruff check src/shardgrid/artifacts/store.py tests/integration/test_snapshot_store.py tests/unit/test_artifact_paths.py`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/integration/test_snapshot_store.py --run-integration`
+    -> `7 passed`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/unit/test_artifact_paths.py`
+    -> `8 passed`
+
+# T085 Immutable Code Snapshot
+
+Date: 2026-08-27
+
+- Implemented local immutable code snapshot creation in
+  [`src/shardgrid/artifacts/snapshot.py`](/home/yangjilei/Code/ShardGrid/src/shardgrid/artifacts/snapshot.py).
+  The implementation stays narrow: copy only the default training code roots
+  (`src/shardgrid`, `examples/train-minimal.yaml`, `examples/models`) into the
+  existing `jobs/<job-id>/code/` snapshot tree, skip transient files, skip
+  secret-like filenames, optionally skip files containing provided secret test
+  values, and compute a stable content-based SHA256.
+- Snapshot behavior:
+  - same content across different jobs -> same checksum
+  - changed source content -> different checksum
+  - repeated creation for the same job returns the existing snapshot
+  - non-empty code roots without the snapshot manifest are rejected instead of
+    being overwritten
+  - symlink includes and include path escape are rejected
+- Added focused integration coverage in
+  [`tests/integration/test_code_snapshot.py`](/home/yangjilei/Code/ShardGrid/tests/integration/test_code_snapshot.py)
+  for supported example inclusion, transient exclusion, secret exclusion,
+  checksum stability/change, immutability after source mutation, overwrite
+  refusal, and symlink/path safety.
+- Local validation passed:
+  - `python -m py_compile src/shardgrid/artifacts/snapshot.py tests/integration/test_code_snapshot.py`
+  - `ruff check src/shardgrid/artifacts/snapshot.py tests/integration/test_code_snapshot.py`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/integration/test_code_snapshot.py --run-integration`
+    -> `7 passed`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/integration/test_snapshot_store.py --run-integration tests/unit/test_artifact_paths.py`
+    -> `15 passed`
+
+# T086 JobSnapshot Metadata
+
+Date: 2026-08-27
+
+- Implemented snapshot metadata persistence in
+  [`src/shardgrid/artifacts/metadata.py`](/home/yangjilei/Code/ShardGrid/src/shardgrid/artifacts/metadata.py).
+  The writer stays local-only and writes the existing job evidence into the
+  existing snapshot tree:
+  - `config/training-config.json`
+  - `plan/original-parallel-plan.json`
+  - `plan/execution-plan.json`
+  - `environment/*-environment-report.json`
+  - `diagnostics/network-state.json`
+  - `diagnostics/job-status.json`
+  - `diagnostics/failure.json` when the job failed
+  - `checkpoint/checkpoint-metadata.json`
+  - `diagnostics/snapshot-metadata.json` manifest
+- Reused the existing `TrainingJob`, `ParallelPlan`, `ExecutionPlan`,
+  `EnvironmentReport`, `NetworkState`, `JobStatus`, `FailureRecord`, and
+  redaction helpers instead of introducing a second metadata model per
+  component.
+- Metadata checks now enforce:
+  - `job_id` agreement between snapshot, job, execution plan, and job status
+  - snapshot-root containment for every written metadata file
+  - completed jobs must include checkpoint metadata
+  - failure-path metadata persists the failure record instead of dropping the
+    snapshot context
+- Added contract coverage in
+  [`tests/contract/test_snapshot_metadata.py`](/home/yangjilei/Code/ShardGrid/tests/contract/test_snapshot_metadata.py)
+  for:
+  - successful snapshot metadata round-trip
+  - failed snapshot metadata preserving failure evidence
+  - config / original plan / execution plan / environment / network /
+    checkpoint metadata presence
+  - secret redaction
+  - required-field validation
+  - job mismatch rejection
+  - path containment rejection
+- Local validation passed:
+  - `python -m py_compile src/shardgrid/artifacts/metadata.py tests/contract/test_snapshot_metadata.py`
+  - `ruff check src/shardgrid/artifacts/metadata.py tests/contract/test_snapshot_metadata.py`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/contract/test_snapshot_metadata.py`
+    -> `7 passed`
+  - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/integration/test_snapshot_store.py --run-integration tests/integration/test_code_snapshot.py --run-integration`
+    -> `14 passed`
 
 # T079 doctor --fix bootstrap runner
 
@@ -433,3 +616,157 @@ Date: 2026-08-27
     -> PASS
   - `PYTHONPATH=$PWD/src:$PWD/tests python -m pytest -q tests/contract/test_compatibility_report.py tests/contract/test_parallel_engine.py tests/unit/test_common_types.py tests/unit/test_doctor_workers.py`
     -> `46 passed`
+
+# T089 Artifact Collection
+
+Date: 2026-08-27
+
+- Implemented [`src/shardgrid/artifacts/collector.py`](/home/yangjilei/Code/ShardGrid/src/shardgrid/artifacts/collector.py)
+  as a thin `ArtifactCollector` over the existing `ArtifactStore` paths and
+  `ArtifactTransport` pull contract; no new SSH/SCP/rsync stack was introduced.
+- The collector preserves source identity per artifact:
+  - worker id
+  - rank
+  - stage
+  - artifact type
+- Default collection covers:
+  - `logs/stdout.log`
+  - `logs/stderr.log`
+  - `diagnostics/runtime.json`
+  - `diagnostics/failure.json`
+  - `checkpoint/checkpoint-metadata.json`
+  - optional `checkpoint/model.pt`
+- Collection writes only into the configured JobSnapshot root:
+  - `logs/<worker>/rank<rank>-<stage>/`
+  - `diagnostics/<worker>/rank<rank>-<stage>/`
+  - `checkpoint/metadata/<worker>/rank<rank>-<stage>/`
+  - `checkpoint/files/<worker>/rank<rank>-<stage>/`
+- Safety and partial-state behavior:
+  - downloads land in per-artifact staging files first
+  - empty or failed pulls never overwrite an existing non-empty local artifact
+  - optional missing artifacts stay visible as `missing` without faking collector failure
+  - checkpoint metadata + file are folded into `complete/partial/missing`
+  - repeated collection reuses identical artifacts as `skipped`
+- T089 validation on 2026-08-27:
+  - `pytest -q --run-integration tests/integration/test_artifact_collection.py`
+    -> `4 passed`
+  - `python -m py_compile src/shardgrid/artifacts/collector.py tests/integration/test_artifact_collection.py`
+    -> PASS
+  - `ruff check src/shardgrid/artifacts/collector.py tests/integration/test_artifact_collection.py`
+    -> PASS
+- Covered acceptance scenarios in
+  [`tests/integration/test_artifact_collection.py`](/home/yangjilei/Code/ShardGrid/tests/integration/test_artifact_collection.py):
+  - two-rank log and diagnostics collection
+  - checkpoint metadata and optional checkpoint file collection
+  - one-rank success + one-rank failure preserving partial state
+  - partial checkpoint detection from metadata/file mismatch
+  - missing remote artifact semantics
+  - transfer failure semantics
+  - completed local artifact not overwritten by empty or failed replacement
+  - repeated collection / idempotency
+  - worker/rank/stage source identity retention
+  - path containment and private-key redaction expectations
+
+# T090 ResourceManager + ClusterState
+
+Date: 2026-08-27
+
+- Implemented [`src/shardgrid/control/resource_manager.py`](/home/yangjilei/Code/ShardGrid/src/shardgrid/control/resource_manager.py)
+  with:
+  - `ClusterState`
+  - `WorkerEligibility`
+  - `ResourceManager`
+- `ResourceManager` consumes existing `WorkerResource` and `NetworkState`
+  records only. It does not reprobe Workers, rerun network tests, or mutate
+  runtime state.
+- `ClusterState` now exposes explicit planner-ready inputs:
+  - all worker entries, kept in stable worker-id order
+  - eligible worker subset
+  - attached `NetworkState`
+  - `generated_at`
+  - `freshness_threshold_seconds`
+  - `network_stale`
+  - cluster summary counts
+- Freshness / stale rules:
+  - default freshness threshold is `24h`
+  - missing or invalid `last_probe_at` => stale worker
+  - missing or invalid `created_at` / `measured_at` => stale network evidence
+  - stale worker or stale network evidence is never eligible
+- Worker eligibility rules:
+  - `HEALTHY` workers proceed to capability checks
+  - `DEGRADED` workers are retained but marked ineligible with explicit reason
+  - `FAILED`, `UNREACHABLE`, `BLOCKED_MANUAL_ACTION`, `UNKNOWN`, and stale
+    workers are ineligible
+  - missing GPU/runtime evidence is ineligible
+  - optional `minimum_gpu_memory_mb` blocks workers that do not meet the floor
+- Network eligibility rules:
+  - when `require_network=True`, every worker must have fresh bidirectional
+    reachable links to every other candidate worker
+  - failed, missing, or stale required links produce explicit exclusion reasons
+  - excluded workers stay in `ClusterState`; they are never silently filtered
+- T090 validation on 2026-08-27:
+  - `pytest -q tests/unit/test_resource_manager.py tests/unit/test_resource_models.py tests/unit/test_job_model.py`
+    -> `22 passed`
+  - `python -m py_compile src/shardgrid/control/resource_manager.py tests/unit/test_resource_manager.py`
+    -> PASS
+  - `ruff check src/shardgrid/control/resource_manager.py tests/unit/test_resource_manager.py`
+    -> PASS
+- Covered T090 scenarios in
+  [`tests/unit/test_resource_manager.py`](/home/yangjilei/Code/ShardGrid/tests/unit/test_resource_manager.py):
+  - healthy workers + healthy links
+  - degraded worker
+  - unhealthy worker
+  - unreachable worker
+  - stale worker resource
+  - stale network state
+  - insufficient GPU memory
+  - failed network link
+  - missing required link
+  - excluded worker retained in output
+  - explicit exclusion reasons
+  - more-than-two-worker fixture
+  - deterministic output ordering
+
+# T091 JobStatus Persistence
+
+Date: 2026-08-27
+
+- Implemented persistent status storage in
+  [`src/shardgrid/control/status_store.py`](/home/yangjilei/Code/ShardGrid/src/shardgrid/control/status_store.py)
+  as a minimal JSON file store with:
+  - `create_initial_status`
+  - `save`
+  - `load`
+  - terminal-state persistence under `jobs/<job-id>/job-status.json`
+- Extended the existing
+  [`JobStatus`]( /home/yangjilei/Code/ShardGrid/src/shardgrid/jobs/models.py)
+  model instead of creating a second status model:
+  - added `assignments` for worker/rank/stage/local-rank context
+  - added `runtime_environment_refs` keyed by rank
+  - added `final_metrics`
+  - kept existing `workers`, `loss_history`, `backend`, `fallback_used`,
+    `failure`, and `checkpoint_ref`
+- Completed-state integrity rules now require:
+  - `checkpoint_ref`
+  - `final_metrics.final_loss`
+- Failed-state integrity rules continue to require `FailureRecord`, and the
+  persisted failure record keeps runtime environment fields such as
+  `runtime_environment`, `python_executable`, `conda_environment`, and
+  `conda_prefix`.
+- Updated the job-status schema and serialization validation so file-backed
+  status records reject incomplete completed states before persistence.
+- T091 validation on 2026-08-27:
+  - `pytest -q tests/unit/test_job_status.py tests/unit/test_job_models.py tests/unit/test_serialization.py tests/contract/test_models.py tests/contract/test_snapshot_metadata.py`
+    -> `35 passed`
+  - `python -m py_compile src/shardgrid/jobs/models.py src/shardgrid/common/serialization.py src/shardgrid/control/status_store.py tests/unit/test_job_status.py tests/unit/test_job_models.py tests/unit/test_serialization.py tests/contract/test_models.py tests/contract/test_snapshot_metadata.py`
+    -> PASS
+  - `ruff check src/shardgrid/jobs/models.py src/shardgrid/common/serialization.py src/shardgrid/control/status_store.py tests/unit/test_job_status.py tests/unit/test_job_models.py tests/unit/test_serialization.py tests/contract/test_models.py tests/contract/test_snapshot_metadata.py`
+    -> PASS
+- Covered T091 scenarios in
+  [`tests/unit/test_job_status.py`](/home/yangjilei/Code/ShardGrid/tests/unit/test_job_status.py):
+  - create/save/load round-trip
+  - repeated update and terminal-state persistence
+  - full legal transition chain plus terminal backtracking rejection
+  - worker/rank/stage/runtime-environment persistence
+  - failed-state `FailureRecord` + runtime context persistence
+  - completed-state checkpoint + final loss enforcement

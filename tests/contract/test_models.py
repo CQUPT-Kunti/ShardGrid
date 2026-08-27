@@ -119,12 +119,28 @@ def test_execution_plan_contract_rejects_invalid_states() -> None:
 
 
 def test_job_status_contract_round_trip_and_lifecycle() -> None:
+    assignments = [
+        WorkerAssignment(
+            worker_id=as_worker_id("gpu4060"),
+            rank=0,
+            stage="0",
+            conda_environment="shardgrid-worker",
+        ),
+        WorkerAssignment(
+            worker_id=as_worker_id("gpu1060"),
+            rank=1,
+            stage="1",
+            conda_environment="shardgrid-worker",
+        ),
+    ]
     status = JobStatus(
         job_id=as_job_id("job-0001"),
         state=JobState.CREATED,
         phase="created",
         backend=as_backend_name("nccl"),
         workers=[as_worker_id("gpu4060"), as_worker_id("gpu1060")],
+        assignments=assignments,
+        runtime_environment_refs={"0": "env:gpu4060/shardgrid", "1": "env:gpu1060/shardgrid"},
     )
 
     status = status.transition_to(JobState.PROBING, phase="probe")
@@ -133,6 +149,7 @@ def test_job_status_contract_round_trip_and_lifecycle() -> None:
 
     assert restored == status
     assert restored.backend == as_backend_name("nccl")
+    assert restored.assignments == assignments
 
 
 def test_job_status_contract_rejects_illegal_failure_and_completion_states() -> None:
@@ -144,7 +161,11 @@ def test_job_status_contract_rejects_illegal_failure_and_completion_states() -> 
 
     status = JobStatus(job_id=as_job_id("job-0001"), state=JobState.CREATED, phase="created")
     with pytest.raises(ValueError, match="invalid job status transition"):
-        status.transition_to(JobState.COMPLETED, checkpoint_ref="/tmp/ckpt")
+        status.transition_to(
+            JobState.COMPLETED,
+            checkpoint_ref="/tmp/ckpt",
+            final_metrics={"final_loss": 0.25},
+        )
 
 
 def test_job_status_contract_failure_record_round_trip() -> None:

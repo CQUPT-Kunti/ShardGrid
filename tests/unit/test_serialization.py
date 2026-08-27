@@ -114,6 +114,11 @@ def make_job_status() -> JobStatus:
         state=JobState.FAILED,
         phase="launch",
         workers=[as_worker_id("gpu4060"), as_worker_id("gpu1060")],
+        assignments=[
+            WorkerAssignment(worker_id=as_worker_id("gpu4060"), rank=0, stage="0"),
+            WorkerAssignment(worker_id=as_worker_id("gpu1060"), rank=1, stage="1"),
+        ],
+        runtime_environment_refs={"0": "env:gpu4060/shardgrid", "1": "env:gpu1060/shardgrid"},
         backend=as_backend_name("ssh"),
         fallback_used=True,
         failure=FailureRecord(
@@ -192,4 +197,16 @@ def test_job_status_schema_rejects_incomplete_failure_record() -> None:
     payload["failure"].pop("recommended_action")
 
     with pytest.raises(SchemaValidationError):
+        validate_schema_data("job_status", payload)
+
+
+def test_job_status_schema_rejects_completed_without_final_metrics() -> None:
+    payload = make_job_status().to_dict()
+    payload["state"] = JobState.COMPLETED.value
+    payload["phase"] = "checkpoint"
+    payload["failure"] = None
+    payload["checkpoint_ref"] = "jobs/job-0001/checkpoint/model.pt"
+    payload["final_metrics"] = {}
+
+    with pytest.raises(SchemaValidationError, match="final_loss"):
         validate_schema_data("job_status", payload)

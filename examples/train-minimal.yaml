@@ -24,3 +24,4 @@ resources:
 artifacts:
   snapshot_name: train-minimal
   keep_failed_snapshots: true
+  transport: auto

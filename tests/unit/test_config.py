@@ -36,6 +36,7 @@ def test_load_training_config_from_example() -> None:
     assert config.model.type == "minimal_sequential"
     assert config.resources.preferred_workers == ["gpu4060", "gpu1060"]
     assert config.artifacts.keep_failed_snapshots is True
+    assert config.artifacts.transport == "auto"
 
 
 def test_missing_worker_identity_is_rejected(tmp_path: Path) -> None:
