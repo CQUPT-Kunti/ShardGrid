@@ -11,6 +11,8 @@ from shardgrid.cli.commands import register_placeholder_commands
 from shardgrid.cli.commands.dist_test import register_dist_test_command
 from shardgrid.cli.commands.doctor import register_doctor_command
 from shardgrid.cli.commands.network_test import register_network_test_command
+from shardgrid.cli.commands.probe import register_probe_command
+from shardgrid.cli.commands.workers import register_workers_command
 from shardgrid.cli.context import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
@@ -45,6 +47,8 @@ def build_parser() -> CLIArgumentParser:
     register_dist_test_command(subparsers)
     register_doctor_command(subparsers)
     register_network_test_command(subparsers)
+    register_probe_command(subparsers)
+    register_workers_command(subparsers)
     return parser
 
 

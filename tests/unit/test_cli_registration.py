@@ -16,6 +16,7 @@ def test_registered_commands_appear_in_help(capsys: Any) -> None:
     captured = capsys.readouterr()
     for command in PLACEHOLDER_COMMANDS:
         assert command in captured.out
+    assert "workers" in captured.out
 
 
 def test_placeholder_command_help_uses_expected_name(capsys: Any) -> None:
@@ -29,7 +30,7 @@ def test_placeholder_command_help_uses_expected_name(capsys: Any) -> None:
 
 
 def test_placeholder_command_behavior_is_explicit(capsys: Any) -> None:
-    exit_code = main(["workers"])
+    exit_code = main(["train"])
 
     captured = capsys.readouterr()
     assert exit_code == 1

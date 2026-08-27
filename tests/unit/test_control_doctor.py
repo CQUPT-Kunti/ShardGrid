@@ -55,11 +55,15 @@ def _all_deps_missing(python_executable: str | None) -> dict[str, bool]:
 
 def _patch_basics(monkeypatch) -> None:
     monkeypatch.setattr(doctor_module, "detect_python", lambda: (sys.executable, "3.13.5"))
-    monkeypatch.setattr(doctor_module, "detect_tool_versions", lambda: {
-        "ssh": "OpenSSH_9.6p1",
-        "git": "git version 2.43.0",
-        "iperf3": "not_installed",
-    })
+    monkeypatch.setattr(
+        doctor_module,
+        "detect_tool_versions",
+        lambda: {
+            "ssh": "OpenSSH_9.6p1",
+            "git": "git version 2.43.0",
+            "iperf3": "not_installed",
+        },
+    )
     monkeypatch.setattr(doctor_module, "_local_address", lambda: "10.0.0.5")
 
 
@@ -88,7 +92,7 @@ def test_control_doctor_healthy(tmp_path, monkeypatch) -> None:
     assert report.exit_code == 0
     assert report.environment["selected_environment"] == "base"
     jobs_check = next(check for check in report.checks if check.name == "jobs_root")
-    assert jobs_check.status == "ok"
+    assert jobs_check.status == "PASS"
 
 
 def test_control_doctor_conda_missing_blocks(monkeypatch) -> None:
@@ -100,7 +104,7 @@ def test_control_doctor_conda_missing_blocks(monkeypatch) -> None:
 
     assert report.health == Health.BLOCKED_MANUAL_ACTION
     assert report.exit_code == 2
-    conda_check = next(check for check in report.checks if check.name == "conda")
+    conda_check = next(check for check in report.checks if check.name == "conda_executable")
     assert conda_check.manual_action_required is True
 
 
@@ -124,10 +128,8 @@ def test_control_doctor_missing_deps_is_degraded(monkeypatch) -> None:
 
     assert report.health == Health.DEGRADED
     assert report.exit_code == 1
-    deps_check = next(
-        check for check in report.checks if check.name == "project_dependencies"
-    )
-    assert deps_check.status == "degraded"
+    deps_check = next(check for check in report.checks if check.name == "dependency:shardgrid")
+    assert deps_check.status == "WARNING"
 
 
 def test_control_doctor_jobs_root_missing_is_degraded(tmp_path, monkeypatch) -> None:
@@ -153,7 +155,7 @@ def test_control_doctor_jobs_root_missing_is_degraded(tmp_path, monkeypatch) -> 
     assert report.health == Health.DEGRADED
     assert report.exit_code == 1
     jobs_check = next(check for check in report.checks if check.name == "jobs_root")
-    assert jobs_check.status == "degraded"
+    assert jobs_check.status == "WARNING"
     assert any("mkdir" in action for action in report.manual_actions)
 
 
@@ -176,7 +178,7 @@ def test_control_doctor_without_config_marks_jobs_root_not_checked(monkeypatch) 
     report = run_control_doctor(None)
 
     jobs_check = next(check for check in report.checks if check.name == "jobs_root")
-    assert jobs_check.status == "not_checked"
+    assert jobs_check.status == "PENDING"
 
 
 def test_control_doctor_report_is_json_serializable(monkeypatch) -> None:
@@ -201,5 +203,5 @@ def test_control_doctor_report_is_json_serializable(monkeypatch) -> None:
     payload = report.to_dict()
 
     assert json.loads(json.dumps(payload)) == payload
-    assert payload["target"] == "control"
-    assert payload["health"] == "healthy"
+    assert payload["subject"] == "control"
+    assert payload["health"] == "degraded"

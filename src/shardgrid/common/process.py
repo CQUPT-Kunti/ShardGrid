@@ -42,13 +42,19 @@ def _coerce_output(value: bytes | str | None, encoding: str) -> str:
     return value
 
 
+def redact_text(text: str | None, secrets: Sequence[str] = ()) -> str | None:
+    if text is None:
+        return None
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "***")
+    return redacted
+
 
 def redact_command(command: Sequence[str] | str, secrets: Sequence[str] = ()) -> str:
     rendered = command if isinstance(command, str) else shlex.join(command)
-    for secret in secrets:
-        if secret:
-            rendered = rendered.replace(secret, "***")
-    return rendered
+    return redact_text(rendered, secrets) or rendered
 
 
 

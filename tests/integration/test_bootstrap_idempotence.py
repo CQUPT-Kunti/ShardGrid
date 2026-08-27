@@ -232,6 +232,42 @@ def _write_fake_nvidia_smi(fake_bin: Path, summary: str) -> None:
     _write_executable(fake_bin / "nvidia-smi", body)
 
 
+def _write_fake_root_apt_get(fake_bin: Path) -> None:
+    body = textwrap.dedent(
+        """\
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [[ "${1:-}" == "update" ]]; then
+            exit 0
+        fi
+        if [[ "${1:-}" == "install" && "${2:-}" == "-y" && "${3:-}" == "iperf3" ]]; then
+            cat >"$(dirname "$0")/iperf3" <<'EOF'
+        #!/usr/bin/env bash
+        echo "iperf 3.20 (cJSON 1.7.15)"
+        EOF
+            chmod +x "$(dirname "$0")/iperf3"
+            exit 0
+        fi
+        exit 1
+        """
+    )
+    _write_executable(fake_bin / "apt-get", body)
+
+
+def _write_fake_root_id(fake_bin: Path) -> None:
+    body = textwrap.dedent(
+        """\
+        #!/usr/bin/env bash
+        if [[ "${1:-}" == "-u" ]]; then
+            echo 0
+            exit 0
+        fi
+        /usr/bin/id "$@"
+        """
+    )
+    _write_executable(fake_bin / "id", body)
+
+
 def _run_bootstrap(
     script: Path,
     args: list[str],
@@ -455,6 +491,53 @@ def test_wsl_bootstrap_reuses_compatible_runtime_and_is_idempotent(tmp_path: Pat
     assert first_payload["torch"]["version"] == "2.7.1+cu118"
     assert first_payload["torch"]["cuda_available"] == "true"
     assert _payload_signature(first_payload) == _payload_signature(second_payload)
+
+
+def test_wsl_bootstrap_install_deps_installs_iperf3_when_already_root(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    _link_core_tools(fake_bin, extra=("bash", "cat", "chmod", "cp", "dirname", "grep", "pwd"))
+    _write_fake_echo_tool(fake_bin, "lsb_release", "Ubuntu 26.04 LTS")
+    _write_fake_echo_tool(fake_bin, "git", "git version 2.53.0")
+    _write_fake_nvidia_smi(fake_bin, "NVIDIA GeForce RTX 4060 Laptop GPU, 566.07")
+    _write_fake_root_apt_get(fake_bin)
+    _write_fake_root_id(fake_bin)
+
+    env_root = tmp_path / "envs"
+    shardgrid = env_root / "shardgrid"
+    _create_fake_env(
+        shardgrid,
+        {
+            "python_version": "Python 3.12.13",
+            "yaml": True,
+            "shardgrid": True,
+            "pytest": True,
+            "ruff": True,
+            "mypy": True,
+            "torch": True,
+            "torch_version": "2.7.1+cu118",
+            "cuda_version": "11.8",
+            "cuda_available": True,
+        },
+    )
+    template_dir = tmp_path / "template-env"
+    _create_fake_env(template_dir, {"python_version": "Python 3.12.13"})
+    _write_fake_conda(fake_bin, env_root, template_dir, {"python_version": "Python 3.12.13"})
+
+    env = _base_env(tmp_path, fake_bin)
+    env["PATH"] = str(fake_bin)
+
+    code, payload = _run_bootstrap(
+        WSL_BOOTSTRAP,
+        ["--install-deps"],
+        env,
+        tmp_path / "wsl-install-iperf3",
+    )
+
+    assert code == 0
+    assert payload["health"] == "healthy"
+    assert payload["runtime_tools"]["iperf3"].startswith("iperf 3.20")
+    assert payload["manual_actions"] == []
 
 
 def test_wsl_bootstrap_creates_shardgrid_environment_only_when_needed(tmp_path: Path) -> None:

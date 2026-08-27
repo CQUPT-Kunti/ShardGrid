@@ -53,6 +53,7 @@ class FakeExecutor:
         command: Sequence[str] | str,
         *,
         stdin: str | bytes | None = None,
+        timeout: float | None = None,
     ) -> ProcessResult:
         self.calls.append(command if isinstance(command, str) else " ".join(command))
         if isinstance(stdin, str):

@@ -10,10 +10,12 @@
 #     no existing environment provides a CUDA-ready PyTorch runtime.
 #   - Never installs a Linux NVIDIA display driver inside WSL.
 #   - Never overwrites or deletes an existing Conda environment.
-#   - Never runs sudo/apt or any password-prompting action.
+#   - Never runs sudo or any password-prompting action.
 #   - Safe automatic mutation is limited to user-space Conda/pip operations
-#     inside the selected WSL training environment, plus optional MTU
-#     configuration when the script is already running with root privileges.
+#     inside the selected WSL training environment, optional apt install of
+#     iperf3 when the script is already running with root privileges, plus
+#     optional MTU configuration when the script is already running with root
+#     privileges.
 #
 # Exit codes:
 #   0 healthy
@@ -21,13 +23,20 @@
 #   2 blocked by manual action(s)
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd || true)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]-}"
+if [[ -n "$SCRIPT_SOURCE" && "$SCRIPT_SOURCE" != "bash" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+    REPO_ROOT="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd || true)"
+else
+    SCRIPT_DIR="$(pwd)"
+    REPO_ROOT=""
+fi
 FINDINGS_DIR="${SHARDGRID_BOOTSTRAP_DIR:-$HOME/.shardgrid/bootstrap}"
 
 MODE="run"
 INSTALL_DEPS=0
-JSON_OUT=0
+JSON_OUT="${SHARDGRID_BOOTSTRAP_JSON:-0}"
+MTU_ONLY=0
 RUNTIME_ENV_NAME="${SHARDGRID_RUNTIME_ENV_NAME:-shardgrid}"
 RUNTIME_PYTHON_SPEC="${SHARDGRID_RUNTIME_PYTHON_SPEC:-python=3.12}"
 TORCH_INDEX_URL="${SHARDGRID_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu118}"
@@ -38,11 +47,14 @@ SHARDGRID_WSL_PERSIST_NCCL_MTU="${SHARDGRID_WSL_PERSIST_NCCL_MTU:-0}"
 
 usage() {
     cat <<'EOF'
-Usage: bootstrap-wsl.sh [--check] [--install-deps] [--json] [--findings-dir DIR]
+Usage: bootstrap-wsl.sh [--check] [--install-deps] [--fix-nccl-mtu-only] [--json] [--findings-dir DIR]
 
   --check            Detect and record only; never install anything.
   --install-deps     Install missing ShardGrid Python dependencies into the
-                     selected existing Conda environment.
+                     selected existing Conda environment, and install iperf3
+                     if missing when already running as root.
+  --fix-nccl-mtu-only
+                     Only run the existing NCCL path MTU fix logic.
   --json             Emit a JSON summary on stdout.
   --findings-dir DIR Override the findings directory
                      (default: ${SHARDGRID_BOOTSTRAP_DIR:-$HOME/.shardgrid/bootstrap}).
@@ -53,6 +65,7 @@ while (($# > 0)); do
     case "$1" in
         --check) MODE="check"; INSTALL_DEPS=0; shift ;;
         --install-deps) INSTALL_DEPS=1; shift ;;
+        --fix-nccl-mtu-only) MTU_ONLY=1; MODE="run"; INSTALL_DEPS=0; shift ;;
         --json) JSON_OUT=1; shift ;;
         --findings-dir) FINDINGS_DIR="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -84,6 +97,23 @@ add_manual_action() {
 
 record_command() {
     COMMANDS_RUN+=("$*")
+}
+
+install_apt_package_if_root() {
+    local package_name="${1:-}"
+    [[ -n "$package_name" ]] || return 1
+    if [[ "$(id -u)" != "0" ]]; then
+        return 1
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        return 1
+    fi
+    record_command apt-get update
+    if ! apt-get update >/dev/null 2>&1; then
+        return 1
+    fi
+    record_command apt-get install -y "$package_name"
+    apt-get install -y "$package_name" >/dev/null 2>&1
 }
 
 parse_route_dev() {
@@ -271,6 +301,90 @@ configure_nccl_path_mtu() {
         fi
     fi
 }
+
+emit_mtu_only_summary() {
+    local json_python=""
+    json_python="$(command -v python3 2>/dev/null || true)"
+    [[ -z "$json_python" ]] && json_python="$(command -v python 2>/dev/null || true)"
+    if [[ "$JSON_OUT" == "1" && -n "$json_python" ]]; then
+        export BOOTSTRAP_SCRIPT="bootstrap-wsl.sh"
+        export BOOTSTRAP_MODE="mtu-only"
+        export BOOTSTRAP_TIMESTAMP="$TIMESTAMP"
+        export BOOTSTRAP_HOST="$HOST"
+        export BOOTSTRAP_WSL_DISTRO="$WSL_DISTRO"
+        export BOOTSTRAP_NCCL_MTU="$SHARDGRID_NCCL_MTU"
+        export BOOTSTRAP_NCCL_PEER_IP="$SHARDGRID_NCCL_PEER_IP"
+        export BOOTSTRAP_NCCL_ROUTE_OUTPUT="$NCCL_ROUTE_OUTPUT"
+        export BOOTSTRAP_NCCL_INTERFACE="$NCCL_INTERFACE"
+        export BOOTSTRAP_NCCL_INTERFACE_MTU_BEFORE="$NCCL_INTERFACE_MTU_BEFORE"
+        export BOOTSTRAP_NCCL_INTERFACE_MTU_AFTER="$NCCL_INTERFACE_MTU_AFTER"
+        export BOOTSTRAP_NCCL_MTU_STATUS="$NCCL_MTU_STATUS"
+        export BOOTSTRAP_NCCL_DF_1472_STATUS="$NCCL_DF_1472_STATUS"
+        export BOOTSTRAP_NCCL_DF_1473_STATUS="$NCCL_DF_1473_STATUS"
+        export BOOTSTRAP_NCCL_WSL_BOOT_STATUS="$NCCL_WSL_BOOT_STATUS"
+        export BOOTSTRAP_NCCL_WSL_BOOT_COMMAND="$NCCL_WSL_BOOT_COMMAND"
+        local manual_actions_joined=""
+        local commands_run_joined=""
+        manual_actions_joined="$(IFS=$'\x1f'; printf '%s' "${MANUAL_ACTIONS[*]}")"
+        commands_run_joined="$(IFS=$'\x1f'; printf '%s' "${COMMANDS_RUN[*]}")"
+        export BOOTSTRAP_MANUAL_ACTIONS="$manual_actions_joined"
+        export BOOTSTRAP_COMMANDS_RUN="$commands_run_joined"
+        "$json_python" - <<'PY'
+import json
+import os
+
+def get_list(key, sep="\x1f"):
+    value = os.environ.get(key, "")
+    return [item for item in value.split(sep) if item] if value else []
+
+def optional(value):
+    return value if value else None
+
+print(json.dumps({
+    "script": os.environ.get("BOOTSTRAP_SCRIPT", ""),
+    "mode": os.environ.get("BOOTSTRAP_MODE", ""),
+    "timestamp": os.environ.get("BOOTSTRAP_TIMESTAMP", ""),
+    "host": os.environ.get("BOOTSTRAP_HOST", ""),
+    "wsl_distro": optional(os.environ.get("BOOTSTRAP_WSL_DISTRO")),
+    "nccl_path_mtu": {
+        "peer_ip": optional(os.environ.get("BOOTSTRAP_NCCL_PEER_IP")),
+        "expected_mtu": optional(os.environ.get("BOOTSTRAP_NCCL_MTU")),
+        "route_output": optional(os.environ.get("BOOTSTRAP_NCCL_ROUTE_OUTPUT")),
+        "interface": optional(os.environ.get("BOOTSTRAP_NCCL_INTERFACE")),
+        "interface_mtu_before": optional(os.environ.get("BOOTSTRAP_NCCL_INTERFACE_MTU_BEFORE")),
+        "interface_mtu_after": optional(os.environ.get("BOOTSTRAP_NCCL_INTERFACE_MTU_AFTER")),
+        "status": optional(os.environ.get("BOOTSTRAP_NCCL_MTU_STATUS")),
+        "df_1472": optional(os.environ.get("BOOTSTRAP_NCCL_DF_1472_STATUS")),
+        "df_1473": optional(os.environ.get("BOOTSTRAP_NCCL_DF_1473_STATUS")),
+        "wsl_boot_status": optional(os.environ.get("BOOTSTRAP_NCCL_WSL_BOOT_STATUS")),
+        "wsl_boot_command": optional(os.environ.get("BOOTSTRAP_NCCL_WSL_BOOT_COMMAND")),
+    },
+    "manual_actions": get_list("BOOTSTRAP_MANUAL_ACTIONS"),
+    "commands_run": get_list("BOOTSTRAP_COMMANDS_RUN"),
+    "health": "healthy" if not get_list("BOOTSTRAP_MANUAL_ACTIONS") else "blocked_manual_action",
+}, indent=2, sort_keys=True))
+PY
+        return
+    fi
+
+    echo "WSL MTU-only bootstrap"
+    echo "peer: ${SHARDGRID_NCCL_PEER_IP:-unset}"
+    echo "interface: ${NCCL_INTERFACE:-unknown}"
+    echo "mtu: ${NCCL_INTERFACE_MTU_BEFORE:-unknown} -> ${NCCL_INTERFACE_MTU_AFTER:-unknown}"
+    echo "status: ${NCCL_MTU_STATUS:-not_checked}"
+}
+
+if [[ "$MTU_ONLY" == "1" ]]; then
+    configure_nccl_path_mtu
+    emit_mtu_only_summary
+    if [[ "$HEALTH" == "blocked_manual_action" ]]; then
+        exit 2
+    fi
+    if [[ "$NCCL_MTU_STATUS" == "PASS" ]]; then
+        exit 0
+    fi
+    exit 1
+fi
 
 find_conda() {
     local candidate=""
@@ -503,9 +617,16 @@ tool_version uname UNAME_VERSION uname -srmo
 tool_version git GIT_VERSION git --version
 tool_version iperf3 IPERF3_VERSION iperf3 --version
 
+if [[ "$IPERF3_VERSION" == "not_installed" && "$INSTALL_DEPS" == "1" && "$MODE" != "check" ]]; then
+    if install_apt_package_if_root iperf3; then
+        hash -r
+        tool_version iperf3 IPERF3_VERSION iperf3 --version
+    fi
+fi
+
 if [[ "$IPERF3_VERSION" == "not_installed" ]]; then
     add_manual_action \
-        "install iperf3 inside the Ubuntu WSL2 runtime (operator action: sudo apt-get install -y iperf3)"
+        "install iperf3 inside the Ubuntu WSL2 runtime (operator action: run this script with root + --install-deps, or sudo apt-get install -y iperf3)"
 fi
 
 configure_nccl_path_mtu

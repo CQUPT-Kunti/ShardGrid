@@ -7,7 +7,7 @@ from typing import Sequence
 
 from shardgrid.common.enums import FailureStage
 from shardgrid.common.models import as_worker_id
-from shardgrid.common.process import ProcessResult, redact_command
+from shardgrid.common.process import ProcessResult, redact_command, redact_text
 from shardgrid.jobs.models import FailureRecord
 
 
@@ -42,6 +42,10 @@ def make_failure_record(
     rendered_command = None
     if command is not None:
         rendered_command = redact_command(command, secrets)
+    redacted_runtime = {
+        str(key): redact_text(str(value), secrets) or str(value)
+        for key, value in ({} if runtime_environment is None else dict(runtime_environment)).items()
+    }
 
     return FailureRecord(
         stage=stage,
@@ -49,14 +53,14 @@ def make_failure_record(
         worker_id=None if worker_id is None else as_worker_id(worker_id),
         command=rendered_command,
         exit_code=exit_code,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        runtime_environment={} if runtime_environment is None else dict(runtime_environment),
-        python_executable=python_executable,
-        conda_environment=conda_environment,
-        conda_prefix=conda_prefix,
-        message=message,
-        recommended_action=recommended_action,
+        stdout_path=redact_text(stdout_path, secrets),
+        stderr_path=redact_text(stderr_path, secrets),
+        runtime_environment=redacted_runtime,
+        python_executable=redact_text(python_executable, secrets),
+        conda_environment=redact_text(conda_environment, secrets),
+        conda_prefix=redact_text(conda_prefix, secrets),
+        message=redact_text(message, secrets) or message,
+        recommended_action=redact_text(recommended_action, secrets) or recommended_action,
         retryable=retryable,
         manual_action_required=manual_action_required,
     )
