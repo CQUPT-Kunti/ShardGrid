@@ -83,7 +83,12 @@ def _tensor_state(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
-def _diag_stage(name: str, start: float, tensor: torch.Tensor | None = None, **extra: object) -> None:
+def _diag_stage(
+    name: str,
+    start: float,
+    tensor: torch.Tensor | None = None,
+    **extra: object,
+) -> None:
     payload = dict(extra)
     if tensor is not None:
         payload.update(_tensor_state(tensor))

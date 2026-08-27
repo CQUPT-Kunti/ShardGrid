@@ -20,6 +20,16 @@ per-parameter device.
     rank0: input -> Stage0 -> activation -> send
     rank1: recv activation -> Stage1 -> logits -> loss
 
+`SHARDGRID_PIPELINE_TASK=t074`:
+    real multi-iteration training for T074
+    rank0: zero_grad -> Stage0 forward -> send activation -> recv grad ->
+           Stage0 backward -> optimizer.step
+    rank1: recv activation -> Stage1 forward -> loss -> Stage1 backward ->
+           send grad -> optimizer.step
+    Each rank optimizes only its own stage parameters, records the loss
+    history (rank1), proves parameter updates, and saves/reloads a per-rank
+    checkpoint (model state + optimizer state + step/iteration).
+
 Usage (per Worker, rank from environment):
 
     RANK=0 WORLD_SIZE=2 LOCAL_RANK=0 MASTER_ADDR=<rank0 ip> MASTER_PORT=29500 \\
@@ -33,6 +43,7 @@ import faulthandler
 import hashlib
 import inspect
 import json
+import math
 import os
 import signal
 import socket
@@ -49,15 +60,20 @@ import yaml
 from examples.models.minimal_transformer import MinimalTransformerConfig
 from examples.models.stage0 import build_stage0
 from examples.models.stage1 import build_stage1
-from torch import nn
 
 EVENT_MARKER = "STAGE_PLACEMENT_EVIDENCE "
 FORWARD_MARKER = "T072_FORWARD_EVIDENCE "
+BACKWARD_MARKER = "T073_BACKWARD_EVIDENCE "
+TRAIN_MARKER = "T074_TRAIN_EVIDENCE "
 TASK_ENV = "SHARDGRID_PIPELINE_TASK"
 TASK_T071 = "t071"
 TASK_T072 = "t072"
+TASK_T073 = "t073"
+TASK_T074 = "t074"
 T072_BATCH_SIZE = 2
 T072_SEQ_LENGTH = 8
+T074_DEFAULT_STEPS = 20
+T074_DEFAULT_LR = 1e-3
 PLAN_PATH = Path(__file__).resolve().with_name("static_parallel_plan.yaml")
 
 MODEL_CONFIG = MinimalTransformerConfig(
@@ -202,8 +218,11 @@ def _mark(name: str) -> float:
     rank = os.environ.get("RANK", "?")
     host = socket.gethostname()
     _emit_line(name)
+    time_text = time.strftime("%H:%M:%S", time.localtime(stamp))
+    millis = int((stamp % 1) * 1000)
     _emit_line(
-        f"[RANK={rank}][HOST={host}][TIME={time.strftime('%H:%M:%S', time.localtime(stamp))}.{int((stamp % 1) * 1000):03d}][MARKER={name}]"
+        f"[RANK={rank}][HOST={host}]"
+        f"[TIME={time_text}.{millis:03d}][MARKER={name}]"
     )
     return stamp
 
@@ -333,6 +352,29 @@ def _tensor_checksum(tensor: torch.Tensor) -> str:
     return hashlib.sha256(cpu.numpy().tobytes()).hexdigest()
 
 
+def _model_param_checksum(model: torch.nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, parameter in sorted(model.named_parameters()):
+        cpu = parameter.detach().to("cpu", copy=True).contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(cpu.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _state_dict_equal(left: object, right: object) -> bool:
+    if isinstance(left, torch.Tensor):
+        return isinstance(right, torch.Tensor) and torch.equal(left, right)
+    if isinstance(left, dict):
+        if not isinstance(right, dict) or left.keys() != right.keys():
+            return False
+        return all(_state_dict_equal(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)):
+        if not isinstance(right, (list, tuple)) or len(left) != len(right):
+            return False
+        return all(_state_dict_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 def _activation_check(name: str, tensor: torch.Tensor) -> dict[str, object]:
     detached = tensor.detach()
     return {
@@ -374,7 +416,9 @@ def _cuda_runtime() -> ctypes.CDLL:
     global _CUDA_RUNTIME
     if _CUDA_RUNTIME is not None:
         return _CUDA_RUNTIME
-    pattern = Path(sys.prefix).glob("lib/python*/site-packages/nvidia/cuda_runtime/lib/libcudart.so*")
+    pattern = Path(sys.prefix).glob(
+        "lib/python*/site-packages/nvidia/cuda_runtime/lib/libcudart.so*"
+    )
     try:
         library_path = next(pattern)
     except StopIteration as error:
@@ -490,7 +534,13 @@ def _save_tensor_capture(
     )
 
 
-def _write_gpu_read_result(rank: int, *, success: bool, error: str, read_values: list[float]) -> None:
+def _write_gpu_read_result(
+    rank: int,
+    *,
+    success: bool,
+    error: str,
+    read_values: list[float],
+) -> None:
     (_capture_root(rank) / "gpu_read_result.json").write_text(
         json.dumps(
             {
@@ -680,8 +730,17 @@ def _log_model_call_impl(rank: int, model: torch.nn.Module) -> None:
         raise
     _mark("MODEL_CALL_IMPL_END")
     _debug_breakpoint(rank, "MODEL_CALL_IMPL_END")
-def _log_role_assignment(rank: int, stage_id: str, local_rank: int, device: torch.device) -> None:
-    gpu_name = torch.cuda.get_device_name(local_rank) if torch.cuda.is_available() else "unavailable"
+def _log_role_assignment(
+    rank: int,
+    stage_id: str,
+    local_rank: int,
+    device: torch.device,
+) -> None:
+    gpu_name = (
+        torch.cuda.get_device_name(local_rank)
+        if torch.cuda.is_available()
+        else "unavailable"
+    )
     _mark("ROLE_ASSIGNMENT")
     _debug_breakpoint(rank, "ROLE_ASSIGNMENT")
     _emit_line(f"[RANK={rank}] GPU={gpu_name} ROLE={stage_id.upper()}")
@@ -715,7 +774,10 @@ def _log_model_device_info(
         model_type=f"{type(model).__module__}.{type(model).__qualname__}",
         device=str(device),
         parameter_devices=parameter_devices,
-        all_parameters_on_device=all(str(parameter.device) == str(device) for parameter in named.values()),
+        all_parameters_on_device=all(
+            str(parameter.device) == str(device)
+            for parameter in named.values()
+        ),
         parameter_count=sum(parameter.numel() for parameter in named.values()),
     )
 
@@ -823,7 +885,6 @@ def _run_t072(
 ) -> dict[str, object]:
     producer_rank = int(runtime_plan["producer_rank"])
     consumer_rank = int(runtime_plan["consumer_rank"])
-    activation_op_id = "activation_0"
     activation_shape = tuple(int(item) for item in runtime_plan["activation_shape"])
     activation_dtype = runtime_plan["activation_dtype"]
     activation_dtype_name = str(runtime_plan["activation_dtype_name"])
@@ -951,6 +1012,459 @@ def _run_t072(
     }
 
 
+def _grad_stats(tensor: torch.Tensor) -> dict[str, object]:
+    return {
+        "shape": list(tensor.shape),
+        "dtype": _dtype_name(tensor.dtype),
+        "device": str(tensor.device),
+        "stride": list(tensor.stride()),
+        "is_contiguous": bool(tensor.is_contiguous()),
+        "isfinite": bool(torch.isfinite(tensor).all().item()),
+    }
+
+
+def _parameter_grad_summary(model: torch.nn.Module) -> dict[str, object]:
+    grads = [(name, param.grad) for name, param in model.named_parameters()]
+    present = [name for name, grad in grads if grad is not None]
+    finite = [
+        name for name, grad in grads
+        if grad is not None and bool(torch.isfinite(grad).all().item())
+    ]
+    return {
+        "gradient_param_count": len(present),
+        "all_params_have_grad": len(present) == len(grads),
+        "all_grads_finite": len(finite) == len(grads),
+        "parameter_samples": present[:10],
+    }
+
+
+def _run_t073(
+    *,
+    rank: int,
+    world: int,
+    local_rank: int,
+    device: torch.device,
+    stage_id: str,
+    model: torch.nn.Module,
+    parameter_count: int,
+    runtime_plan: dict[str, object],
+) -> dict[str, object]:
+    producer_rank = int(runtime_plan["producer_rank"])
+    consumer_rank = int(runtime_plan["consumer_rank"])
+    activation_shape = tuple(int(item) for item in runtime_plan["activation_shape"])
+    activation_dtype = runtime_plan["activation_dtype"]
+    activation_dtype_name = str(runtime_plan["activation_dtype_name"])
+
+    if rank == producer_rank:
+        input_ids, _ = _build_t072_inputs(device)
+        _mark("STAGE0_FORWARD_BEGIN")
+        stage0_forward_begin = _timestamp()
+        hidden = model(input_ids)
+        stage0_forward_end = _timestamp()
+        _mark("STAGE0_FORWARD_END")
+
+        send_hidden = hidden.detach().contiguous()
+        activation_stats = _activation_basics(send_hidden)
+        _diag_line("activation_send_metadata", rank=rank, **activation_stats)
+        _mark("ACTIVATION_SEND_BEGIN")
+        activation_send_begin = _timestamp()
+        dist.send(send_hidden, dst=consumer_rank)
+        activation_send_end = _timestamp()
+        _mark("ACTIVATION_SEND_END")
+
+        grad_hidden = torch.empty(
+            activation_shape,
+            dtype=activation_dtype,
+            device=device,
+        )
+        _mark("GRADIENT_RECV_BEGIN")
+        gradient_recv_begin = _timestamp()
+        dist.recv(grad_hidden, src=consumer_rank)
+        gradient_recv_end = _timestamp()
+        _mark("GRADIENT_RECV_END")
+
+        grad_stats = _grad_stats(grad_hidden)
+        _diag_line("activation_gradient_recv_metadata", rank=rank, **grad_stats)
+
+        _mark("STAGE0_BACKWARD_BEGIN")
+        stage0_backward_begin = _timestamp()
+        hidden.backward(grad_hidden)
+        stage0_backward_end = _timestamp()
+        _mark("STAGE0_BACKWARD_END")
+
+        stage0_grad_summary = _parameter_grad_summary(model)
+        _mark("STAGE0_GRADIENTS_READY")
+        return {
+            "hostname": socket.gethostname(),
+            "rank": rank,
+            "world_size": world,
+            "local_rank": local_rank,
+            "gpu_name": torch.cuda.get_device_name(local_rank),
+            "device": str(device),
+            "stage_id": stage_id,
+            "parameter_count": parameter_count,
+            "input_shape": list(input_ids.shape),
+            "input_dtype": _dtype_name(input_ids.dtype),
+            "activation_shape": list(hidden.shape),
+            "activation_dtype": _dtype_name(hidden.dtype),
+            "stage0_forward_ok": bool(torch.isfinite(hidden).all().item()),
+            "stage0_backward_ok": True,
+            "activation_grad_isfinite": bool(grad_stats["isfinite"]),
+            "lifecycle": {
+                "stage0_forward_begin": stage0_forward_begin,
+                "stage0_forward_end": stage0_forward_end,
+                "activation_send_begin": activation_send_begin,
+                "activation_send_end": activation_send_end,
+                "gradient_recv_begin": gradient_recv_begin,
+                "gradient_recv_end": gradient_recv_end,
+                "stage0_backward_begin": stage0_backward_begin,
+                "stage0_backward_end": stage0_backward_end,
+            },
+            "activation_transfer": {
+                "sender_rank": producer_rank,
+                "receiver_rank": consumer_rank,
+                "shape": list(send_hidden.shape),
+                "dtype": activation_dtype_name,
+                "numel": int(send_hidden.numel()),
+            },
+            "gradient_return": {
+                "sender_rank": consumer_rank,
+                "receiver_rank": producer_rank,
+                "shape": grad_stats["shape"],
+                "dtype": grad_stats["dtype"],
+                "isfinite": grad_stats["isfinite"],
+            },
+            "stage0_gradients": stage0_grad_summary,
+        }
+
+    hidden = torch.empty(
+        activation_shape,
+        dtype=activation_dtype,
+        device=device,
+    )
+    _mark("ACTIVATION_RECV_BEGIN")
+    activation_recv_begin = _timestamp()
+    dist.recv(hidden, src=producer_rank)
+    activation_recv_end = _timestamp()
+    _mark("ACTIVATION_RECV_END")
+    activation_stats = _activation_basics(hidden)
+    _diag_line("activation_recv_metadata", rank=rank, **activation_stats)
+
+    hidden.requires_grad_(True)
+    labels = _build_t072_inputs(device)[1]
+
+    _mark("STAGE1_FORWARD_BEGIN")
+    stage1_forward_begin = _timestamp()
+    logits = model(hidden)
+    stage1_forward_end = _timestamp()
+    _mark("STAGE1_FORWARD_END")
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        labels.reshape(-1),
+    )
+    loss_value = float(loss.item())
+    loss_isfinite = bool(torch.isfinite(loss).item())
+    _mark("LOSS_READY")
+
+    _mark("STAGE1_BACKWARD_BEGIN")
+    stage1_backward_begin = _timestamp()
+    loss.backward()
+    stage1_backward_end = _timestamp()
+    _mark("STAGE1_BACKWARD_END")
+
+    if hidden.grad is None:
+        raise RuntimeError("Stage1 backward completed but hidden.grad is missing")
+    grad_hidden = hidden.grad.detach().contiguous()
+    grad_stats = _grad_stats(grad_hidden)
+    _diag_line("activation_gradient_send_metadata", rank=rank, **grad_stats)
+    _mark("ACTIVATION_GRADIENT_READY")
+
+    _mark("GRADIENT_SEND_BEGIN")
+    gradient_send_begin = _timestamp()
+    dist.send(grad_hidden, dst=producer_rank)
+    gradient_send_end = _timestamp()
+    _mark("GRADIENT_SEND_END")
+
+    stage1_grad_summary = _parameter_grad_summary(model)
+    _mark("STAGE1_GRADIENTS_READY")
+    return {
+        "hostname": socket.gethostname(),
+        "rank": rank,
+        "world_size": world,
+        "local_rank": local_rank,
+        "gpu_name": torch.cuda.get_device_name(local_rank),
+        "device": str(device),
+        "stage_id": stage_id,
+        "parameter_count": parameter_count,
+        "input_shape": list(hidden.shape),
+        "input_dtype": _dtype_name(hidden.dtype),
+        "output_shape": list(logits.shape),
+        "output_dtype": _dtype_name(logits.dtype),
+        "target_shape": list(labels.shape),
+        "target_dtype": _dtype_name(labels.dtype),
+        "loss": loss_value,
+        "loss_isfinite": loss_isfinite,
+        "stage1_forward_ok": bool(torch.isfinite(logits).all().item()),
+        "stage1_backward_ok": True,
+        "activation_grad_isfinite": bool(grad_stats["isfinite"]),
+        "lifecycle": {
+            "activation_recv_begin": activation_recv_begin,
+            "activation_recv_end": activation_recv_end,
+            "stage1_forward_begin": stage1_forward_begin,
+            "stage1_forward_end": stage1_forward_end,
+            "stage1_backward_begin": stage1_backward_begin,
+            "stage1_backward_end": stage1_backward_end,
+            "gradient_send_begin": gradient_send_begin,
+            "gradient_send_end": gradient_send_end,
+        },
+        "activation_transfer": {
+            "sender_rank": producer_rank,
+            "receiver_rank": consumer_rank,
+            "shape": list(hidden.shape),
+            "dtype": activation_dtype_name,
+            "numel": int(hidden.numel()),
+        },
+        "gradient_return": {
+            "sender_rank": consumer_rank,
+            "receiver_rank": producer_rank,
+            "shape": grad_stats["shape"],
+            "dtype": grad_stats["dtype"],
+            "isfinite": grad_stats["isfinite"],
+        },
+        "stage1_gradients": stage1_grad_summary,
+    }
+
+
+def _model_config_metadata() -> dict[str, object]:
+    return {
+        "vocab_size": MODEL_CONFIG.vocab_size,
+        "hidden_size": MODEL_CONFIG.hidden_size,
+        "num_hidden_layers": MODEL_CONFIG.num_hidden_layers,
+        "num_attention_heads": MODEL_CONFIG.num_attention_heads,
+        "max_seq_length": MODEL_CONFIG.max_seq_length,
+        "dropout": MODEL_CONFIG.dropout,
+    }
+
+
+def _run_t074(
+    *,
+    rank: int,
+    world: int,
+    local_rank: int,
+    device: torch.device,
+    stage_id: str,
+    model: torch.nn.Module,
+    parameter_count: int,
+    runtime_plan: dict[str, object],
+) -> dict[str, object]:
+    producer_rank = int(runtime_plan["producer_rank"])
+    consumer_rank = int(runtime_plan["consumer_rank"])
+    producer_id = str(runtime_plan["producer_id"])
+    consumer_id = str(runtime_plan["consumer_id"])
+    activation_shape = tuple(int(item) for item in runtime_plan["activation_shape"])
+    activation_dtype = runtime_plan["activation_dtype"]
+    activation_dtype_name = str(runtime_plan["activation_dtype_name"])
+
+    steps = int(os.environ.get("SHARDGRID_T074_STEPS", str(T074_DEFAULT_STEPS)))
+    learning_rate = float(os.environ.get("SHARDGRID_T074_LR", str(T074_DEFAULT_LR)))
+    checkpoint_dir = Path(
+        os.environ.get("SHARDGRID_T074_CHECKPOINT_DIR", "/tmp/t074/checkpoint")
+    )
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"checkpoint_rank{rank}.pt"
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    loss_history: list[float] = []
+    initial_loss: float | None = None
+    final_loss: float | None = None
+    params_before = _model_param_checksum(model)
+    lifecycle: dict[str, object] = {
+        "train_step_begin": [],
+        "optimizer_step_end": [],
+        "train_step_end": [],
+    }
+    if rank == producer_rank:
+        lifecycle["stage0_backward_end"] = []
+    else:
+        lifecycle["loss_ready"] = []
+        lifecycle["stage1_backward_end"] = []
+        lifecycle["gradient_send_end"] = []
+
+    for _ in range(1, steps + 1):
+        _mark("TRAIN_STEP_BEGIN")
+        lifecycle["train_step_begin"].append(_timestamp())
+        optimizer.zero_grad(set_to_none=True)
+
+        if rank == producer_rank:
+            input_ids, _ = _build_t072_inputs(device)
+            _mark("STAGE0_FORWARD_BEGIN")
+            hidden = model(input_ids)
+            _mark("STAGE0_FORWARD_END")
+            send_hidden = hidden.detach().contiguous()
+            _mark("ACTIVATION_SEND_BEGIN")
+            dist.send(send_hidden, dst=consumer_rank)
+            _mark("ACTIVATION_SEND_END")
+            grad_hidden = torch.empty(
+                activation_shape,
+                dtype=activation_dtype,
+                device=device,
+            )
+            _mark("GRADIENT_RECV_BEGIN")
+            dist.recv(grad_hidden, src=consumer_rank)
+            _mark("GRADIENT_RECV_END")
+            _mark("STAGE0_BACKWARD_BEGIN")
+            hidden.backward(grad_hidden)
+            _mark("STAGE0_BACKWARD_END")
+            lifecycle["stage0_backward_end"].append(_timestamp())
+        else:
+            hidden = torch.empty(
+                activation_shape,
+                dtype=activation_dtype,
+                device=device,
+            )
+            _mark("ACTIVATION_RECV_BEGIN")
+            dist.recv(hidden, src=producer_rank)
+            _mark("ACTIVATION_RECV_END")
+            hidden.requires_grad_(True)
+            labels = _build_t072_inputs(device)[1]
+            _mark("STAGE1_FORWARD_BEGIN")
+            logits = model(hidden)
+            _mark("STAGE1_FORWARD_END")
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
+            )
+            loss_value = float(loss.item())
+            loss_history.append(loss_value)
+            if initial_loss is None:
+                initial_loss = loss_value
+            _mark("LOSS_READY")
+            lifecycle["loss_ready"].append(_timestamp())
+            _mark("STAGE1_BACKWARD_BEGIN")
+            loss.backward()
+            _mark("STAGE1_BACKWARD_END")
+            lifecycle["stage1_backward_end"].append(_timestamp())
+            if hidden.grad is None:
+                raise RuntimeError(
+                    "Stage1 backward completed but hidden.grad is missing"
+                )
+            grad_hidden = hidden.grad.detach().contiguous()
+            _mark("GRADIENT_SEND_BEGIN")
+            dist.send(grad_hidden, dst=producer_rank)
+            _mark("GRADIENT_SEND_END")
+            lifecycle["gradient_send_end"].append(_timestamp())
+
+        optimizer.step()
+        _mark("OPTIMIZER_STEP_END")
+        lifecycle["optimizer_step_end"].append(_timestamp())
+        _mark("TRAIN_STEP_END")
+        lifecycle["train_step_end"].append(_timestamp())
+
+    if loss_history:
+        final_loss = loss_history[-1]
+    params_after = _model_param_checksum(model)
+    param_update_ok = params_before != params_after
+
+    _mark("CHECKPOINT_SAVE_BEGIN")
+    checkpoint_save_begin = _timestamp()
+    checkpoint_payload = {
+        "checkpoint_version": 1,
+        "task": "t074",
+        "rank": rank,
+        "world_size": world,
+        "stage_id": stage_id,
+        "step": steps,
+        "model_state_dict": {
+            name: tensor.detach().cpu()
+            for name, tensor in model.state_dict().items()
+        },
+        "optimizer_state_dict": optimizer.state_dict(),
+        "loss_history": loss_history,
+        "metadata": {
+            "producer_id": producer_id,
+            "consumer_id": consumer_id,
+            "producer_rank": producer_rank,
+            "consumer_rank": consumer_rank,
+            "activation_shape": list(activation_shape),
+            "activation_dtype": activation_dtype_name,
+            "model_config": _model_config_metadata(),
+            "learning_rate": learning_rate,
+            "steps": steps,
+        },
+    }
+    torch.save(checkpoint_payload, checkpoint_path)
+    checkpoint_save_end = _timestamp()
+    _mark("CHECKPOINT_SAVE_END")
+
+    for parameter in model.parameters():
+        parameter.data.zero_()
+    fresh_optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    _mark("CHECKPOINT_LOAD_BEGIN")
+    checkpoint_load_begin = _timestamp()
+    loaded = torch.load(checkpoint_path, weights_only=False)
+    model.load_state_dict(loaded["model_state_dict"])
+    fresh_optimizer.load_state_dict(loaded["optimizer_state_dict"])
+    restored_step = int(loaded["step"])
+    checkpoint_load_end = _timestamp()
+    _mark("CHECKPOINT_LOAD_END")
+
+    saved_state = checkpoint_payload["model_state_dict"]
+    current_state = model.state_dict()
+    param_restore_ok = all(
+        torch.equal(current_state[name].detach().cpu(), saved_state[name])
+        for name in saved_state
+    )
+    optimizer_restore_ok = _state_dict_equal(
+        fresh_optimizer.state_dict(), optimizer.state_dict()
+    )
+    step_restore_ok = restored_step == steps
+    checkpoint_roundtrip_ok = bool(
+        param_restore_ok and optimizer_restore_ok and step_restore_ok
+    )
+
+    loss_isfinite = all(math.isfinite(value) for value in loss_history)
+    loss_decrease = bool(
+        initial_loss is not None
+        and final_loss is not None
+        and final_loss < initial_loss
+    )
+
+    return {
+        "hostname": socket.gethostname(),
+        "rank": rank,
+        "world_size": world,
+        "local_rank": local_rank,
+        "gpu_name": torch.cuda.get_device_name(local_rank),
+        "device": str(device),
+        "stage_id": stage_id,
+        "parameter_count": parameter_count,
+        "steps": steps,
+        "loss_history": loss_history,
+        "initial_loss": initial_loss,
+        "final_loss": final_loss,
+        "loss_isfinite": loss_isfinite,
+        "loss_decrease": loss_decrease,
+        "params_before_checksum": params_before,
+        "params_after_checksum": params_after,
+        "param_update_ok": param_update_ok,
+        "param_restore_ok": param_restore_ok,
+        "optimizer_restore_ok": optimizer_restore_ok,
+        "step_restore_ok": step_restore_ok,
+        "checkpoint_roundtrip_ok": checkpoint_roundtrip_ok,
+        "checkpoint_path": str(checkpoint_path),
+        "lifecycle": {
+            **lifecycle,
+            "checkpoint_save_begin": checkpoint_save_begin,
+            "checkpoint_save_end": checkpoint_save_end,
+            "checkpoint_load_begin": checkpoint_load_begin,
+            "checkpoint_load_end": checkpoint_load_end,
+        },
+    }
+
+
 def _shutdown_distributed(*, local_rank: int) -> None:
     if not dist.is_initialized():
         return
@@ -1007,7 +1521,7 @@ def main() -> None:
     parameter_count = sum(parameter.numel() for parameter in named.values())
     task = os.environ.get(TASK_ENV, TASK_T071).strip().lower()
 
-    if task == TASK_T072:
+    if task in {TASK_T072, TASK_T073, TASK_T074}:
         sanity_ok = True
     elif stage_id == "stage0":
         sample = torch.randint(
@@ -1053,9 +1567,38 @@ def main() -> None:
         )
         print(FORWARD_MARKER + json.dumps(forward, sort_keys=True), flush=True)
         _shutdown_distributed(local_rank=local_rank)
+    elif task == TASK_T073:
+        print(EVENT_MARKER + json.dumps(placement, sort_keys=True), flush=True)
+        backward = _run_t073(
+            rank=rank,
+            world=world,
+            local_rank=local_rank,
+            device=device,
+            stage_id=stage_id,
+            model=model,
+            parameter_count=parameter_count,
+            runtime_plan=runtime_plan,
+        )
+        print(BACKWARD_MARKER + json.dumps(backward, sort_keys=True), flush=True)
+        _shutdown_distributed(local_rank=local_rank)
+    elif task == TASK_T074:
+        print(EVENT_MARKER + json.dumps(placement, sort_keys=True), flush=True)
+        train = _run_t074(
+            rank=rank,
+            world=world,
+            local_rank=local_rank,
+            device=device,
+            stage_id=stage_id,
+            model=model,
+            parameter_count=parameter_count,
+            runtime_plan=runtime_plan,
+        )
+        print(TRAIN_MARKER + json.dumps(train, sort_keys=True), flush=True)
+        _shutdown_distributed(local_rank=local_rank)
     else:
         raise ValueError(
-            f"unsupported {TASK_ENV}={task!r}; expected {TASK_T071!r} or {TASK_T072!r}"
+            f"unsupported {TASK_ENV}={task!r}; expected "
+            f"{TASK_T071!r}, {TASK_T072!r}, {TASK_T073!r}, or {TASK_T074!r}"
         )
     try:
         if dist.is_initialized():
