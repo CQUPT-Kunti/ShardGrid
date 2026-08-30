@@ -25,3 +25,8 @@ artifacts:
   snapshot_name: train-minimal
   keep_failed_snapshots: true
   transport: auto
+  checkpoint:
+    consolidation:
+      enabled: false
+      device: auto
+      required: false

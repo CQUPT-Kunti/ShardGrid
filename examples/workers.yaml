@@ -5,6 +5,8 @@ jobs_root: /var/tmp/shardgrid/jobs
 ssh:
   default_port: 22
   connect_timeout_seconds: 15
+  command_timeout_seconds: 60
+  probe_timeout_seconds: 120
   strict_host_key_checking: true
   private_key_path: null
   known_hosts_path: null
@@ -39,7 +41,7 @@ workers:
   physical_os: windows
   runtime_os: wsl2_linux
   runtime: wsl2
-  host: machine-c.local
+  host: 10.87.5.155
   ssh_user: shardgrid
   ssh_port: 22
   runtime_distro: Ubuntu-22.04
@@ -55,7 +57,7 @@ workers:
   physical_os: windows
   runtime_os: wsl2_linux
   runtime: wsl2
-  host: machine-d.local
+  host: 10.87.5.15
   ssh_user: shardgrid
   ssh_port: 22
   runtime_distro: Ubuntu-22.04

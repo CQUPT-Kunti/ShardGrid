@@ -33,6 +33,8 @@ class SSHOptions:
     user: str | None = None
     port: int = 22
     timeout: float = 15.0
+    command_timeout: float = 60.0
+    probe_timeout: float = 120.0
     known_host_policy: KnownHostPolicy = KnownHostPolicy.STRICT
     known_hosts_path: str | None = None
     private_key_path: str | None = None
@@ -57,6 +59,8 @@ class SSHOptions:
             user=user,
             port=port if port is not None else ssh_config.default_port,
             timeout=float(ssh_config.connect_timeout_seconds),
+            command_timeout=float(ssh_config.command_timeout_seconds),
+            probe_timeout=float(ssh_config.probe_timeout_seconds),
             known_host_policy=policy,
             known_hosts_path=ssh_config.known_hosts_path,
             private_key_path=ssh_config.private_key_path,
@@ -122,7 +126,7 @@ class SSHTransport:
         try:
             return run_process(
                 argv,
-                timeout=self.options.timeout if timeout is None else timeout,
+                timeout=self.options.command_timeout if timeout is None else timeout,
                 shell=False,
                 secrets=secrets,
                 check=check,

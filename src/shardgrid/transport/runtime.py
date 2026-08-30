@@ -192,6 +192,7 @@ class WSLRuntimeWrapper:
         self,
         result: ProcessResult,
         *,
+        stage: FailureStage = FailureStage.LAUNCH,
         host: str | None = None,
         worker_id: str | None = None,
         conda_environment: str | None = None,
@@ -209,7 +210,7 @@ class WSLRuntimeWrapper:
             message = "runtime command failed with a non-zero exit code"
             recommended_action = "inspect stderr from the WSL runtime and retry"
         return make_failure_record(
-            stage=FailureStage.LAUNCH,
+            stage=stage,
             host=host or self.config.distro or "wsl-runtime",
             worker_id=worker_id,
             command=result.recorded_command,

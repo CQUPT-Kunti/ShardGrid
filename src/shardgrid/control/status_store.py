@@ -34,7 +34,10 @@ class StatusStore:
         return self.save(status)
 
     def save(self, status: JobStatus) -> JobStatus:
-        path = self.status_path(status.job_id)
+        return self.save_path(self.status_path(status.job_id), status)
+
+    def save_path(self, path: str | Path, status: JobStatus) -> JobStatus:
+        path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         persisted = status
         if persisted.state in {JobState.COMPLETED, JobState.FAILED, JobState.STOPPED}:
@@ -44,5 +47,7 @@ class StatusStore:
         return persisted
 
     def load(self, job_id: JobId | str) -> JobStatus:
-        return JobStatus.from_dict(json.loads(self.status_path(job_id).read_text()))
+        return self.load_path(self.status_path(job_id))
 
+    def load_path(self, path: str | Path) -> JobStatus:
+        return JobStatus.from_dict(json.loads(Path(path).read_text()))

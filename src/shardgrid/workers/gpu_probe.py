@@ -22,9 +22,11 @@ from shardgrid.transport.runtime import WSLRuntimeWrapper
 from shardgrid.workers.models import WorkerRuntime
 from shardgrid.workers.probe import ProbeFailure
 
-_PROBE_SCRIPT = (
-    "import json,subprocess\n"
-    "out={'torch':None,'nvidia_smi':None}\n"
+PROBE_SCRIPT = (
+    "import json,platform,subprocess,sys\n"
+    "out={'python':{'executable':sys.executable,"
+    "'version':'Python '+platform.python_version()},"
+    "'torch':None,'nvidia_smi':None}\n"
     "try:\n"
     " import torch\n"
     " t={'version':torch.__version__,'cuda_version':str(torch.version.cuda),"
@@ -80,7 +82,7 @@ class GPUProbeResult:
         }
 
 
-def _parse_probe_payload(stdout: str) -> dict[str, Any] | None:
+def parse_probe_payload(stdout: str) -> dict[str, Any] | None:
     for line in stdout.splitlines():
         stripped = line.strip()
         if stripped.startswith("{"):
@@ -101,32 +103,25 @@ def _select_gpu_name(torch_gpu: dict[str, Any] | None, smi: dict[str, Any] | Non
     return None
 
 
-def probe_gpu(
-    wrapper: WSLRuntimeWrapper,
+def gpu_probe_result_from_payload(
+    payload: dict[str, Any],
     worker: WorkerConfig,
     *,
+    runtime_version: str | None,
+    conda_environment: str | None,
+    conda_prefix: str | None,
+    conda_executable: str | None = None,
+    python_executable: str | None = None,
+    python_version: str | None = None,
     probe_status: str = "live",
-    timeout: float = 120.0,
+    raw_output: str = "",
 ) -> GPUProbeResult:
     failures: list[ProbeFailure] = []
     health = Health.HEALTHY
 
-    result = wrapper.run_script(_PROBE_SCRIPT, timeout=timeout)
-    payload = _parse_probe_payload(result.stdout) if result.ok else None
-    if payload is None:
-        failures.append(
-            ProbeFailure(
-                layer="wsl_runtime",
-                check="gpu_probe_script",
-                message="GPU probe script did not produce a parseable result",
-                exit_code=result.exit_code,
-                output=(result.stderr or result.stdout)[:500] or None,
-            )
-        )
-        health = Health.FAILED
-
     torch_data = payload.get("torch") if payload else None
     smi = payload.get("nvidia_smi") if payload else None
+    python_data = payload.get("python") if payload else None
 
     torch_error = None
     if isinstance(torch_data, dict) and torch_data.get("error"):
@@ -221,19 +216,31 @@ def probe_gpu(
         nccl_available = torch_data.get("nccl") is not None
         gloo_available = torch_data.get("gloo") is True
 
-    python_executable = None
-    if wrapper.config.conda_prefix:
-        python_executable = f"{wrapper.config.conda_prefix}/bin/python"
+    selected_python_executable = python_executable
+    if not selected_python_executable and isinstance(python_data, dict):
+        value = python_data.get("executable")
+        if isinstance(value, str) and value.strip():
+            selected_python_executable = value.strip()
+    if not selected_python_executable and conda_prefix:
+        selected_python_executable = f"{conda_prefix}/bin/python"
+
+    selected_python_version = python_version
+    if not selected_python_version and isinstance(python_data, dict):
+        value = python_data.get("version")
+        if isinstance(value, str) and value.strip():
+            selected_python_version = value.strip()
 
     worker_runtime = WorkerRuntime(
         worker_id=worker.worker_id,
         runtime_os=RuntimeOS.WSL2_LINUX,
-        runtime_version=wrapper.config.distro,
+        runtime_version=runtime_version,
         environment_manager="conda",
-        conda_environment=wrapper.config.conda_environment,
-        conda_prefix=wrapper.config.conda_prefix,
-        conda_active=True,
-        python_executable=python_executable,
+        conda_executable=conda_executable,
+        conda_environment=conda_environment,
+        conda_prefix=conda_prefix,
+        conda_active=bool(conda_prefix or conda_environment),
+        python_executable=selected_python_executable,
+        python_version=selected_python_version,
         torch_version=torch_version,
         torch_cuda_version=torch_cuda_version,
         cuda_available=cuda_available,
@@ -247,9 +254,9 @@ def probe_gpu(
         hostname=as_hostname(worker.host),
         physical_os=PhysicalOS.WINDOWS,
         runtime_os=RuntimeOS.WSL2_LINUX,
-        conda_environment=wrapper.config.conda_environment,
-        conda_prefix=wrapper.config.conda_prefix,
-        python_executable=python_executable,
+        conda_environment=conda_environment,
+        conda_prefix=conda_prefix,
+        python_executable=selected_python_executable,
         gpu_name=gpu_name,
         gpu_total_memory=total_memory,
         gpu_free_memory=free_memory,
@@ -263,12 +270,66 @@ def probe_gpu(
         gloo_available=gloo_available,
         health=health,
     )
-
     return GPUProbeResult(
         worker_resource=worker_resource,
         worker_runtime=worker_runtime,
         failures=tuple(failures),
         health=health,
+        probe_status=probe_status,
+        raw_output=raw_output,
+    )
+
+
+def probe_gpu(
+    wrapper: WSLRuntimeWrapper,
+    worker: WorkerConfig,
+    *,
+    probe_status: str = "live",
+    timeout: float = 120.0,
+) -> GPUProbeResult:
+    result = wrapper.run_script(PROBE_SCRIPT, timeout=timeout)
+    payload = parse_probe_payload(result.stdout) if result.ok else None
+    if payload is None:
+        return GPUProbeResult(
+            worker_resource=WorkerResource(
+                worker_id=worker.worker_id,
+                hostname=as_hostname(worker.host),
+                physical_os=PhysicalOS.WINDOWS,
+                runtime_os=RuntimeOS.WSL2_LINUX,
+                conda_environment=wrapper.config.conda_environment,
+                conda_prefix=wrapper.config.conda_prefix,
+                health=Health.FAILED,
+            ),
+            worker_runtime=WorkerRuntime(
+                worker_id=worker.worker_id,
+                runtime_os=RuntimeOS.WSL2_LINUX,
+                runtime_version=wrapper.config.distro,
+                conda_environment=wrapper.config.conda_environment,
+                conda_prefix=wrapper.config.conda_prefix,
+                health=Health.FAILED,
+            ),
+            failures=(
+                ProbeFailure(
+                    layer="wsl_runtime",
+                    check="gpu_probe_script",
+                    message="GPU probe script did not produce a parseable result",
+                    exit_code=result.exit_code,
+                    output=(result.stderr or result.stdout)[:500] or None,
+                ),
+            ),
+            health=Health.FAILED,
+            probe_status=probe_status,
+            raw_output=result.stdout if result.ok else "",
+        )
+    return gpu_probe_result_from_payload(
+        payload,
+        worker,
+        runtime_version=wrapper.config.distro,
+        conda_environment=wrapper.config.conda_environment,
+        conda_prefix=wrapper.config.conda_prefix,
+        python_executable=f"{wrapper.config.conda_prefix}/bin/python"
+        if wrapper.config.conda_prefix
+        else None,
         probe_status=probe_status,
         raw_output=result.stdout if result.ok else "",
     )

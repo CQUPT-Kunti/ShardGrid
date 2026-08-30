@@ -7,6 +7,7 @@ from shardgrid.network.mtu import (
     check_nccl_path_mtu,
     parse_interface_mtu,
     parse_route_interface,
+    parse_route_source_ip,
 )
 
 
@@ -17,6 +18,11 @@ def test_parse_route_interface_reads_dynamic_dev() -> None:
 
 def test_parse_route_interface_returns_none_without_dev() -> None:
     assert parse_route_interface("10.87.5.15 src 10.87.5.155") is None
+
+
+def test_parse_route_source_ip_reads_dynamic_src() -> None:
+    route = "10.87.5.15 dev eth3 src 10.87.5.155 uid 1000"
+    assert parse_route_source_ip(route) == "10.87.5.155"
 
 
 def test_parse_interface_mtu_reads_numeric_value() -> None:

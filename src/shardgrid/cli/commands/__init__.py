@@ -7,12 +7,7 @@ from typing import Any
 
 from shardgrid.cli.context import EXIT_RUNTIME_ERROR
 
-PLACEHOLDER_COMMANDS = (
-    "train",
-    "status",
-    "logs",
-    "stop",
-)
+PLACEHOLDER_COMMANDS: tuple[str, ...] = ()
 
 
 def register_placeholder_commands(

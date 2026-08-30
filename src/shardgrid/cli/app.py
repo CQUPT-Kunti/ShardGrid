@@ -10,8 +10,12 @@ from typing import Never
 from shardgrid.cli.commands import register_placeholder_commands
 from shardgrid.cli.commands.dist_test import register_dist_test_command
 from shardgrid.cli.commands.doctor import register_doctor_command
+from shardgrid.cli.commands.logs import register_logs_command
 from shardgrid.cli.commands.network_test import register_network_test_command
 from shardgrid.cli.commands.probe import register_probe_command
+from shardgrid.cli.commands.status import register_status_command
+from shardgrid.cli.commands.stop import register_stop_command
+from shardgrid.cli.commands.train import register_train_command
 from shardgrid.cli.commands.workers import register_workers_command
 from shardgrid.cli.context import (
     EXIT_CONFIG_ERROR,
@@ -46,8 +50,12 @@ def build_parser() -> CLIArgumentParser:
     register_placeholder_commands(subparsers)
     register_dist_test_command(subparsers)
     register_doctor_command(subparsers)
+    register_logs_command(subparsers)
     register_network_test_command(subparsers)
     register_probe_command(subparsers)
+    register_status_command(subparsers)
+    register_stop_command(subparsers)
+    register_train_command(subparsers)
     register_workers_command(subparsers)
     return parser
 

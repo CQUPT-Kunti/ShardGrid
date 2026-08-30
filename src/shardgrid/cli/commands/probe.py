@@ -204,8 +204,15 @@ def _probe_report(worker: WorkerConfig, config: ClusterConfig) -> WorkerProbeRep
             },
         )
 
-    wrapper = _runtime_wrapper(transport, worker, access)
-    gpu_result = probe_gpu(wrapper, worker, probe_status="live")
+    gpu_result = getattr(access, "gpu_probe_result", None)
+    if gpu_result is None:
+        wrapper = _runtime_wrapper(transport, worker, access)
+        gpu_result = probe_gpu(
+            wrapper,
+            worker,
+            probe_status="live",
+            timeout=float(config.ssh.probe_timeout_seconds),
+        )
     payload = _parse_gpu_payload(gpu_result)
     torch_data = payload.get("torch") if isinstance(payload.get("torch"), dict) else {}
     resource = replace(

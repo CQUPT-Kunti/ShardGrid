@@ -45,6 +45,12 @@ schemas:
       connect_timeout_seconds:
         type: integer
         default: 15
+      command_timeout_seconds:
+        type: integer
+        default: 60
+      probe_timeout_seconds:
+        type: integer
+        default: 120
       strict_host_key_checking:
         type: boolean
         default: true

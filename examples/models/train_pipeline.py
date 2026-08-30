@@ -65,6 +65,7 @@ EVENT_MARKER = "STAGE_PLACEMENT_EVIDENCE "
 FORWARD_MARKER = "T072_FORWARD_EVIDENCE "
 BACKWARD_MARKER = "T073_BACKWARD_EVIDENCE "
 TRAIN_MARKER = "T074_TRAIN_EVIDENCE "
+LAUNCHER_OWNS_LOG_ENV = "SHARDGRID_LAUNCHER_OWNS_LOG_SINK"
 TASK_ENV = "SHARDGRID_PIPELINE_TASK"
 TASK_T071 = "t071"
 TASK_T072 = "t072"
@@ -104,10 +105,12 @@ class _TeeStream:
 
 
 def _emit_line(message: str) -> None:
-    sys.__stdout__.write(message + "\n")
-    sys.__stdout__.flush()
     sys.stdout.write(message + "\n")
     sys.stdout.flush()
+
+
+def _launcher_owns_log_sink() -> bool:
+    return os.environ.get(LAUNCHER_OWNS_LOG_ENV, "").strip() == "1"
 
 
 def _configure_rank_log(rank: int) -> Path:
@@ -118,6 +121,9 @@ def _configure_rank_log(rank: int) -> Path:
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         path = Path(f"/tmp/t072_model_entry_rank{rank}_full_{stamp}.log")
     path.parent.mkdir(parents=True, exist_ok=True)
+    if _launcher_owns_log_sink():
+        print(f"T072_LOG_PATH {path}", flush=True)
+        return path
     handle = path.open("a", encoding="utf-8", buffering=1)
     _LOG_HANDLES.append(handle)
     sys.stdout = _TeeStream(sys.__stdout__, handle)
@@ -286,6 +292,15 @@ def _runtime_info(rank: int, local_rank: int) -> None:
         "torch_version": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "cuda_available": bool(torch.cuda.is_available()),
+        "MASTER_ADDR": os.environ.get("MASTER_ADDR"),
+        "MASTER_PORT": os.environ.get("MASTER_PORT"),
+        "NCCL_SOCKET_IFNAME": os.environ.get("NCCL_SOCKET_IFNAME"),
+        "GLOO_SOCKET_IFNAME": os.environ.get("GLOO_SOCKET_IFNAME"),
+        "NCCL_SOCKET_FAMILY": os.environ.get("NCCL_SOCKET_FAMILY"),
+        "NCCL_IB_DISABLE": os.environ.get("NCCL_IB_DISABLE"),
+        "SHARDGRID_NETWORK_INTERFACE": os.environ.get("SHARDGRID_NETWORK_INTERFACE"),
+        "SHARDGRID_NETWORK_SOURCE_IP": os.environ.get("SHARDGRID_NETWORK_SOURCE_IP"),
+        "SHARDGRID_NETWORK_PEER_IP": os.environ.get("SHARDGRID_NETWORK_PEER_IP"),
     }
     if torch.cuda.is_available():
         payload.update(

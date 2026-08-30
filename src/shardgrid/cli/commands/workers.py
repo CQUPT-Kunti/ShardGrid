@@ -224,8 +224,15 @@ def _refresh_worker(
             None,
         )
 
-    wrapper = _runtime_wrapper(config, worker, access)
-    gpu_result = probe_gpu(wrapper, worker, probe_status="live")
+    gpu_result = getattr(access, "gpu_probe_result", None)
+    if gpu_result is None:
+        wrapper = _runtime_wrapper(config, worker, access)
+        gpu_result = probe_gpu(
+            wrapper,
+            worker,
+            probe_status="live",
+            timeout=float(config.ssh.probe_timeout_seconds),
+        )
     resource = replace(
         gpu_result.worker_resource,
         ip=str(worker.host),

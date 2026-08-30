@@ -13,6 +13,7 @@ from typing import Any, Sequence, cast
 from shardgrid.artifacts.transport import (
     ArtifactTransferSpec,
     ArtifactTransferStatus,
+    ArtifactTransport,
     RemoteArtifactLocation,
     build_transport_config,
     select_artifact_transport,
@@ -22,6 +23,7 @@ from shardgrid.common.config import ClusterConfig, WorkerConfig
 from shardgrid.common.enums import FailureStage, PhysicalOS, SerializableStrEnum
 from shardgrid.common.errors import make_failure_record
 from shardgrid.common.logging import redact_mapping
+from shardgrid.common.process import redact_text
 from shardgrid.jobs.models import FailureRecord, JobSnapshot
 from shardgrid.transport.runtime import WSLRuntimeConfig, WSLRuntimeWrapper
 from shardgrid.transport.ssh import SSHOptions, SSHTransport
@@ -37,6 +39,8 @@ _REMOTE_REQUIRED_RELATIVE_PATHS = (
     "diagnostics/snapshot-metadata.json",
     "checkpoint/checkpoint-metadata.json",
 )
+_PREPARE_ONLY_TOP_LEVEL_DIRS = frozenset({"logs", "diagnostics", "checkpoint"})
+_CHECKSUM_EXCLUDED_TOP_LEVEL_DIRS = frozenset({"logs", "diagnostics", "checkpoint"})
 
 
 class DistributionStatus(SerializableStrEnum):
@@ -52,6 +56,22 @@ class RemoteSnapshotProbe:
     checksum: str | None = None
     job_id: str | None = None
     missing_paths: tuple[str, ...] = ()
+    top_level_entries: tuple[str, ...] = ()
+    metadata_ready: bool = False
+    parse_error: str | None = None
+    command_summary: str | None = None
+    exit_code: int | None = None
+    stdout_summary: str | None = None
+    stderr_summary: str | None = None
+
+
+@dataclass(frozen=True)
+class RemoteSnapshotProbeError(RuntimeError):
+    message: str
+    diagnostics: dict[str, Any]
+
+    def __str__(self) -> str:
+        return self.message
 
 
 @dataclass(frozen=True)
@@ -68,6 +88,7 @@ class WorkerDistributionResult:
     skipped: bool = False
     transfer_result: dict[str, Any] | None = None
     failure: FailureRecord | None = None
+    details: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)
@@ -125,27 +146,53 @@ def distribute_job_snapshot_to_worker(
     worker: WorkerConfig,
     preferred_transport: str = "auto",
     secrets: Sequence[str] = (),
+    transport: ArtifactTransport | None = None,
+    ssh: SSHTransport | None = None,
+    runtime: WSLRuntimeWrapper | None = None,
 ) -> WorkerDistributionResult:
+    remote_root = _remote_snapshot_root(cluster_config, snapshot)
     try:
-        transport = _select_worker_transport(
+        transport = transport or _select_worker_transport(
             cluster_config=cluster_config,
             worker=worker,
             preferred_transport=preferred_transport,
         )
-        ssh = _build_ssh_transport(cluster_config, worker)
-        runtime = WSLRuntimeWrapper(
+        ssh = ssh or _build_ssh_transport(cluster_config, worker)
+        runtime = runtime or WSLRuntimeWrapper(
             WSLRuntimeConfig.from_worker_and_runtime(worker, cluster_config.runtime),
             ssh,
         )
-        remote_root = _remote_snapshot_root(cluster_config, snapshot)
         before = _probe_remote_snapshot(runtime, remote_root)
+    except RemoteSnapshotProbeError as exc:
+        details = redact_mapping(exc.diagnostics, secrets)
+        return WorkerDistributionResult(
+            worker_id=str(worker.worker_id),
+            host=str(worker.host),
+            transport=preferred_transport,
+            status=DistributionStatus.BLOCKED,
+            remote_snapshot_root=remote_root,
+            control_checksum=control_checksum,
+            failure=make_failure_record(
+                stage=FailureStage.DISTRIBUTE,
+                host=str(worker.host),
+                worker_id=str(worker.worker_id),
+                message=f"remote snapshot preflight failed: {exc}",
+                recommended_action=str(
+                    details.get("recommended_action")
+                    or "repair SSH/WSL runtime access on the Worker, then retry"
+                ),
+                command=details.get("command_summary"),
+                exit_code=cast(int | None, details.get("exit_code")),
+            ),
+            details=details,
+        )
     except Exception as exc:
         return WorkerDistributionResult(
             worker_id=str(worker.worker_id),
             host=str(worker.host),
             transport=preferred_transport,
             status=DistributionStatus.BLOCKED,
-            remote_snapshot_root=_remote_snapshot_root(cluster_config, snapshot),
+            remote_snapshot_root=remote_root,
             control_checksum=control_checksum,
             failure=make_failure_record(
                 stage=FailureStage.DISTRIBUTE,
@@ -154,12 +201,25 @@ def distribute_job_snapshot_to_worker(
                 message=f"remote snapshot preflight failed: {exc}",
                 recommended_action="repair SSH/WSL runtime access on the Worker, then retry",
             ),
+            details=_distribution_details(
+                worker=worker,
+                remote_root=remote_root,
+                substep="preflight_exception",
+                expected_job_id=str(snapshot.job_id),
+                expected_checksum=control_checksum,
+                recommended_action="repair SSH/WSL runtime access on the Worker, then retry",
+                command_summary="remote snapshot preflight",
+                parse_error=f"{type(exc).__name__}: {exc}",
+                metadata_ready=False,
+                secrets=secrets,
+            ),
         )
     if before.exists and not before.empty:
         if (
             before.checksum == control_checksum
             and before.job_id == str(snapshot.job_id)
             and not before.missing_paths
+            and before.parse_error is None
         ):
             return WorkerDistributionResult(
                 worker_id=str(worker.worker_id),
@@ -172,26 +232,52 @@ def distribute_job_snapshot_to_worker(
                 remote_job_id=before.job_id,
                 metadata_ready=True,
                 skipped=True,
-            )
-        return WorkerDistributionResult(
-            worker_id=str(worker.worker_id),
-            host=str(worker.host),
-            transport=transport.name.value,
-            status=DistributionStatus.FAIL,
-            remote_snapshot_root=remote_root,
-            control_checksum=control_checksum,
-            remote_checksum=before.checksum,
-            remote_job_id=before.job_id,
-            failure=make_failure_record(
-                stage=FailureStage.DISTRIBUTE,
-                host=str(worker.host),
-                worker_id=str(worker.worker_id),
-                message="remote snapshot already exists with a different immutable identity",
-                recommended_action=(
-                    "remove the conflicting remote snapshot or choose a new job_id, then retry"
+                details=_probe_details(
+                    worker=worker,
+                    remote_root=remote_root,
+                    substep="preflight_ready",
+                    probe=before,
+                    expected_job_id=str(snapshot.job_id),
+                    expected_checksum=control_checksum,
+                    recommended_action="none",
+                    secrets=secrets,
                 ),
-            ),
-        )
+            )
+        if _is_prepare_only_layout(before):
+            pass
+        else:
+            recommended_action = (
+                "remote snapshot identity is not fresh; use a new unique job_id or inspect "
+                "the stale remote root before retrying"
+            )
+            return WorkerDistributionResult(
+                worker_id=str(worker.worker_id),
+                host=str(worker.host),
+                transport=transport.name.value,
+                status=DistributionStatus.FAIL,
+                remote_snapshot_root=remote_root,
+                control_checksum=control_checksum,
+                remote_checksum=before.checksum,
+                remote_job_id=before.job_id,
+                metadata_ready=before.metadata_ready,
+                failure=make_failure_record(
+                    stage=FailureStage.DISTRIBUTE,
+                    host=str(worker.host),
+                    worker_id=str(worker.worker_id),
+                    message="remote snapshot already exists with a different immutable identity",
+                    recommended_action=recommended_action,
+                ),
+                details=_probe_details(
+                    worker=worker,
+                    remote_root=remote_root,
+                    substep="preflight_identity_conflict",
+                    probe=before,
+                    expected_job_id=str(snapshot.job_id),
+                    expected_checksum=control_checksum,
+                    recommended_action=recommended_action,
+                    secrets=secrets,
+                ),
+            )
 
     windows_profile = _read_windows_userprofile(ssh)
     staging_dir = str(PureWindowsPath(".shardgrid") / "snapshots" / str(snapshot.job_id))
@@ -216,6 +302,12 @@ def distribute_job_snapshot_to_worker(
             port=worker.ssh_port,
             path=".",
             private_key_path=cluster_config.ssh.private_key_path,
+            connect_timeout_seconds=cluster_config.ssh.connect_timeout_seconds,
+            command_timeout_seconds=float(cluster_config.ssh.command_timeout_seconds),
+            known_host_policy=(
+                "yes" if cluster_config.ssh.strict_host_key_checking else "accept-new"
+            ),
+            known_hosts_path=cluster_config.ssh.known_hosts_path,
         ),
         secrets=secrets,
     )
@@ -246,6 +338,21 @@ def distribute_job_snapshot_to_worker(
                 retryable=item.retryable,
                 secrets=secrets,
             ),
+            details=_distribution_details(
+                worker=worker,
+                remote_root=remote_root,
+                substep="transfer_archive",
+                expected_job_id=str(snapshot.job_id),
+                expected_checksum=control_checksum,
+                recommended_action=(
+                    "inspect transport stderr and remote write permissions, then retry"
+                ),
+                command_summary=item.recorded_command,
+                exit_code=item.exit_code,
+                stderr_summary=item.stderr,
+                metadata_ready=False,
+                secrets=secrets,
+            ),
         )
 
     windows_archive = (
@@ -268,10 +375,27 @@ def distribute_job_snapshot_to_worker(
             transfer_result=serialize_transfer_result(transport_result),
             failure=runtime.classify_runtime_failure(
                 unpack_result,
+                stage=FailureStage.DISTRIBUTE,
                 host=str(worker.host),
                 worker_id=str(worker.worker_id),
                 conda_environment=worker.conda_environment,
                 conda_prefix=worker.conda_prefix,
+            ),
+            details=_distribution_details(
+                worker=worker,
+                remote_root=remote_root,
+                substep="materialize_archive",
+                expected_job_id=str(snapshot.job_id),
+                expected_checksum=control_checksum,
+                recommended_action=(
+                    "inspect remote extract stderr and remote snapshot path permissions, then retry"
+                ),
+                command_summary=unpack_result.recorded_command,
+                exit_code=unpack_result.exit_code,
+                stdout_summary=unpack_result.stdout,
+                stderr_summary=unpack_result.stderr,
+                metadata_ready=False,
+                secrets=secrets,
             ),
         )
 
@@ -280,7 +404,12 @@ def distribute_job_snapshot_to_worker(
         after.checksum != control_checksum
         or after.job_id != str(snapshot.job_id)
         or after.missing_paths
+        or after.parse_error is not None
     ):
+        recommended_action = (
+            "compare control and remote snapshot contents, inspect the first failed "
+            "verification substep, then retry the distribution"
+        )
         return WorkerDistributionResult(
             worker_id=str(worker.worker_id),
             host=str(worker.host),
@@ -290,15 +419,24 @@ def distribute_job_snapshot_to_worker(
             control_checksum=control_checksum,
             remote_checksum=after.checksum,
             remote_job_id=after.job_id,
+            metadata_ready=after.metadata_ready,
             transfer_result=serialize_transfer_result(transport_result),
             failure=make_failure_record(
                 stage=FailureStage.DISTRIBUTE,
                 host=str(worker.host),
                 worker_id=str(worker.worker_id),
                 message="remote snapshot verification failed after distribution",
-                recommended_action=(
-                    "compare control and remote snapshot contents, then retry the distribution"
-                ),
+                recommended_action=recommended_action,
+            ),
+            details=_probe_details(
+                worker=worker,
+                remote_root=remote_root,
+                substep="verify_post_transfer",
+                probe=after,
+                expected_job_id=str(snapshot.job_id),
+                expected_checksum=control_checksum,
+                recommended_action=recommended_action,
+                secrets=secrets,
             ),
         )
 
@@ -313,12 +451,22 @@ def distribute_job_snapshot_to_worker(
         remote_job_id=after.job_id,
         metadata_ready=True,
         transfer_result=serialize_transfer_result(transport_result),
+        details=_probe_details(
+            worker=worker,
+            remote_root=remote_root,
+            substep="verify_success",
+            probe=after,
+            expected_job_id=str(snapshot.job_id),
+            expected_checksum=control_checksum,
+            recommended_action="none",
+            secrets=secrets,
+        ),
     )
 
 
 def snapshot_checksum(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+    for path in _snapshot_checksum_files(root):
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -427,21 +575,32 @@ from pathlib import Path
 
 root = Path(%(root)r)
 required = %(required)r
+excluded = %(excluded)r
 payload = {
     "exists": root.exists(),
     "empty": False,
     "checksum": None,
     "job_id": None,
     "missing_paths": [],
+    "top_level_entries": [],
+    "metadata_ready": False,
+    "parse_error": None,
 }
 if root.exists():
     if not root.is_dir():
-        raise SystemExit("remote snapshot root is not a directory")
-    payload["empty"] = not any(root.iterdir())
-    files = sorted(candidate for candidate in root.rglob("*") if candidate.is_file())
-    if files:
-        payload["missing_paths"] = [path for path in required if not (root / path).exists()]
-        if not payload["missing_paths"]:
+        payload["parse_error"] = "remote snapshot root is not a directory"
+    else:
+        payload["empty"] = not any(root.iterdir())
+        payload["top_level_entries"] = sorted(path.name for path in root.iterdir())
+        files = sorted(
+            candidate
+            for candidate in root.rglob("*")
+            if candidate.is_file()
+            and candidate.relative_to(root).parts[0] not in excluded
+            and "__pycache__" not in candidate.relative_to(root).parts
+            and candidate.suffix != ".pyc"
+        )
+        if files:
             digest = hashlib.sha256()
             for path in files:
                 digest.update(path.relative_to(root).as_posix().encode())
@@ -449,20 +608,227 @@ if root.exists():
                 digest.update(path.read_bytes())
                 digest.update(b"\\0")
             payload["checksum"] = digest.hexdigest()
-            metadata = json.loads((root / "diagnostics/snapshot-metadata.json").read_text())
-            payload["job_id"] = metadata["job_id"]
+            payload["missing_paths"] = [path for path in required if not (root / path).exists()]
+            metadata_path = root / "diagnostics/snapshot-metadata.json"
+            if metadata_path.exists():
+                try:
+                    metadata = json.loads(metadata_path.read_text())
+                    job_id = metadata.get("job_id")
+                    if isinstance(job_id, str) and job_id:
+                        payload["job_id"] = job_id
+                    else:
+                        payload["parse_error"] = "snapshot metadata missing job_id"
+                except Exception as exc:
+                    payload["parse_error"] = f"{type(exc).__name__}: {exc}"
+            if (
+                not payload["missing_paths"]
+                and payload["job_id"]
+                and payload["parse_error"] is None
+            ):
+                payload["metadata_ready"] = True
 print(json.dumps(payload, sort_keys=True))
-""" % {"root": remote_root, "required": list(_REMOTE_REQUIRED_RELATIVE_PATHS)}
+""" % {
+        "root": remote_root,
+        "required": list(_REMOTE_REQUIRED_RELATIVE_PATHS),
+        "excluded": sorted(_CHECKSUM_EXCLUDED_TOP_LEVEL_DIRS),
+    }
     result = runtime.run_script(script)
     if not result.ok:
-        raise RuntimeError(result.stderr or "failed to probe remote snapshot")
-    payload = json.loads(result.stdout)
+        raise RemoteSnapshotProbeError(
+            "failed to execute remote snapshot probe",
+            _distribution_details(
+                remote_root=remote_root,
+                substep="probe_command",
+                expected_job_id=None,
+                expected_checksum=None,
+                recommended_action="inspect SSH/WSL runtime command execution and retry",
+                command_summary=result.recorded_command,
+                exit_code=result.exit_code,
+                stdout_summary=result.stdout,
+                stderr_summary=result.stderr or "failed to probe remote snapshot",
+                metadata_ready=False,
+            ),
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RemoteSnapshotProbeError(
+            "remote snapshot probe did not return valid JSON",
+            _distribution_details(
+                remote_root=remote_root,
+                substep="probe_parse_json",
+                expected_job_id=None,
+                expected_checksum=None,
+                recommended_action="repair the remote probe script output formatting and retry",
+                command_summary=result.recorded_command,
+                exit_code=result.exit_code,
+                stdout_summary=result.stdout,
+                stderr_summary=result.stderr,
+                parse_error=f"{type(exc).__name__}: {exc}",
+                metadata_ready=False,
+            ),
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RemoteSnapshotProbeError(
+            "remote snapshot probe returned a non-object payload",
+            _distribution_details(
+                remote_root=remote_root,
+                substep="probe_payload_shape",
+                expected_job_id=None,
+                expected_checksum=None,
+                recommended_action="repair the remote probe payload shape and retry",
+                command_summary=result.recorded_command,
+                exit_code=result.exit_code,
+                stdout_summary=result.stdout,
+                stderr_summary=result.stderr,
+                parse_error="probe payload must be a JSON object",
+                metadata_ready=False,
+            ),
+        )
     return RemoteSnapshotProbe(
         exists=bool(payload["exists"]),
         empty=bool(payload["empty"]),
         checksum=payload.get("checksum"),
         job_id=payload.get("job_id"),
         missing_paths=tuple(str(item) for item in payload.get("missing_paths", [])),
+        top_level_entries=tuple(str(item) for item in payload.get("top_level_entries", [])),
+        metadata_ready=bool(payload.get("metadata_ready")),
+        parse_error=(
+            None
+            if payload.get("parse_error") in {None, ""}
+            else str(payload.get("parse_error"))
+        ),
+        command_summary=result.recorded_command,
+        exit_code=result.exit_code,
+        stdout_summary=_summary_text(result.stdout),
+        stderr_summary=_summary_text(result.stderr),
+    )
+
+
+def _is_prepare_only_layout(probe: RemoteSnapshotProbe) -> bool:
+    if (
+        probe.empty
+        or probe.job_id
+        or probe.missing_paths
+        or probe.parse_error is not None
+        or probe.metadata_ready
+    ):
+        return False
+    entries = set(probe.top_level_entries)
+    return bool(entries) and entries <= _PREPARE_ONLY_TOP_LEVEL_DIRS
+
+
+def _summary_text(text: str | None, *, limit: int = 400) -> str | None:
+    if text is None:
+        return None
+    squashed = " ".join(text.split())
+    if not squashed:
+        return None
+    return squashed[:limit]
+
+
+def _probe_state(probe: RemoteSnapshotProbe) -> str:
+    if not probe.exists:
+        return "ABSENT"
+    if _is_prepare_only_layout(probe):
+        return "PREPARE_ONLY"
+    if probe.metadata_ready:
+        return "READY"
+    if probe.parse_error is not None:
+        return "INVALID"
+    if probe.missing_paths:
+        return "PARTIAL"
+    if probe.empty:
+        return "EMPTY"
+    return "PRESENT"
+
+
+def _probe_details(
+    *,
+    worker: WorkerConfig,
+    remote_root: str,
+    substep: str,
+    probe: RemoteSnapshotProbe,
+    expected_job_id: str,
+    expected_checksum: str,
+    recommended_action: str,
+    secrets: Sequence[str] = (),
+) -> dict[str, Any]:
+    return _distribution_details(
+        worker=worker,
+        remote_root=remote_root,
+        substep=substep,
+        expected_job_id=expected_job_id,
+        detected_job_id=probe.job_id,
+        expected_checksum=expected_checksum,
+        detected_checksum=probe.checksum,
+        recommended_action=recommended_action,
+        command_summary=probe.command_summary,
+        exit_code=probe.exit_code,
+        stdout_summary=probe.stdout_summary,
+        stderr_summary=probe.stderr_summary,
+        parse_error=probe.parse_error,
+        metadata_ready=probe.metadata_ready,
+        probe_state=_probe_state(probe),
+        missing_paths=list(probe.missing_paths),
+        top_level_entries=list(probe.top_level_entries),
+        secrets=secrets,
+    )
+
+
+def _distribution_details(
+    *,
+    remote_root: str,
+    substep: str,
+    expected_job_id: str | None,
+    expected_checksum: str | None,
+    recommended_action: str,
+    metadata_ready: bool,
+    worker: WorkerConfig | None = None,
+    detected_job_id: str | None = None,
+    detected_checksum: str | None = None,
+    command_summary: str | None = None,
+    exit_code: int | None = None,
+    stdout_summary: str | None = None,
+    stderr_summary: str | None = None,
+    parse_error: str | None = None,
+    probe_state: str | None = None,
+    missing_paths: list[str] | None = None,
+    top_level_entries: list[str] | None = None,
+    secrets: Sequence[str] = (),
+) -> dict[str, Any]:
+    payload = {
+        "worker_id": None if worker is None else str(worker.worker_id),
+        "stage": FailureStage.DISTRIBUTE.value,
+        "action": "remote_snapshot",
+        "substep": substep,
+        "remote_path": remote_root,
+        "command_summary": redact_text(command_summary, secrets),
+        "exit_code": exit_code,
+        "stdout_summary": redact_text(_summary_text(stdout_summary), secrets),
+        "stderr_summary": redact_text(_summary_text(stderr_summary), secrets),
+        "parse_error": redact_text(parse_error, secrets),
+        "expected_job_id": redact_text(expected_job_id, secrets),
+        "detected_job_id": redact_text(detected_job_id, secrets),
+        "expected_checksum": expected_checksum,
+        "detected_checksum": detected_checksum,
+        "metadata_ready": metadata_ready,
+        "probe_state": probe_state,
+        "missing_paths": missing_paths or [],
+        "top_level_entries": top_level_entries or [],
+        "recommended_action": redact_text(recommended_action, secrets),
+    }
+    return redact_mapping(payload, secrets)
+
+
+def _snapshot_checksum_files(root: Path) -> list[Path]:
+    return sorted(
+        candidate
+        for candidate in root.rglob("*")
+        if candidate.is_file()
+        and candidate.relative_to(root).parts[0] not in _CHECKSUM_EXCLUDED_TOP_LEVEL_DIRS
+        and "__pycache__" not in candidate.relative_to(root).parts
+        and candidate.suffix != ".pyc"
     )
 
 

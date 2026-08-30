@@ -41,24 +41,36 @@ def _config(tmp_path: Path) -> ClusterConfig:
                 {
                     "id": "gpu4060",
                     "machine_id": "machine-c",
-                    "physical_os": "windows",
-                    "runtime_os": "wsl2_linux",
-                    "runtime": "wsl2",
+                    "physical_os": "linux",
+                    "runtime_os": "linux",
+                    "runtime": "ssh",
                     "host": "10.0.0.10",
                     "ssh_user": "shardgrid",
                 },
                 {
                     "id": "gpu1060",
                     "machine_id": "machine-d",
-                    "physical_os": "windows",
-                    "runtime_os": "wsl2_linux",
-                    "runtime": "wsl2",
+                    "physical_os": "linux",
+                    "runtime_os": "linux",
+                    "runtime": "ssh",
                     "host": "10.0.0.11",
                     "ssh_user": "shardgrid",
                 },
             ],
         }
     )
+
+
+def _wsl_config(tmp_path: Path) -> ClusterConfig:
+    data = _config(tmp_path).to_dict()
+    for worker in data["workers"]:
+        worker["physical_os"] = "windows"
+        worker["runtime_os"] = "wsl2_linux"
+        worker["runtime"] = "wsl2"
+        worker["runtime_distro"] = "Ubuntu-22.04"
+        worker["conda_environment"] = "shardgrid"
+        worker["conda_prefix"] = "/home/shardgrid/miniconda3/envs/shardgrid"
+    return ClusterConfig.from_dict(data)
 
 
 def _snapshot(tmp_path: Path):
@@ -131,7 +143,7 @@ class _FakePullTransport:
                         destination=item.destination,
                         recorded_command=f"scp {remote.private_key_path or ''}",
                         exit_code=1,
-                        stderr="No such file or directory",
+                    stderr="No such file or directory",
                     )
                 )
                 continue
@@ -157,6 +169,216 @@ class _FakePullTransport:
                 else ArtifactTransferStatus.FAILED
             )
         return ArtifactTransferResult(transport=self.name.value, status=status, items=results)
+
+
+class _FakeSSH:
+    def __init__(self, profile: str = r"C:\Users\shardgrid") -> None:
+        self.profile = profile
+        self.commands: list[str] = []
+
+    def run(self, command, *, timeout=None, secrets=(), check=False, stdin=None):
+        del timeout, secrets, check, stdin
+        self.commands.append(str(command))
+        stdout = self.profile if "%USERPROFILE%" in str(command) else ""
+        return _process(stdout=stdout)
+
+
+class _FakeRuntime:
+    def __init__(
+        self,
+        wsl_root: Path,
+        windows_root: Path,
+        *,
+        fail_stage: bool = False,
+    ) -> None:
+        self.wsl_root = wsl_root
+        self.windows_root = windows_root
+        self.fail_stage = fail_stage
+        self.scripts: list[str] = []
+
+    def run_script(self, script: str, *, timeout=None, secrets=()):
+        del timeout, secrets
+        self.scripts.append(script)
+        if "path.unlink()" in script or "shutil.rmtree" in script:
+            return _process()
+        if self.fail_stage:
+            return _process(stderr="copy failed", exit_code=12)
+        artifacts = _script_artifacts(script)
+        if artifacts is not None:
+            staging_root = _script_staging_root(script)
+            payload = {"artifacts": []}
+            failed = False
+            for artifact in artifacts:
+                source = self.wsl_root / artifact["source"].removeprefix("/")
+                destination = self.windows_root / staging_root / artifact["relative_path"]
+                item = {
+                    "relative_path": artifact["relative_path"],
+                    "source": artifact["source"],
+                    "destination": str(destination),
+                    "status": "missing",
+                    "size_bytes": None,
+                    "checksum": None,
+                }
+                if not source.exists():
+                    payload["artifacts"].append(item)
+                    if not artifact.get("optional", False):
+                        failed = True
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                item["status"] = "staged"
+                item["size_bytes"] = destination.stat().st_size
+                payload["artifacts"].append(item)
+            return _process(stdout=json.dumps(payload), exit_code=10 if failed else 0)
+        payload = _script_paths(script)
+        source = self.wsl_root / payload["source"].removeprefix("/")
+        destination = self.windows_root / payload["destination"].removeprefix(
+            "/mnt/c/Users/shardgrid/"
+        )
+        if not source.exists():
+            return _process(
+                stdout=json.dumps({"exists": False, "source": payload["source"]}),
+                exit_code=10,
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        return _process(
+            stdout=json.dumps(
+                {
+                    "exists": True,
+                    "source": payload["source"],
+                    "destination": payload["destination"],
+                    "size_bytes": destination.stat().st_size,
+                }
+            )
+        )
+
+
+class _FakeWindowsStagingTransport:
+    name = ArtifactTransportName.SCP
+
+    def __init__(self, windows_root: Path, *, fail: bool = False) -> None:
+        self.windows_root = windows_root
+        self.fail = fail
+        self.calls: list[str] = []
+
+    def transfer(self, items, *, remote: RemoteArtifactLocation, secrets=()):
+        del remote, secrets
+        results = []
+        for item in items:
+            self.calls.append(item.source)
+            if item.source.startswith("/var/tmp/"):
+                raise AssertionError("Windows SCP tried to read a WSL /var/tmp path directly")
+            if self.fail:
+                results.append(
+                    ArtifactTransferItemResult(
+                        label=item.label,
+                        transport=self.name.value,
+                        status=ArtifactTransferStatus.FAILED,
+                        source=item.source,
+                        destination=item.destination,
+                        recorded_command=f"scp host:{item.source} {item.destination}",
+                        exit_code=1,
+                        stderr="scp failed",
+                    )
+                )
+                continue
+            source = self.windows_root / item.source
+            destination = Path(item.destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if item.recursive:
+                shutil.copytree(source, destination)
+            else:
+                shutil.copyfile(source, destination)
+            results.append(
+                ArtifactTransferItemResult(
+                    label=item.label,
+                    transport=self.name.value,
+                    status=ArtifactTransferStatus.SUCCESS,
+                    source=item.source,
+                    destination=item.destination,
+                    recorded_command=f"scp host:{item.source} {item.destination}",
+                    exit_code=0,
+                )
+            )
+        status = (
+            ArtifactTransferStatus.FAILED
+            if any(item.status is ArtifactTransferStatus.FAILED for item in results)
+            else ArtifactTransferStatus.SUCCESS
+        )
+        return ArtifactTransferResult(transport=self.name.value, status=status, items=results)
+
+
+class _DestinationFailureTransport:
+    name = ArtifactTransportName.SCP
+
+    def transfer(self, items, *, remote: RemoteArtifactLocation, secrets=()):
+        del remote, secrets
+        item = tuple(items)[0]
+        return ArtifactTransferResult(
+            transport=self.name.value,
+            status=ArtifactTransferStatus.FAILED,
+            items=[
+                ArtifactTransferItemResult(
+                    label=item.label,
+                    transport=self.name.value,
+                    status=ArtifactTransferStatus.FAILED,
+                    source=item.source,
+                    destination=item.destination,
+                    recorded_command="scp local destination preparation",
+                    stderr="local destination preparation failed: permission denied",
+                )
+            ],
+        )
+
+
+def _process(
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    exit_code: int = 0,
+    timed_out: bool = False,
+):
+    from shardgrid.common.process import ProcessResult
+
+    return ProcessResult(
+        args=(),
+        recorded_command="fake",
+        shell=False,
+        cwd=None,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=timed_out,
+        runtime_environment={},
+    )
+
+
+def _script_paths(script: str) -> dict[str, str]:
+    import ast
+    import re
+
+    values = re.findall(r"Path\(([^\n]+?)\)", script)
+    return {"source": ast.literal_eval(values[0]), "destination": ast.literal_eval(values[1])}
+
+
+def _script_artifacts(script: str):
+    import ast
+    import re
+
+    match = re.search(r"artifacts = ([^\n]+)", script)
+    if match is None:
+        return None
+    return json.loads(ast.literal_eval(match.group(1)))
+
+
+def _script_staging_root(script: str) -> str:
+    import ast
+    import re
+
+    match = re.search(r"staging_root = Path\(([^\n]+?)\)", script)
+    assert match is not None
+    return ast.literal_eval(match.group(1)).removeprefix("/mnt/c/Users/shardgrid/")
 
 
 def test_collects_rank_logs_diagnostics_metadata_and_optional_checkpoint(tmp_path: Path) -> None:
@@ -298,3 +520,233 @@ def test_repeated_collection_is_idempotent_and_preserves_identity(
             sources=[escaped],
             artifact_paths=("logs/../../escape.txt",),
         )
+
+
+def test_collects_runtime_log_and_checkpoint_from_assignment_references(tmp_path: Path) -> None:
+    config, snapshot = _snapshot(tmp_path)
+    remote_root = tmp_path / "remote-runtime"
+    assignment = WorkerAssignment(
+        worker_id="gpu4060",
+        rank=0,
+        stage="stage0",
+        log_path=str(remote_root / "logs" / "gpu4060" / "rank0-stage0" / "combined.log"),
+    )
+    _write(
+        remote_root / "logs" / "gpu4060" / "rank0-stage0" / "combined.log",
+        "combined-rank0\n",
+    )
+    _write(remote_root / "checkpoint" / "checkpoint_rank0.pt", "checkpoint-rank0")
+
+    source = WorkerArtifactSource.from_worker_assignment(
+        worker=next(item for item in config.workers if str(item.worker_id) == "gpu4060"),
+        assignment=assignment,
+        remote_root=str(remote_root),
+        checkpoint_paths=("checkpoint/checkpoint_rank0.pt",),
+    )
+    result = ArtifactCollector(transport=_FakePullTransport()).collect(snapshot, sources=[source])
+
+    assert result.status is CollectionStatus.SUCCESS
+    assert result.workers[0].checkpoint_state is ArtifactCollectionState.COMPLETE
+    assert (
+        Path(snapshot.logs_path, "gpu4060", "rank0-stage0", "combined.log").read_text()
+        == "combined-rank0\n"
+    )
+    assert (
+        Path(snapshot.checkpoint_path, "files", "gpu4060", "rank0-stage0", "checkpoint_rank0.pt")
+        .read_text()
+        == "checkpoint-rank0"
+    )
+
+
+def test_windows_wsl_pull_stages_artifact_before_scp(tmp_path: Path) -> None:
+    config = _wsl_config(tmp_path)
+    _, snapshot = _snapshot(tmp_path)
+    wsl_root = tmp_path / "wsl"
+    windows_root = tmp_path / "windows"
+    remote_root = Path("/var/tmp/shardgrid/jobs/job-wsl")
+    _write(
+        wsl_root
+        / "var/tmp/shardgrid/jobs/job-wsl/logs/gpu4060/rank0-stage0/combined.log",
+        "combined\n",
+    )
+    _write(
+        wsl_root / "var/tmp/shardgrid/jobs/job-wsl/checkpoint/checkpoint_rank0.pt",
+        "checkpoint\n",
+    )
+    source = WorkerArtifactSource.from_worker_assignment(
+        worker=next(item for item in config.workers if str(item.worker_id) == "gpu4060"),
+        assignment=WorkerAssignment(
+            worker_id="gpu4060",
+            rank=0,
+            stage="stage0",
+            log_path="/var/tmp/shardgrid/jobs/job-wsl/logs/gpu4060/rank0-stage0/combined.log",
+        ),
+        remote_root=str(remote_root),
+        checkpoint_paths=("checkpoint/checkpoint_rank0.pt",),
+    )
+    transport = _FakeWindowsStagingTransport(windows_root)
+
+    result = ArtifactCollector(
+        transport=transport,
+        ssh_factory=lambda _: _FakeSSH(),
+        runtime_factory=lambda _, __: _FakeRuntime(wsl_root, windows_root),
+    ).collect(snapshot, sources=[source])
+
+    assert result.status is CollectionStatus.SUCCESS
+    assert all(not call.startswith("/var/tmp/") for call in transport.calls)
+    assert transport.calls == [".shardgrid/artifacts/job-089/gpu4060/rank0-stage0"]
+    checkpoint = result.workers[0].artifacts[1]
+    assert checkpoint.wsl_source == "/var/tmp/shardgrid/jobs/job-wsl/checkpoint/checkpoint_rank0.pt"
+    assert checkpoint.windows_staging_path is not None
+    assert checkpoint.control_destination is not None
+    assert checkpoint.bytes_received == len("checkpoint\n")
+
+
+def test_windows_wsl_worker_batches_staging_and_scp_for_multiple_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = _wsl_config(tmp_path)
+    _, snapshot = _snapshot(tmp_path)
+    wsl_root = tmp_path / "wsl"
+    windows_root = tmp_path / "windows"
+    remote_root = Path("/var/tmp/shardgrid/jobs/job-wsl")
+    _write(
+        wsl_root / "var/tmp/shardgrid/jobs/job-wsl/logs/gpu4060/rank0-stage0/combined.log",
+        "combined\n",
+    )
+    _write(
+        wsl_root / "var/tmp/shardgrid/jobs/job-wsl/checkpoint/checkpoint_rank0.pt",
+        "checkpoint-0\n",
+    )
+    _write(
+        wsl_root / "var/tmp/shardgrid/jobs/job-wsl/checkpoint/extra_rank0.pt",
+        "checkpoint-extra\n",
+    )
+    runtime = _FakeRuntime(wsl_root, windows_root)
+    transport = _FakeWindowsStagingTransport(windows_root)
+    source = WorkerArtifactSource.from_worker_assignment(
+        worker=next(item for item in config.workers if str(item.worker_id) == "gpu4060"),
+        assignment=WorkerAssignment(
+            worker_id="gpu4060",
+            rank=0,
+            stage="stage0",
+            log_path="/var/tmp/shardgrid/jobs/job-wsl/logs/gpu4060/rank0-stage0/combined.log",
+        ),
+        remote_root=str(remote_root),
+        checkpoint_paths=("checkpoint/checkpoint_rank0.pt", "checkpoint/extra_rank0.pt"),
+    )
+
+    result = ArtifactCollector(
+        transport=transport,
+        ssh_factory=lambda _: _FakeSSH(),
+        runtime_factory=lambda _, __: runtime,
+    ).collect(snapshot, sources=[source])
+
+    assert result.status is CollectionStatus.SUCCESS
+    assert len([script for script in runtime.scripts if "artifacts =" in script]) == 1
+    assert transport.calls == [".shardgrid/artifacts/job-089/gpu4060/rank0-stage0"]
+    assert (
+        Path(snapshot.checkpoint_path, "files", "gpu4060", "rank0-stage0", "extra_rank0.pt")
+        .read_text()
+        == "checkpoint-extra\n"
+    )
+
+
+def test_windows_wsl_source_missing_does_not_run_scp(tmp_path: Path) -> None:
+    config = _wsl_config(tmp_path)
+    _, snapshot = _snapshot(tmp_path)
+    windows_root = tmp_path / "windows"
+    source = WorkerArtifactSource.from_worker_assignment(
+        worker=next(item for item in config.workers if str(item.worker_id) == "gpu4060"),
+        assignment=WorkerAssignment(worker_id="gpu4060", rank=0, stage="stage0"),
+        remote_root="/var/tmp/shardgrid/jobs/job-wsl",
+        checkpoint_paths=("checkpoint/missing.pt",),
+    )
+    transport = _FakeWindowsStagingTransport(windows_root)
+
+    result = ArtifactCollector(
+        transport=transport,
+        ssh_factory=lambda _: _FakeSSH(),
+        runtime_factory=lambda _, __: _FakeRuntime(tmp_path / "wsl", windows_root),
+    ).collect(snapshot, sources=[source])
+
+    artifact = result.workers[0].artifacts[0]
+    assert transport.calls == []
+    assert artifact.failure_class == "ARTIFACT_SOURCE_MISSING"
+    assert artifact.failure is not None
+    assert artifact.failure.message == "source artifact is missing in the WSL runtime"
+
+
+def test_windows_wsl_stage_failure_does_not_run_scp(tmp_path: Path) -> None:
+    config = _wsl_config(tmp_path)
+    _, snapshot = _snapshot(tmp_path)
+    source = WorkerArtifactSource.from_worker_assignment(
+        worker=next(item for item in config.workers if str(item.worker_id) == "gpu4060"),
+        assignment=WorkerAssignment(worker_id="gpu4060", rank=0, stage="stage0"),
+        remote_root="/var/tmp/shardgrid/jobs/job-wsl",
+        checkpoint_paths=("checkpoint/checkpoint_rank0.pt",),
+    )
+    transport = _FakeWindowsStagingTransport(tmp_path / "windows")
+
+    result = ArtifactCollector(
+        transport=transport,
+        ssh_factory=lambda _: _FakeSSH(),
+        runtime_factory=lambda _, __: _FakeRuntime(
+            tmp_path / "wsl",
+            tmp_path / "windows",
+            fail_stage=True,
+        ),
+    ).collect(snapshot, sources=[source])
+
+    artifact = result.workers[0].artifacts[0]
+    assert transport.calls == []
+    assert artifact.failure_class == "ARTIFACT_STAGE_FAILED"
+    assert artifact.stderr_summary == "copy failed"
+
+
+def test_windows_wsl_scp_failure_keeps_artifact_diagnostics(tmp_path: Path) -> None:
+    config = _wsl_config(tmp_path)
+    _, snapshot = _snapshot(tmp_path)
+    wsl_root = tmp_path / "wsl"
+    remote_root = "/var/tmp/shardgrid/jobs/job-wsl"
+    _write(
+        wsl_root / "var/tmp/shardgrid/jobs/job-wsl/checkpoint/checkpoint_rank0.pt",
+        "checkpoint\n",
+    )
+    source = WorkerArtifactSource.from_worker_assignment(
+        worker=next(item for item in config.workers if str(item.worker_id) == "gpu4060"),
+        assignment=WorkerAssignment(worker_id="gpu4060", rank=0, stage="stage0"),
+        remote_root=remote_root,
+        checkpoint_paths=("checkpoint/checkpoint_rank0.pt",),
+    )
+
+    result = ArtifactCollector(
+        transport=_FakeWindowsStagingTransport(tmp_path / "windows", fail=True),
+        ssh_factory=lambda _: _FakeSSH(),
+        runtime_factory=lambda _, __: _FakeRuntime(wsl_root, tmp_path / "windows"),
+    ).collect(snapshot, sources=[source])
+
+    artifact = result.workers[0].artifacts[0]
+    assert artifact.failure_class == "ARTIFACT_SCP_FAILED"
+    assert artifact.exit_code == 1
+    assert artifact.stderr_summary == "scp failed"
+    assert artifact.recorded_command is not None
+    assert "host:.shardgrid/artifacts/" in artifact.recorded_command
+    assert "host:/var/tmp/" not in artifact.recorded_command
+
+
+def test_local_destination_preparation_failure_is_classified(tmp_path: Path) -> None:
+    config, snapshot = _snapshot(tmp_path)
+    worker = tmp_path / "remote-a"
+    _write(worker / "checkpoint" / "model.pt", "checkpoint")
+
+    result = ArtifactCollector(transport=_DestinationFailureTransport()).collect(
+        snapshot,
+        sources=[_source(config, "gpu4060", 0, "stage0", worker)],
+        artifact_paths=("checkpoint/model.pt",),
+    )
+
+    artifact = result.workers[0].artifacts[0]
+    assert artifact.failure_class == "ARTIFACT_DESTINATION_FAILED"
+    assert artifact.failure is not None
+    assert "local destination preparation failed" in artifact.failure.message

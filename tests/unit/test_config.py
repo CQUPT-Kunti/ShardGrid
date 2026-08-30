@@ -20,6 +20,8 @@ def test_load_cluster_config_from_example() -> None:
     assert str(config.jobs_root) == "/var/tmp/shardgrid/jobs"
     assert config.runtime.environment_manager == "conda"
     assert config.runtime.conda_environment is None
+    assert config.ssh.command_timeout_seconds == 60
+    assert config.ssh.probe_timeout_seconds == 120
     assert config.network.nccl_mtu == 1500
     assert len(config.workers) == 3
     assert [worker.worker_id for worker in config.workers[:2]] == ["gpu4060", "gpu1060"]
@@ -37,6 +39,9 @@ def test_load_training_config_from_example() -> None:
     assert config.resources.preferred_workers == ["gpu4060", "gpu1060"]
     assert config.artifacts.keep_failed_snapshots is True
     assert config.artifacts.transport == "auto"
+    assert config.artifacts.checkpoint.consolidation.enabled is False
+    assert config.artifacts.checkpoint.consolidation.device == "auto"
+    assert config.artifacts.checkpoint.consolidation.required is False
 
 
 def test_missing_worker_identity_is_rejected(tmp_path: Path) -> None:
@@ -100,3 +105,31 @@ def test_training_config_serialization_is_stable() -> None:
     config = load_training_config(Path("examples/train-minimal.yaml"))
 
     assert config.to_dict() == load_config_data(Path("examples/train-minimal.yaml"))
+
+
+def test_invalid_consolidation_device_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "train-invalid-consolidation.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "job": {"name": "train-minimal", "backend": "ssh"},
+                "model": {"name": "tiny-sequential", "type": "minimal_sequential"},
+                "resources": {"world_size": 2},
+                "artifacts": {
+                    "checkpoint": {
+                        "consolidation": {
+                            "enabled": True,
+                            "device": "tpu",
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ConfigValidationError,
+        match="artifacts.checkpoint.consolidation.device must be one of: auto, cpu, cuda",
+    ):
+        load_training_config(path)

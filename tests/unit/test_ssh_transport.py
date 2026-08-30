@@ -34,6 +34,8 @@ def _transport(
     user: str | None = "shardgrid",
     port: int = 22,
     timeout: float = 15.0,
+    command_timeout: float = 60.0,
+    probe_timeout: float = 120.0,
     known_host_policy: KnownHostPolicy = KnownHostPolicy.STRICT,
     known_hosts_path: str | None = None,
     private_key_path: str | None = None,
@@ -45,6 +47,8 @@ def _transport(
             user=user,
             port=port,
             timeout=timeout,
+            command_timeout=command_timeout,
+            probe_timeout=probe_timeout,
             known_host_policy=known_host_policy,
             known_hosts_path=known_hosts_path,
             private_key_path=private_key_path,
@@ -128,7 +132,7 @@ def test_run_returns_stdout_stderr_and_exit_code(monkeypatch) -> None:
     assert captured_command[-1] == "echo ok"
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
-    assert kwargs["timeout"] == 15.0
+    assert kwargs["timeout"] == 60.0
     assert kwargs["shell"] is False
 
 
@@ -191,6 +195,8 @@ def test_options_from_ssh_config() -> None:
     ssh_config = SSHConfig(
         default_port=2222,
         connect_timeout_seconds=9,
+        command_timeout_seconds=45,
+        probe_timeout_seconds=90,
         strict_host_key_checking=False,
         known_hosts_path="~/.ssh/known_hosts",
         private_key_path="~/.ssh/id_ed25519",
@@ -200,6 +206,8 @@ def test_options_from_ssh_config() -> None:
 
     assert options.port == 2222
     assert options.timeout == 9.0
+    assert options.command_timeout == 45.0
+    assert options.probe_timeout == 90.0
     assert options.known_host_policy == KnownHostPolicy.ACCEPT_NEW
     assert options.known_hosts_path == "~/.ssh/known_hosts"
     assert options.private_key_path == "~/.ssh/id_ed25519"

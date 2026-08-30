@@ -43,6 +43,13 @@ def parse_route_interface(route_output: str | None) -> str | None:
     return match.group(1) if match else None
 
 
+def parse_route_source_ip(route_output: str | None) -> str | None:
+    if not route_output:
+        return None
+    match = re.search(r"\bsrc\s+(\S+)", route_output)
+    return match.group(1) if match else None
+
+
 def parse_interface_mtu(link_output: str | None) -> int | None:
     if not link_output:
         return None

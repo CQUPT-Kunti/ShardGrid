@@ -2,20 +2,25 @@
 
 Both GPU Workers use exactly the same transport contract and check logic:
 ``Machine A -> SSHTransport -> Windows host -> WSL2 Ubuntu -> selected Conda
-environment -> runtime Python``.  The check stops at identity/runtime evidence;
-GPU depth probing belongs to later tasks.
+environment -> runtime Python``.  Formal worker probes should cross that chain
+once per worker, collect runtime identity and GPU evidence together, and return
+the structured result to higher-level callers.
 """
 
 from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
-from typing import Any
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Any
 
 from shardgrid.common.config import WorkerConfig
 from shardgrid.common.enums import FailureStage
 from shardgrid.common.process import ProcessResult
 from shardgrid.transport.ssh import SSHTransport
+
+if TYPE_CHECKING:
+    from shardgrid.workers.gpu_probe import GPUProbeResult
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,7 @@ class RemoteAccessResult:
     failure_category: str | None = None
     failure_reason: str | None = None
     failure_record: dict[str, Any] | None = None
+    gpu_probe_result: GPUProbeResult | None = None
     stdout: str = ""
     stderr: str = ""
     exit_code: int | None = None
@@ -87,6 +93,24 @@ def classify_connection_failure(
     )
 
 
+def _remote_timeout(
+    *,
+    step: str,
+    message: str,
+    recommended_action: str,
+) -> tuple[str, str, str]:
+    return (f"{step}_timeout", message, recommended_action)
+
+
+def _remote_failure(
+    *,
+    step: str,
+    message: str,
+    recommended_action: str,
+) -> tuple[str, str, str]:
+    return (step, message, recommended_action)
+
+
 def _parse_default_wsl_distro(output: str) -> str | None:
     for raw_line in output.splitlines():
         line = raw_line.replace("\x00", "").strip()
@@ -128,6 +152,241 @@ def _python_version_script(python_executable: str) -> str:
 
 def _python_identity_script(python_executable: str) -> str:
     return f"{python_executable} -c 'import sys; print(sys.executable)'"
+
+
+def _env_name_from_prefix(prefix: str) -> str:
+    return PurePosixPath(prefix.rstrip("/")).name or "unknown"
+
+
+def _conda_executable_from_prefix(prefix: str) -> str:
+    normalized = prefix.rstrip("/")
+    marker = "/envs/"
+    if marker in normalized:
+        return f"{normalized.split(marker, 1)[0]}/bin/conda"
+    return f"{normalized}/bin/conda"
+
+
+def _runtime_wrapper_from_identity(
+    *,
+    distro: str,
+    user: str,
+    conda_executable: str,
+    conda_environment: str,
+    conda_prefix: str,
+    transport: SSHTransport,
+):
+    from shardgrid.transport.runtime import WSLRuntimeConfig, WSLRuntimeWrapper
+
+    return WSLRuntimeWrapper(
+        WSLRuntimeConfig(
+            distro=distro,
+            user=user,
+            conda_executable=conda_executable,
+            conda_environment=conda_environment,
+            conda_prefix=conda_prefix,
+        ),
+        transport,
+    )
+
+
+def _run_structured_runtime_probe(
+    *,
+    transport: SSHTransport,
+    worker: WorkerConfig,
+    commands: list[str],
+    windows_identity: str,
+    distro: str,
+    conda_executable: str,
+    conda_environment: str,
+    conda_prefix: str,
+    probe_timeout: float,
+) -> RemoteAccessResult | tuple[RemoteRuntimeIdentity, "GPUProbeResult", ProcessResult]:
+    from shardgrid.workers.gpu_probe import (
+        PROBE_SCRIPT,
+        gpu_probe_result_from_payload,
+        parse_probe_payload,
+    )
+
+    wrapper = _runtime_wrapper_from_identity(
+        distro=distro,
+        user=worker.ssh_user,
+        conda_executable=conda_executable,
+        conda_environment=conda_environment,
+        conda_prefix=conda_prefix,
+        transport=transport,
+    )
+    runtime_probe = wrapper.run_script(PROBE_SCRIPT, timeout=probe_timeout)
+    commands.append(runtime_probe.recorded_command)
+    if not runtime_probe.ok:
+        category, message, recommended_action = (
+            _remote_timeout(
+                step="runtime_probe",
+                message="WSL is reachable but the structured runtime probe timed out",
+                recommended_action=(
+                    "inspect WSL startup, the selected Conda runtime, and Python/Torch startup time"
+                ),
+            )
+            if runtime_probe.timed_out
+            else _remote_failure(
+                step="runtime_probe_failed",
+                message="WSL is reachable but the structured runtime probe could not be executed",
+                recommended_action=(
+                    "repair the selected WSL Conda runtime and rerun the worker probe"
+                ),
+            )
+        )
+        failure = transport.to_failure_record(
+            runtime_probe,
+            stage=FailureStage.PROBE,
+            host=str(worker.host),
+            worker_id=str(worker.worker_id),
+            message=message,
+            recommended_action=recommended_action,
+            conda_environment=conda_environment,
+            conda_prefix=conda_prefix,
+            python_executable=f"{conda_prefix}/bin/python",
+        )
+        return RemoteAccessResult(
+            status="FAIL",
+            worker_id=str(worker.worker_id),
+            host=str(worker.host),
+            ssh_user=worker.ssh_user,
+            transport=transport,
+            commands=tuple(commands),
+            windows_identity=windows_identity,
+            wsl_distro=distro,
+            failure_category=category,
+            failure_reason=message,
+            failure_record=failure.to_dict(),
+            stdout=runtime_probe.stdout,
+            stderr=runtime_probe.stderr,
+            exit_code=runtime_probe.exit_code,
+        )
+
+    payload = parse_probe_payload(runtime_probe.stdout)
+    if payload is None:
+        failure = transport.to_failure_record(
+            runtime_probe,
+            stage=FailureStage.PROBE,
+            host=str(worker.host),
+            worker_id=str(worker.worker_id),
+            message="WSL is reachable but the structured runtime probe returned invalid JSON",
+            recommended_action=(
+                "inspect the probe stdout/stderr and repair the remote runtime probe script"
+            ),
+            conda_environment=conda_environment,
+            conda_prefix=conda_prefix,
+            python_executable=f"{conda_prefix}/bin/python",
+        )
+        return RemoteAccessResult(
+            status="FAIL",
+            worker_id=str(worker.worker_id),
+            host=str(worker.host),
+            ssh_user=worker.ssh_user,
+            transport=transport,
+            commands=tuple(commands),
+            windows_identity=windows_identity,
+            wsl_distro=distro,
+            failure_category="runtime_probe_invalid_output",
+            failure_reason=(
+                "WSL is reachable but the structured runtime probe "
+                "returned invalid JSON"
+            ),
+            failure_record=failure.to_dict(),
+            stdout=runtime_probe.stdout,
+            stderr=runtime_probe.stderr,
+            exit_code=runtime_probe.exit_code,
+        )
+
+    probe_result = gpu_probe_result_from_payload(
+        payload,
+        worker,
+        runtime_version=distro,
+        conda_environment=conda_environment,
+        conda_prefix=conda_prefix,
+        conda_executable=conda_executable,
+        probe_status="live",
+        raw_output=runtime_probe.stdout,
+    )
+    python_executable = probe_result.worker_runtime.python_executable
+    python_version = probe_result.worker_runtime.python_version
+    if not python_executable or not python_version:
+        failure = transport.to_failure_record(
+            runtime_probe,
+            stage=FailureStage.PROBE,
+            host=str(worker.host),
+            worker_id=str(worker.worker_id),
+            message=(
+                "WSL is reachable but the structured runtime probe "
+                "did not report Python identity"
+            ),
+            recommended_action=(
+                "repair the runtime probe script so it emits python executable and version"
+            ),
+            conda_environment=conda_environment,
+            conda_prefix=conda_prefix,
+            python_executable=f"{conda_prefix}/bin/python",
+        )
+        return RemoteAccessResult(
+            status="FAIL",
+            worker_id=str(worker.worker_id),
+            host=str(worker.host),
+            ssh_user=worker.ssh_user,
+            transport=transport,
+            commands=tuple(commands),
+            windows_identity=windows_identity,
+            wsl_distro=distro,
+            failure_category="runtime_probe_missing_python_identity",
+            failure_reason=(
+                "WSL is reachable but the structured runtime probe did not report Python identity"
+            ),
+            failure_record=failure.to_dict(),
+            stdout=runtime_probe.stdout,
+            stderr=runtime_probe.stderr,
+            exit_code=runtime_probe.exit_code,
+        )
+
+    identity = RemoteRuntimeIdentity(
+        windows_identity=windows_identity or str(worker.host),
+        wsl_distro=distro,
+        conda_executable=conda_executable,
+        conda_environment=conda_environment,
+        conda_prefix=conda_prefix,
+        python_executable=python_executable,
+        python_version=python_version,
+    )
+    if not identity.python_executable.startswith(identity.conda_prefix.rstrip("/") + "/"):
+        failure = transport.to_failure_record(
+            runtime_probe,
+            stage=FailureStage.PROBE,
+            host=str(worker.host),
+            worker_id=str(worker.worker_id),
+            message="Remote Python is not inside the selected WSL Conda environment",
+            recommended_action=(
+                "fix the WSL runtime selection so Python comes from the "
+                "selected Conda prefix, then rerun the check"
+            ),
+            conda_environment=identity.conda_environment,
+            conda_prefix=identity.conda_prefix,
+            python_executable=identity.python_executable,
+        )
+        return RemoteAccessResult(
+            status="FAIL",
+            worker_id=str(worker.worker_id),
+            host=str(worker.host),
+            ssh_user=worker.ssh_user,
+            transport=transport,
+            commands=tuple(commands),
+            windows_identity=identity.windows_identity,
+            wsl_distro=identity.wsl_distro,
+            failure_category="runtime_python_outside_selected_conda",
+            failure_reason="Remote Python is not inside the selected WSL Conda environment",
+            failure_record=failure.to_dict(),
+            stdout=runtime_probe.stdout,
+            stderr=runtime_probe.stderr,
+            exit_code=runtime_probe.exit_code,
+        )
+    return identity, probe_result, runtime_probe
 
 
 def wrap_wsl_runtime_command(distro: str, user: str, command: str) -> str:
@@ -188,7 +447,10 @@ def run_remote_access_check(
 ) -> RemoteAccessResult:
     commands: list[str] = []
 
-    windows_identity = transport.run(["hostname"])
+    command_timeout = transport.options.command_timeout
+    probe_timeout = transport.options.probe_timeout
+
+    windows_identity = transport.run(["hostname"], timeout=command_timeout)
     commands.append(windows_identity.recorded_command)
     if not windows_identity.ok:
         category, message, recommended_action = classify_connection_failure(
@@ -219,7 +481,7 @@ def run_remote_access_check(
             exit_code=windows_identity.exit_code,
         )
 
-    wsl_list = transport.run(["wsl.exe", "-l", "-v"])
+    wsl_list = transport.run(["wsl.exe", "-l", "-v"], timeout=command_timeout)
     commands.append(wsl_list.recorded_command)
     if not wsl_list.ok:
         failure = transport.to_failure_record(
@@ -277,24 +539,77 @@ def run_remote_access_check(
             exit_code=wsl_list.exit_code,
         )
 
+    if worker.conda_prefix:
+        selected_prefix = worker.conda_prefix
+        selected_environment = (
+            preferred_environment
+            or worker.conda_environment
+            or _env_name_from_prefix(selected_prefix)
+        )
+        conda_executable = _conda_executable_from_prefix(selected_prefix)
+        probe_outcome = _run_structured_runtime_probe(
+            transport=transport,
+            worker=worker,
+            commands=commands,
+            windows_identity=windows_identity.stdout.strip() or str(worker.host),
+            distro=distro,
+            conda_executable=conda_executable,
+            conda_environment=selected_environment,
+            conda_prefix=selected_prefix,
+            probe_timeout=probe_timeout,
+        )
+        if isinstance(probe_outcome, RemoteAccessResult):
+            return probe_outcome
+        identity, probe_result, runtime_probe = probe_outcome
+        return RemoteAccessResult(
+            status="PASS",
+            worker_id=str(worker.worker_id),
+            host=str(worker.host),
+            ssh_user=worker.ssh_user,
+            transport=transport,
+            commands=tuple(commands),
+            windows_identity=identity.windows_identity,
+            wsl_distro=identity.wsl_distro,
+            runtime_identity=identity,
+            gpu_probe_result=probe_result,
+            stdout=runtime_probe.stdout,
+            stderr=runtime_probe.stderr,
+            exit_code=runtime_probe.exit_code,
+        )
+
     runtime_command = wrap_wsl_runtime_command(
         distro,
         worker.ssh_user,
         _runtime_probe_script(),
     )
-    runtime_conda = transport.run(runtime_command)
+    runtime_conda = transport.run(runtime_command, timeout=probe_timeout)
     commands.append(runtime_conda.recorded_command)
     if not runtime_conda.ok:
+        category, message, recommended_action = (
+            _remote_timeout(
+                step="wsl_runtime_probe",
+                message="WSL is reachable but the Conda runtime probe timed out",
+                recommended_action=(
+                    "inspect WSL startup and the selected runtime shell, then rerun the check"
+                ),
+            )
+            if runtime_conda.timed_out
+            else _remote_failure(
+                step="conda_unavailable",
+                message="WSL is reachable but Conda is unavailable in the training runtime",
+                recommended_action=(
+                    "install or expose Conda in the WSL training runtime, "
+                    "then rerun the check"
+                ),
+            )
+        )
         failure = transport.to_failure_record(
             runtime_conda,
             stage=FailureStage.PROBE,
             host=str(worker.host),
             worker_id=str(worker.worker_id),
-            message="WSL is reachable but Conda is unavailable in the training runtime",
-            recommended_action=(
-                "install or expose Conda in the WSL training runtime, "
-                "then rerun the check"
-            ),
+            message=message,
+            recommended_action=recommended_action,
             conda_environment=preferred_environment or worker.conda_environment,
             conda_prefix=worker.conda_prefix,
         )
@@ -307,8 +622,8 @@ def run_remote_access_check(
             commands=tuple(commands),
             windows_identity=windows_identity.stdout.strip() or None,
             wsl_distro=distro,
-            failure_category="conda_unavailable",
-            failure_reason="WSL is reachable but Conda is unavailable in the training runtime",
+            failure_category=category,
+            failure_reason=message,
             failure_record=failure.to_dict(),
             stdout=runtime_conda.stdout,
             stderr=runtime_conda.stderr,
@@ -321,16 +636,33 @@ def run_remote_access_check(
         worker.ssh_user,
         _runtime_active_script(),
     )
-    runtime_active = transport.run(active_command)
+    runtime_active = transport.run(active_command, timeout=probe_timeout)
     commands.append(runtime_active.recorded_command)
     if not runtime_active.ok:
+        category, message, recommended_action = (
+            _remote_timeout(
+                step="conda_active_state",
+                message="WSL is reachable but the active Conda state command timed out",
+                recommended_action=(
+                    "inspect WSL shell startup and Conda activation hooks, then rerun the check"
+                ),
+            )
+            if runtime_active.timed_out
+            else _remote_failure(
+                step="remote_command_non_zero_exit",
+                message="WSL is reachable but the active Conda state could not be read",
+                recommended_action=(
+                    "inspect the remote WSL Conda shell setup and rerun the check"
+                ),
+            )
+        )
         failure = transport.to_failure_record(
             runtime_active,
             stage=FailureStage.PROBE,
             host=str(worker.host),
             worker_id=str(worker.worker_id),
-            message="WSL is reachable but the active Conda state could not be read",
-            recommended_action="inspect the remote WSL Conda shell setup and rerun the check",
+            message=message,
+            recommended_action=recommended_action,
         )
         return RemoteAccessResult(
             status="FAIL",
@@ -341,8 +673,8 @@ def run_remote_access_check(
             commands=tuple(commands),
             windows_identity=windows_identity.stdout.strip() or None,
             wsl_distro=distro,
-            failure_category="remote_command_non_zero_exit",
-            failure_reason="WSL is reachable but the active Conda state could not be read",
+            failure_category=category,
+            failure_reason=message,
             failure_record=failure.to_dict(),
             stdout=runtime_active.stdout,
             stderr=runtime_active.stderr,
@@ -358,16 +690,34 @@ def run_remote_access_check(
         worker.ssh_user,
         _env_list_script(conda_executable),
     )
-    runtime_env_list = transport.run(env_list_command)
+    runtime_env_list = transport.run(env_list_command, timeout=probe_timeout)
     commands.append(runtime_env_list.recorded_command)
     if not runtime_env_list.ok:
+        category, message, recommended_action = (
+            _remote_timeout(
+                step="conda_env_list",
+                message="WSL is reachable but the Conda environment list command timed out",
+                recommended_action=(
+                    "inspect the remote Conda installation and retry after "
+                    "the WSL runtime is responsive"
+                ),
+            )
+            if runtime_env_list.timed_out
+            else _remote_failure(
+                step="remote_command_non_zero_exit",
+                message="WSL is reachable but the Conda environment list could not be read",
+                recommended_action=(
+                    "inspect the remote WSL Conda installation and rerun the check"
+                ),
+            )
+        )
         failure = transport.to_failure_record(
             runtime_env_list,
             stage=FailureStage.PROBE,
             host=str(worker.host),
             worker_id=str(worker.worker_id),
-            message="WSL is reachable but the Conda environment list could not be read",
-            recommended_action="inspect the remote WSL Conda installation and rerun the check",
+            message=message,
+            recommended_action=recommended_action,
             conda_environment=preferred_environment or worker.conda_environment,
             conda_prefix=worker.conda_prefix,
         )
@@ -380,8 +730,8 @@ def run_remote_access_check(
             commands=tuple(commands),
             windows_identity=windows_identity.stdout.strip() or None,
             wsl_distro=distro,
-            failure_category="remote_command_non_zero_exit",
-            failure_reason="WSL is reachable but the Conda environment list could not be read",
+            failure_category=category,
+            failure_reason=message,
             failure_record=failure.to_dict(),
             stdout=runtime_env_list.stdout,
             stderr=runtime_env_list.stderr,
@@ -423,124 +773,20 @@ def run_remote_access_check(
             exit_code=runtime_env_list.exit_code,
         )
 
-    python_executable = f"{selected_prefix}/bin/python"
-    python_version_command = wrap_wsl_runtime_command(
-        distro,
-        worker.ssh_user,
-        _python_version_script(python_executable),
-    )
-    runtime_python_version = transport.run(python_version_command)
-    commands.append(runtime_python_version.recorded_command)
-    if not runtime_python_version.ok:
-        failure = transport.to_failure_record(
-            runtime_python_version,
-            stage=FailureStage.PROBE,
-            host=str(worker.host),
-            worker_id=str(worker.worker_id),
-            message="WSL is reachable but the runtime Python could not be executed",
-            recommended_action=(
-                "repair the selected WSL Conda environment Python and rerun the check"
-            ),
-            conda_environment=selected_environment,
-            conda_prefix=selected_prefix,
-            python_executable=python_executable,
-        )
-        return RemoteAccessResult(
-            status="FAIL",
-            worker_id=str(worker.worker_id),
-            host=str(worker.host),
-            ssh_user=worker.ssh_user,
-            transport=transport,
-            commands=tuple(commands),
-            windows_identity=windows_identity.stdout.strip() or None,
-            wsl_distro=distro,
-            failure_category="remote_command_non_zero_exit",
-            failure_reason="WSL is reachable but the runtime Python could not be executed",
-            failure_record=failure.to_dict(),
-            stdout=runtime_python_version.stdout,
-            stderr=runtime_python_version.stderr,
-            exit_code=runtime_python_version.exit_code,
-        )
-
-    python_identity_command = wrap_wsl_runtime_command(
-        distro,
-        worker.ssh_user,
-        _python_identity_script(python_executable),
-    )
-    runtime_python_identity = transport.run(python_identity_command)
-    commands.append(runtime_python_identity.recorded_command)
-    if not runtime_python_identity.ok:
-        failure = transport.to_failure_record(
-            runtime_python_identity,
-            stage=FailureStage.PROBE,
-            host=str(worker.host),
-            worker_id=str(worker.worker_id),
-            message="WSL is reachable but the runtime Python identity could not be read",
-            recommended_action=(
-                "repair the selected WSL Conda environment Python and rerun the check"
-            ),
-            conda_environment=selected_environment,
-            conda_prefix=selected_prefix,
-            python_executable=python_executable,
-        )
-        return RemoteAccessResult(
-            status="FAIL",
-            worker_id=str(worker.worker_id),
-            host=str(worker.host),
-            ssh_user=worker.ssh_user,
-            transport=transport,
-            commands=tuple(commands),
-            windows_identity=windows_identity.stdout.strip() or None,
-            wsl_distro=distro,
-            failure_category="remote_command_non_zero_exit",
-            failure_reason="WSL is reachable but the runtime Python identity could not be read",
-            failure_record=failure.to_dict(),
-            stdout=runtime_python_identity.stdout,
-            stderr=runtime_python_identity.stderr,
-            exit_code=runtime_python_identity.exit_code,
-        )
-
-    identity = RemoteRuntimeIdentity(
-        windows_identity=(windows_identity.stdout.strip() or str(worker.host)),
-        wsl_distro=distro,
+    probe_outcome = _run_structured_runtime_probe(
+        transport=transport,
+        worker=worker,
+        commands=commands,
+        windows_identity=windows_identity.stdout.strip() or str(worker.host),
+        distro=distro,
         conda_executable=conda_executable,
         conda_environment=selected_environment,
         conda_prefix=selected_prefix,
-        python_executable=runtime_python_identity.stdout.strip(),
-        python_version=runtime_python_version.stdout.strip(),
+        probe_timeout=probe_timeout,
     )
-    if not identity.python_executable.startswith(identity.conda_prefix.rstrip("/") + "/"):
-        failure = transport.to_failure_record(
-            runtime_python_identity,
-            stage=FailureStage.PROBE,
-            host=str(worker.host),
-            worker_id=str(worker.worker_id),
-            message="Remote Python is not inside the selected WSL Conda environment",
-            recommended_action=(
-                "fix the WSL runtime selection so Python comes from the "
-                "selected Conda prefix, then rerun the check"
-            ),
-            conda_environment=identity.conda_environment,
-            conda_prefix=identity.conda_prefix,
-            python_executable=identity.python_executable,
-        )
-        return RemoteAccessResult(
-            status="FAIL",
-            worker_id=str(worker.worker_id),
-            host=str(worker.host),
-            ssh_user=worker.ssh_user,
-            transport=transport,
-            commands=tuple(commands),
-            windows_identity=identity.windows_identity,
-            wsl_distro=identity.wsl_distro,
-            failure_category="runtime_python_outside_selected_conda",
-            failure_reason="Remote Python is not inside the selected WSL Conda environment",
-            failure_record=failure.to_dict(),
-            stdout=runtime_python_identity.stdout,
-            stderr=runtime_python_identity.stderr,
-            exit_code=runtime_python_identity.exit_code,
-        )
-
+    if isinstance(probe_outcome, RemoteAccessResult):
+        return probe_outcome
+    identity, probe_result, runtime_probe = probe_outcome
     return RemoteAccessResult(
         status="PASS",
         worker_id=str(worker.worker_id),
@@ -551,7 +797,8 @@ def run_remote_access_check(
         windows_identity=identity.windows_identity,
         wsl_distro=identity.wsl_distro,
         runtime_identity=identity,
-        stdout=runtime_python_identity.stdout,
-        stderr=runtime_python_identity.stderr,
-        exit_code=runtime_python_identity.exit_code,
+        gpu_probe_result=probe_result,
+        stdout=runtime_probe.stdout,
+        stderr=runtime_probe.stderr,
+        exit_code=runtime_probe.exit_code,
     )

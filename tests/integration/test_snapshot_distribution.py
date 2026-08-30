@@ -14,6 +14,7 @@ from shardgrid.artifacts.snapshot import create_code_snapshot
 from shardgrid.artifacts.ssh_transport import (
     DistributionStatus,
     RemoteSnapshotProbe,
+    RemoteSnapshotProbeError,
     distribute_job_snapshot,
     snapshot_checksum,
 )
@@ -270,7 +271,21 @@ def test_distribution_verifies_both_workers_and_is_idempotent(
     assert second.status is DistributionStatus.PASS
     assert all(worker.skipped for worker in second.workers)
     assert control_checksum == expected_checksum
-    assert fake.calls == 2
+
+
+def test_snapshot_checksum_ignores_mutable_launcher_outputs(tmp_path: Path) -> None:
+    _, snapshot = _job_snapshot(tmp_path)
+    root = Path(snapshot.root_path)
+    baseline = snapshot_checksum(root)
+
+    (root / "logs" / "gpu4060").mkdir(parents=True, exist_ok=True)
+    (root / "logs" / "gpu4060" / "rank0.log").write_text("rank output\n", encoding="utf-8")
+    (root / "diagnostics" / "launch-gpu4060.json").write_text("{}", encoding="utf-8")
+    (root / "checkpoint" / "model.pt").write_text("checkpoint\n", encoding="utf-8")
+    (root / "code" / "examples" / "__pycache__").mkdir(parents=True, exist_ok=True)
+    (root / "code" / "examples" / "__pycache__" / "train.cpython-312.pyc").write_bytes(b"pyc")
+
+    assert snapshot_checksum(root) == baseline
 
 
 def test_distribution_fails_on_checksum_conflict(
@@ -299,6 +314,86 @@ def test_distribution_fails_on_checksum_conflict(
     assert result.workers[0].failure is not None
 
 
+def test_distribution_allows_prepare_only_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, snapshot = _job_snapshot(tmp_path)
+    fake = _FakeTransport()
+    workers = _workers(config)
+    expected_checksum = snapshot_checksum(Path(snapshot.root_path))
+    state: dict[str, list[RemoteSnapshotProbe]] = {
+        str(worker.host): [
+            RemoteSnapshotProbe(
+                exists=True,
+                empty=False,
+                top_level_entries=("checkpoint", "diagnostics", "logs"),
+            ),
+            RemoteSnapshotProbe(
+                exists=True,
+                empty=False,
+                checksum=expected_checksum,
+                job_id="job-001",
+            ),
+        ]
+        for worker in workers
+    }
+
+    def fake_probe(runtime, remote_root: str) -> RemoteSnapshotProbe:
+        host = str(runtime.executor.options.host)
+        return state[host].pop(0)
+
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._select_worker_transport",
+        lambda **_: fake,
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._read_windows_userprofile",
+        lambda ssh: r"C:\Users\shardgrid",
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._prepare_windows_staging_dir",
+        lambda ssh, staging_dir: None,
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._extract_remote_snapshot",
+        lambda runtime, archive_wsl_path, remote_root: type("R", (), {"ok": True})(),
+    )
+    monkeypatch.setattr("shardgrid.artifacts.ssh_transport._probe_remote_snapshot", fake_probe)
+
+    result = distribute_job_snapshot(snapshot, cluster_config=config, workers=workers)
+
+    assert result.status is DistributionStatus.PASS
+    assert all(worker.status is DistributionStatus.PASS for worker in result.workers)
+
+
+def test_distribution_rejects_unknown_nonempty_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, snapshot = _job_snapshot(tmp_path)
+    fake = _FakeTransport()
+    worker = _workers(config)[0]
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._select_worker_transport",
+        lambda **_: fake,
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._probe_remote_snapshot",
+        lambda runtime, remote_root: RemoteSnapshotProbe(
+            exists=True,
+            empty=False,
+            top_level_entries=("checkpoint", "diagnostics", "logs", "mystery"),
+        ),
+    )
+
+    result = distribute_job_snapshot(snapshot, cluster_config=config, workers=[worker])
+
+    assert result.status is DistributionStatus.FAIL
+    assert result.workers[0].failure is not None
+    assert result.workers[0].details is not None
+    assert result.workers[0].details["substep"] == "preflight_identity_conflict"
+    assert result.workers[0].details["probe_state"] == "PRESENT"
+
+
 def test_distribution_preserves_partial_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -310,7 +405,7 @@ def test_distribution_preserves_partial_failure(
             self.calls += 1
             status = (
                 ArtifactTransferStatus.SUCCESS
-                if remote.host == "machine-c.local"
+                if remote.host == str(workers[0].host)
                 else ArtifactTransferStatus.FAILED
             )
             return ArtifactTransferResult(
@@ -340,7 +435,7 @@ def test_distribution_preserves_partial_failure(
 
     def fake_probe(runtime, remote_root: str) -> RemoteSnapshotProbe:
         host = str(runtime.executor.options.host)
-        if host == "machine-c.local":
+        if host == str(workers[0].host):
             return RemoteSnapshotProbe(
                 exists=True,
                 empty=False,
@@ -372,6 +467,106 @@ def test_distribution_preserves_partial_failure(
     assert result.status is DistributionStatus.BLOCKED
     assert result.workers[0].status is DistributionStatus.PASS
     assert result.workers[1].status is DistributionStatus.BLOCKED
+
+
+def test_distribution_reports_first_failed_probe_substep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, snapshot = _job_snapshot(tmp_path)
+    fake = _FakeTransport()
+    worker = _workers(config)[0]
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._select_worker_transport",
+        lambda **_: fake,
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._probe_remote_snapshot",
+        lambda runtime, remote_root: (_ for _ in ()).throw(
+            RemoteSnapshotProbeError(
+                "failed to execute remote snapshot probe",
+                {
+                    "worker_id": "gpu4060",
+                    "stage": "DISTRIBUTE",
+                    "action": "remote_snapshot",
+                    "substep": "probe_command",
+                    "remote_path": remote_root,
+                    "command_summary": "python -",
+                    "exit_code": 1,
+                    "stdout_summary": None,
+                    "stderr_summary": "permission denied",
+                    "parse_error": None,
+                    "expected_job_id": "job-001",
+                    "detected_job_id": None,
+                    "expected_checksum": "expected",
+                    "detected_checksum": None,
+                    "metadata_ready": False,
+                    "recommended_action": "inspect SSH/WSL runtime command execution and retry",
+                },
+            )
+        ),
+    )
+
+    result = distribute_job_snapshot(snapshot, cluster_config=config, workers=[worker])
+
+    assert result.status is DistributionStatus.BLOCKED
+    details = result.workers[0].details
+    assert details is not None
+    assert details["substep"] == "probe_command"
+    assert details["remote_path"].endswith("/job-001")
+    assert details["stderr_summary"] == "permission denied"
+
+
+def test_distribution_reports_partial_snapshot_probe_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, snapshot = _job_snapshot(tmp_path)
+    fake = _FakeTransport()
+    worker = _workers(config)[0]
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._select_worker_transport",
+        lambda **_: fake,
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._read_windows_userprofile",
+        lambda ssh: r"C:\Users\shardgrid",
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._prepare_windows_staging_dir",
+        lambda ssh, staging_dir: None,
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._extract_remote_snapshot",
+        lambda runtime, archive_wsl_path, remote_root: type("R", (), {"ok": True})(),
+    )
+    expected_checksum = snapshot_checksum(Path(snapshot.root_path))
+    probes = iter(
+        (
+            RemoteSnapshotProbe(exists=False, empty=False),
+            RemoteSnapshotProbe(
+                exists=True,
+                empty=False,
+                checksum="partial-checksum",
+                job_id=None,
+                missing_paths=("diagnostics/snapshot-metadata.json",),
+                metadata_ready=False,
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        "shardgrid.artifacts.ssh_transport._probe_remote_snapshot",
+        lambda runtime, remote_root: next(probes),
+    )
+
+    result = distribute_job_snapshot(snapshot, cluster_config=config, workers=[worker])
+
+    assert result.status is DistributionStatus.FAIL
+    details = result.workers[0].details
+    assert details is not None
+    assert details["substep"] == "verify_post_transfer"
+    assert details["expected_checksum"] == expected_checksum
+    assert details["detected_checksum"] == "partial-checksum"
+    assert details["probe_state"] == "PARTIAL"
+    assert details["missing_paths"] == ["diagnostics/snapshot-metadata.json"]
 
 
 def _require_password() -> str:

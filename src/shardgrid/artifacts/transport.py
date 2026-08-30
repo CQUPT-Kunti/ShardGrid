@@ -49,6 +49,11 @@ class RemoteArtifactLocation:
     user: str | None = None
     port: int = 22
     private_key_path: str | None = None
+    connect_timeout_seconds: int | None = None
+    command_timeout_seconds: float | None = None
+    known_host_policy: str | None = None
+    known_hosts_path: str | None = None
+    batch_mode: bool = True
 
     def __post_init__(self) -> None:
         if not self.host.strip():
@@ -88,7 +93,9 @@ class ArtifactTransferItemResult:
     destination: str
     recorded_command: str | None = None
     exit_code: int | None = None
+    stdout: str = ""
     stderr: str = ""
+    timed_out: bool = False
     retryable: bool = False
 
     @property
@@ -176,9 +183,32 @@ class CommandArtifactTransport:
 
         results: list[ArtifactTransferItemResult] = []
         for item in items:
-            self._validate_local_path(item)
+            try:
+                self._validate_local_path(item)
+                self._prepare_local_destination(item)
+            except OSError as exc:
+                results.append(
+                    ArtifactTransferItemResult(
+                        label=item.label,
+                        transport=self.name.value,
+                        status=ArtifactTransferStatus.FAILED,
+                        source=item.source,
+                        destination=item.destination,
+                        recorded_command=f"{self.executable} local destination preparation",
+                        exit_code=None,
+                        stderr=f"local destination preparation failed: {exc}",
+                        retryable=True,
+                    )
+                )
+                continue
             argv, stdin = self._build_command(item, remote)
-            process = self._runner(argv, shell=False, secrets=secrets, input=stdin)
+            process = self._runner(
+                argv,
+                shell=False,
+                secrets=secrets,
+                input=stdin,
+                timeout=remote.command_timeout_seconds,
+            )
             results.append(
                 ArtifactTransferItemResult(
                     label=item.label,
@@ -188,7 +218,9 @@ class CommandArtifactTransport:
                     destination=item.destination,
                     recorded_command=process.recorded_command,
                     exit_code=process.exit_code,
+                    stdout=redact_text(process.stdout, secrets) or "",
                     stderr=redact_text(process.stderr, secrets) or "",
+                    timed_out=process.timed_out,
                     retryable=not _is_permission_denied(process.stderr),
                 )
             )
@@ -237,19 +269,36 @@ class CommandArtifactTransport:
         if root not in path.parents and path != root:
             raise ValueError("artifact path escaped local_root")
 
-    def _ssh_flags(self, remote: RemoteArtifactLocation) -> list[str]:
+    def _prepare_local_destination(self, item: ArtifactTransferSpec) -> None:
+        if item.direction == "pull":
+            Path(item.destination).parent.mkdir(parents=True, exist_ok=True)
+
+    def _ssh_flags(
+        self,
+        remote: RemoteArtifactLocation,
+        *,
+        port_flag: str,
+    ) -> list[str]:
         flags: list[str] = []
+        if remote.batch_mode:
+            flags.extend(["-o", "BatchMode=yes"])
+        if remote.connect_timeout_seconds is not None:
+            flags.extend(["-o", f"ConnectTimeout={int(remote.connect_timeout_seconds)}"])
+        if remote.known_host_policy:
+            flags.extend(["-o", f"StrictHostKeyChecking={remote.known_host_policy}"])
+        if remote.known_hosts_path:
+            flags.extend(["-o", f"UserKnownHostsFile={remote.known_hosts_path}"])
         if remote.private_key_path:
             flags.extend(["-i", remote.private_key_path])
         if remote.port != 22:
-            flags.extend(["-P", str(remote.port)])
+            flags.extend([port_flag, str(remote.port)])
         return flags
 
     def _build_command(
         self, item: ArtifactTransferSpec, remote: RemoteArtifactLocation
     ) -> tuple[list[str], str | None]:
         if self.name is ArtifactTransportName.SCP:
-            argv = [self.executable, *self._ssh_flags(remote)]
+            argv = [self.executable, *self._ssh_flags(remote, port_flag="-P")]
             if item.recursive:
                 argv.append("-r")
             if item.direction == "push":
@@ -259,12 +308,10 @@ class CommandArtifactTransport:
             return argv, None
         if self.name is ArtifactTransportName.RSYNC:
             argv = [self.executable, "-a"]
-            if remote.port != 22 or remote.private_key_path:
+            ssh_flags = self._ssh_flags(remote, port_flag="-p")
+            if ssh_flags:
                 ssh_parts = ["ssh"]
-                if remote.private_key_path:
-                    ssh_parts.extend(["-i", remote.private_key_path])
-                if remote.port != 22:
-                    ssh_parts.extend(["-p", str(remote.port)])
+                ssh_parts.extend(ssh_flags)
                 argv.extend(["-e", " ".join(ssh_parts)])
             if item.direction == "push":
                 argv.extend([item.source, remote.target_for(item.destination)])
@@ -272,11 +319,7 @@ class CommandArtifactTransport:
                 argv.extend([remote.source_for(item.source), item.destination])
             return argv, None
 
-        argv = [self.executable]
-        if remote.private_key_path:
-            argv.extend(["-i", remote.private_key_path])
-        if remote.port != 22:
-            argv.extend(["-P", str(remote.port)])
+        argv = [self.executable, *self._ssh_flags(remote, port_flag="-P")]
         argv.append(remote.login_target)
         if item.direction == "push":
             script = f'put {"-r " if item.recursive else ""}{item.source} {item.destination}\n'

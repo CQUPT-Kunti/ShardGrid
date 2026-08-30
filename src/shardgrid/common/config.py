@@ -125,6 +125,8 @@ class ControlNodeConfig:
 class SSHConfig:
     default_port: int = 22
     connect_timeout_seconds: int = 15
+    command_timeout_seconds: int = 60
+    probe_timeout_seconds: int = 120
     strict_host_key_checking: bool = True
     private_key_path: str | None = None
     known_hosts_path: str | None = None
@@ -139,6 +141,14 @@ class SSHConfig:
             connect_timeout_seconds=_require_int(
                 payload.get("connect_timeout_seconds", 15),
                 field_name="ssh.connect_timeout_seconds",
+            ),
+            command_timeout_seconds=_require_int(
+                payload.get("command_timeout_seconds", 60),
+                field_name="ssh.command_timeout_seconds",
+            ),
+            probe_timeout_seconds=_require_int(
+                payload.get("probe_timeout_seconds", 120),
+                field_name="ssh.probe_timeout_seconds",
             ),
             strict_host_key_checking=_require_bool(
                 payload.get("strict_host_key_checking", True),
@@ -469,6 +479,23 @@ class TrainingArtifactsConfig:
     snapshot_name: str | None = None
     keep_failed_snapshots: bool = True
     transport: str = "auto"
+    checkpoint: "TrainingCheckpointConfig" = field(
+        default_factory=lambda: TrainingCheckpointConfig()
+    )
+
+
+@dataclass(frozen=True)
+class TrainingCheckpointConfig:
+    consolidation: "TrainingCheckpointConsolidationConfig" = field(
+        default_factory=lambda: TrainingCheckpointConsolidationConfig()
+    )
+
+
+@dataclass(frozen=True)
+class TrainingCheckpointConsolidationConfig:
+    enabled: bool = False
+    device: str = "auto"
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -487,6 +514,21 @@ class TrainingConfig:
         artifacts_payload = _require_mapping(
             payload.get("artifacts", {}), field_name="artifacts"
         )
+        checkpoint_payload = _require_mapping(
+            artifacts_payload.get("checkpoint", {}), field_name="artifacts.checkpoint"
+        )
+        consolidation_payload = _require_mapping(
+            checkpoint_payload.get("consolidation", {}),
+            field_name="artifacts.checkpoint.consolidation",
+        )
+        consolidation_device = _require_string(
+            consolidation_payload.get("device", "auto"),
+            field_name="artifacts.checkpoint.consolidation.device",
+        ).lower()
+        if consolidation_device not in {"auto", "cpu", "cuda"}:
+            raise ConfigValidationError(
+                "artifacts.checkpoint.consolidation.device must be one of: auto, cpu, cuda"
+            )
         return cls(
             job=TrainingJobConfig(
                 name=_require_string(job_payload.get("name"), field_name="job.name"),
@@ -548,6 +590,19 @@ class TrainingConfig:
                 transport=_require_string(
                     artifacts_payload.get("transport", "auto"),
                     field_name="artifacts.transport",
+                ),
+                checkpoint=TrainingCheckpointConfig(
+                    consolidation=TrainingCheckpointConsolidationConfig(
+                        enabled=_require_bool(
+                            consolidation_payload.get("enabled", False),
+                            field_name="artifacts.checkpoint.consolidation.enabled",
+                        ),
+                        device=consolidation_device,
+                        required=_require_bool(
+                            consolidation_payload.get("required", False),
+                            field_name="artifacts.checkpoint.consolidation.required",
+                        ),
+                    )
                 ),
             ),
         )

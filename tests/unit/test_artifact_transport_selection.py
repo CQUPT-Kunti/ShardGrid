@@ -20,12 +20,12 @@ _SECRET = "TEST_PASSWORD_DO_NOT_LEAK"
 
 
 def _runner_factory(exit_codes: list[int], stderrs: list[str] | None = None):
-    calls: list[tuple[list[str], str | bytes | None]] = []
+    calls: list[tuple[list[str], dict[str, object]]] = []
     stderr_values = stderrs or [""] * len(exit_codes)
 
     def fake_runner(command, **kwargs):
         index = len(calls)
-        calls.append((list(command), kwargs.get("input")))
+        calls.append((list(command), dict(kwargs)))
         return ProcessResult(
             args=tuple(command),
             recorded_command=" ".join(str(part) for part in command).replace(_SECRET, "***"),
@@ -65,6 +65,10 @@ def _remote() -> RemoteArtifactLocation:
         path="/remote/job-001",
         port=2222,
         private_key_path="/keys/id_ed25519",
+        connect_timeout_seconds=15,
+        command_timeout_seconds=60.0,
+        known_host_policy="yes",
+        known_hosts_path="/home/test/.ssh/known_hosts",
     )
 
 
@@ -164,6 +168,57 @@ def test_sensitive_credential_not_leaked_to_recorded_command(tmp_path: Path) -> 
     assert calls[0][0][0] == "scp"
 
 
+def test_scp_reuses_ssh_flags_and_command_timeout(tmp_path: Path) -> None:
+    runner, calls = _runner_factory([0])
+    transport = select_artifact_transport(
+        ArtifactTransportConfig(preferred=ArtifactTransportName.SCP),
+        which=_which_available("scp"),
+        runner=runner,
+    )
+
+    result = transport.transfer([_spec(tmp_path)], remote=_remote())
+
+    assert result.ok is True
+    argv, kwargs = calls[0]
+    assert argv[:11] == [
+        "scp",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/home/test/.ssh/known_hosts",
+        "-i",
+        "/keys/id_ed25519",
+    ]
+    assert "-P" in argv
+    assert kwargs["timeout"] == 60.0
+
+
+def test_rsync_reuses_ssh_flags_and_command_timeout(tmp_path: Path) -> None:
+    runner, calls = _runner_factory([0])
+    transport = select_artifact_transport(
+        ArtifactTransportConfig(preferred=ArtifactTransportName.RSYNC),
+        which=_which_available("rsync"),
+        runner=runner,
+    )
+
+    result = transport.transfer([_spec(tmp_path)], remote=_remote())
+
+    assert result.ok is True
+    argv, kwargs = calls[0]
+    assert argv[:3] == ["rsync", "-a", "-e"]
+    assert "BatchMode=yes" in argv[3]
+    assert "ConnectTimeout=15" in argv[3]
+    assert "StrictHostKeyChecking=yes" in argv[3]
+    assert "UserKnownHostsFile=/home/test/.ssh/known_hosts" in argv[3]
+    assert "-i /keys/id_ed25519" in argv[3]
+    assert "-p 2222" in argv[3]
+    assert kwargs["timeout"] == 60.0
+
+
 def test_argument_safety_preserves_space_paths_without_shell_join(tmp_path: Path) -> None:
     runner, calls = _runner_factory([0])
     source_root = tmp_path / "job 001"
@@ -213,6 +268,74 @@ def test_path_escape_is_rejected(tmp_path: Path) -> None:
             ],
             remote=_remote(),
         )
+
+
+def test_pull_creates_nested_destination_parent_before_command(tmp_path: Path) -> None:
+    destination = tmp_path / "job-001" / "logs" / "worker-a" / "rank0" / ".incoming.log"
+    calls = []
+
+    def runner(command, **kwargs):
+        del kwargs
+        calls.append(command)
+        assert destination.parent.exists()
+        return ProcessResult(
+            args=tuple(command),
+            recorded_command="scp ok",
+            shell=False,
+            cwd=None,
+            exit_code=0,
+            stdout="",
+            stderr="",
+            timed_out=False,
+            runtime_environment={},
+        )
+
+    transport = select_artifact_transport(
+        ArtifactTransportConfig(preferred=ArtifactTransportName.SCP),
+        which=_which_available("scp"),
+        runner=runner,
+    )
+
+    result = transport.transfer(
+        [
+            ArtifactTransferSpec(
+                label="log",
+                source="/remote/log",
+                destination=str(destination),
+                direction="pull",
+                local_root=str(tmp_path / "job-001"),
+            )
+        ],
+        remote=_remote(),
+    )
+
+    assert result.ok is True
+    assert calls
+
+
+def test_pull_rejects_escaped_destination_before_mkdir(tmp_path: Path) -> None:
+    escaped = tmp_path / "outside" / "created-by-bug" / "file.txt"
+    transport = select_artifact_transport(
+        ArtifactTransportConfig(preferred=ArtifactTransportName.SCP),
+        which=_which_available("scp"),
+        runner=lambda command, **kwargs: pytest.fail("runner must not be called"),
+    )
+
+    with pytest.raises(ValueError, match="escaped local_root"):
+        transport.transfer(
+            [
+                ArtifactTransferSpec(
+                    label="log",
+                    source="/remote/log",
+                    destination=str(escaped),
+                    direction="pull",
+                    local_root=str(tmp_path / "job-001"),
+                )
+            ],
+            remote=_remote(),
+        )
+
+    assert not escaped.parent.exists()
 
 
 def test_transfer_result_serialization(tmp_path: Path) -> None:
