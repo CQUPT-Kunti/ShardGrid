@@ -68,19 +68,20 @@ workers:
   labels:
     gpu: gtx1650
     required_for_mvp: 'true'
-- id: gpu4060e
+- id: gpu4060-cqupt
   machine_id: machine-e
   physical_os: windows
   runtime_os: wsl2_linux
   runtime: wsl2
-  host: machine-e.local
+  host: 10.87.5.214
   ssh_user: shardgrid
   ssh_port: 22
   runtime_distro: Ubuntu-22.04
-  conda_environment: null
-  conda_prefix: null
+  conda_environment: shardgrid
+  conda_prefix: /home/shardgrid/miniconda3/envs/shardgrid
   local_world_size: 1
-  enabled: false
+  enabled: true
   labels:
     gpu: rtx4060
+    host_identity: CQUPT
     optional: 'true'

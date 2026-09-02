@@ -34,5 +34,14 @@
         "gpu": false,
         "gpu_model": null,
         "os": "Ubuntu"
+    },
+    {
+        "ip": "10.87.5.214",
+        "hostname": "CQUPT",
+        "username": "shardgrid",
+        "password": null,
+        "gpu": true,
+        "gpu_model": "NVIDIA GeForce RTX 4060",
+        "os": "Windows"
     }
 ]
