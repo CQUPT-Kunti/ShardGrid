@@ -115,6 +115,53 @@ This research resolves planning choices for the first implementation route. Deci
 - Large model demo first: rejected because it risks blocking the training proof on memory/performance instead of validating orchestration.
 - Smoke tests only: rejected because the MVP requires real forward/backward/optimizer/checkpoint.
 
+## Decision: Automatic Partition Only Through Selected ParallelEngine Capabilities
+
+**Rationale**: The existing engine decision selects Galvatron for MVP evidence and keeps PyTorch pipelining as a supported fallback. Automatic partitioning must use the selected engine for model inspection, profiling, supported partition boundaries, partition materialization, engine-owned plans, and runtime/autograd integration. ShardGrid adds resource constraints, placement, launch, artifacts, and diagnostics only.
+
+**Alternatives considered**:
+
+- ShardGrid-owned graph partitioner: rejected because it would reimplement mature model-parallel engine responsibilities.
+- User-authored `stage0.py` / `stage1.py` / `stage2.py` as automatic acceptance: rejected because it proves static regression only.
+- Claim arbitrary model support: rejected; unsupported dynamic control flow, custom CUDA ops, untraceable graphs, incompatible modules, or unsupported tied/shared behavior must be BLOCKED or UNSATISFIABLE with reasons.
+
+## Decision: Joint Partition and Placement Search
+
+**Rationale**: Model split choices and Worker choices are coupled by memory, network, runtime, and heterogeneous GPU performance. The Planner therefore evaluates a feedback loop: profile -> candidate partition -> placement attempt -> hard-constraint validation -> reject or select.
+
+**Alternatives considered**:
+
+- Split model into N stages first, then find N Workers: rejected because it can force avoidable Worker count, communication, or memory failures.
+- Use every healthy Worker by default: rejected because extra physical Workers add stage boundaries, transfers, synchronization, and failure points.
+- Opaque composite score only: rejected because operators need deterministic, replayable reasons.
+
+## Decision: Peak Training Memory Before Launch
+
+**Rationale**: Parameter size alone is not enough to predict trainability. Planner memory fit uses parameter bytes, activation bytes, gradient bytes, optimizer bytes, runtime overhead, communication buffers, estimated peak training memory, and configurable safety headroom. Candidates that exceed usable GPU memory after headroom are rejected before training.
+
+**Alternatives considered**:
+
+- Detect OOM by launching training: rejected because it wastes hardware time and loses clear planning diagnostics.
+- Increase stage count until it fits: rejected because it can increase communication and still fail on unsupported boundaries.
+
+## Decision: Boundary-Based Communication and Heterogeneous Scoring
+
+**Rationale**: Pipeline cost comes from actual stage boundaries, not total parameter count. Planner scoring uses activation and gradient bytes, microbatch count, batch size, sequence length where relevant, boundary tensor shape, bandwidth, latency, and estimated bytes per training step. Legal candidates are sorted by minimum physical Workers, least cross-host communication, avoidance of severe heterogeneous bottlenecks, compute balance, GPU secondary preferences, and deterministic tie-break.
+
+**Alternatives considered**:
+
+- Equal parameter split: rejected because weak GPUs can become bottlenecks and high-transfer boundaries can dominate runtime.
+- GPU model preference before Worker count: rejected because using more hosts usually adds communication and failure surface.
+
+## Decision: Distributed Checkpoint for Resume, Consolidated Model for Use
+
+**Rationale**: Distributed checkpoints are the authoritative resume format and may keep optimizer, scheduler, RNG, and runtime state distributed. Completed automatic-partition jobs also need a consolidated full-model artifact that restores the original model state dict and can reload without Worker, rank, or stage knowledge. CPU consolidation is the default to avoid GPU OOM during export.
+
+**Alternatives considered**:
+
+- Only save stage shards: rejected because users cannot load a normal full model artifact.
+- Force optimizer consolidation: rejected because model export and training resume have different needs.
+
 ## Decision: File-Based Job Snapshots First
 
 **Rationale**: Stage C needs reproducible jobs, logs, plans, environment records, and checkpoints. Local filesystem snapshots on Machine A are the simplest inspectable source of truth. NFS can be added in Stage D behind `ArtifactStore` once Kubernetes needs shared paths.

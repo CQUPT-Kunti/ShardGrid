@@ -8,7 +8,7 @@
 
 ## Summary
 
-ShardGrid first-stage implementation builds a single Python-based CLI/control-plane system that proves real distributed training across two separate Windows physical GPU hosts running WSL2 Linux training runtimes. The implementation order is risk-gated: Stage A establishes cross-platform bootstrap, platform abstraction, and doctor; Stage B proves real multi-host GPU communication and two-stage training over SSH; Stage C automates ShardGrid jobs, snapshots, planning, and SSH launch into the formal MVP; Stage D adds Kubernetes and Volcano only after compatibility gates pass; Stage E adds HAMi GPU sharing and multi-user simulation after the Kubernetes/Volcano chain is stable.
+ShardGrid first-stage implementation builds a single Python-based CLI/control-plane system that proves real distributed training across separate Windows physical GPU hosts running WSL2 Linux training runtimes. The implementation order is risk-gated: Stage A establishes cross-platform bootstrap, platform abstraction, and doctor; Stage B proves real multi-host GPU communication and two-stage training over SSH; Stage C automates ShardGrid jobs, snapshots, supported-model automatic partitioning, joint resource-aware placement, SSH launch, checkpoint consolidation, and full-model reload validation; Stage D adds Kubernetes and Volcano only after compatibility gates pass; Stage E adds HAMi GPU sharing and multi-user simulation after the Kubernetes/Volcano chain is stable.
 
 The core architectural rule is adapter-first reuse. ShardGrid owns orchestration, resource modeling, placement metadata, artifact snapshots, diagnostics, and launcher contracts. It does not reimplement SSH, file transfer, PyTorch distributed communication, NCCL/Gloo, Kubernetes, Volcano, HAMi, autograd, CUDA kernels, GPU virtualization, or a full model-parallel engine.
 
@@ -16,7 +16,7 @@ The core architectural rule is adapter-first reuse. ShardGrid owns orchestration
 
 **Language/Version**: Python from the selected Conda-managed development or training environment; no fixed Python or Conda version is required unless a dependency compatibility check proves it. PowerShell 5+/7 is used for Windows bootstrap; Bash is used for Ubuntu/WSL bootstrap.
 
-**Primary Dependencies**: Existing Conda installation and compatible Conda environments are reused first for Python development and training; Typer or Click for CLI; Pydantic for schemas; PyYAML for config; Rich or standard logging for human output; pytest for tests; system OpenSSH/SCP/SFTP/rsync for remote execution and transfer; iperf3/ping/system network tools for probing; PyTorch distributed and torchrun for training runtime inside the selected Conda environment; NCCL first and Gloo fallback; Galvatron compatibility spike first, then DeepSpeed Pipeline, PyTorch pipeline APIs, and nnScaler as ordered alternatives; Kubernetes Python client or kubectl manifests for Stage D; official Volcano and HAMi distributions for later stages.
+**Primary Dependencies**: Existing Conda installation and compatible Conda environments are reused first for Python development and training; Typer or Click for CLI; Pydantic for schemas; PyYAML for config; Rich or standard logging for human output; pytest for tests; system OpenSSH/SCP/SFTP/rsync for remote execution and transfer; iperf3/ping/system network tools for probing; PyTorch distributed and torchrun for training runtime inside the selected Conda environment; NCCL first and Gloo fallback; Galvatron compatibility spike first, then DeepSpeed Pipeline, PyTorch pipeline APIs, and nnScaler as ordered alternatives; selected ParallelEngine APIs for model inspection, profiling, legal partition boundaries, partition materialization, engine-owned plans, and runtime/autograd integration; Kubernetes Python client or kubectl manifests for Stage D; official Volcano and HAMi distributions for later stages.
 
 **Storage**: Stage A-C use local filesystem snapshots on the Ubuntu control node under configurable `jobs/<job-id>/`. Stage D may add NFS through an `ArtifactStore` interface. Future artifact backends may include S3 or MinIO without changing job semantics.
 
@@ -26,11 +26,11 @@ The core architectural rule is adapter-first reuse. ShardGrid owns orchestration
 
 **Project Type**: Python CLI plus local control-plane library, worker-side scripts, remote launcher adapters, training examples, deployment manifests, and layered test suite.
 
-**Performance Goals**: The supported validation model completes forward, activation transfer, loss, backward, gradient transfer, optimizer step, and checkpoint across RTX 4060 plus GTX 1650 within 15 minutes. Distributed process group initialization succeeds within 2 minutes or fails with diagnostics. Worker inventory succeeds in at least 95% of repeated discovery attempts on a stable LAN.
+**Performance Goals**: The supported validation model completes forward, activation transfer, loss, backward, gradient transfer, optimizer step, checkpoint, full-model consolidation, and reload validation across selected Workers within 15 minutes on target hardware. Distributed process group initialization succeeds within 2 minutes or fails with diagnostics. Worker inventory succeeds in at least 95% of repeated discovery attempts on a stable LAN. Planner fixtures deterministically choose the fewest legal physical Workers before communication and GPU preference tie-breaks.
 
 **Constraints**: One GPU per physical Worker; default `local_world_size = 1`; no hard-coded paths, users, drive letters, IPs, ports, Conda prefixes, environment names, or Python executables; all addresses, paths, and runtime environment selections are configurable or detected; no manual rank launch by the user; no Kubernetes/Volcano/HAMi dependency before the SSH backend proves real training; stop any automated setup step that requires administrator approval, reboot, BIOS changes, password entry, risky firewall changes, Conda installation with elevated permissions, or destructive environment replacement.
 
-**Scale/Scope**: First formal MVP covers Machine A, Machine C, Machine D, and optional Machine E. Stage C supports a small number of configured one-GPU Workers and one active validation job at a time. Stage E expands to multi-job and multi-user simulation, not production multi-tenancy.
+**Scale/Scope**: First formal MVP covers Machine A, Machine C, Machine D, and optional Machine E. Stage C supports a small number of configured one-GPU Workers, one active validation job at a time, and automatic partition only for models supported by the selected ParallelEngine. Unsupported, untraceable, or unsatisfiable models are blocked with explicit reasons. Stage E expands to multi-job and multi-user simulation, not production multi-tenancy.
 
 ## Constitution Check
 
@@ -218,28 +218,38 @@ docs/
 
 ### Stage C - ShardGrid Automation
 
-**Goal**: Turn the proven manual/static training path into the formal one-command MVP.
+**Goal**: Turn the proven manual/static training path into the formal one-command MVP, then add automatic partition planning and full-model consolidation for selected-engine-supported models.
 
 **Entry Conditions**:
 
 - Gate B passed.
 - Minimal pipeline training is reproducible with explicit command records.
+- Static stage fixtures remain available as regression evidence but are not automatic partition acceptance evidence.
 
 **Implementation Work**:
 
-- Define serializable entities: `TrainingJob`, `WorkerResource`, `NetworkState`, `ParallelPlan`, `ExecutionPlan`, `JobStatus`, `TrainingResult`, `EnvironmentSnapshot`, and `CompatibilityReport`.
+- Define serializable entities: `TrainingJob`, `WorkerResource`, `NetworkState`, `ModelProfile`, `PartitionCandidate`, `TrainingMemoryEstimate`, `CommunicationEdge`, `ParallelPlan`, `ExecutionPlan`, `JobStatus`, `TrainingResult`, `DistributedCheckpoint`, `ConsolidatedModelArtifact`, `EnvironmentSnapshot`, and `CompatibilityReport`.
 - Implement local file snapshot under configurable `jobs/<job-id>/`.
 - Implement `ArtifactStore` and `ArtifactTransport`:
   - Stage C concrete transport: SSH/SCP/SFTP/rsync.
   - Future stores: NFS, S3, MinIO.
 - Implement `ResourceManager` and `ClusterState` from live probe results.
-- Implement placement-only Planner:
-  - memory fit
-  - minimum Workers
-  - best network
-  - better GPU as secondary
-  - manual override
+- Implement selected-engine-driven model profiling and automatic partition candidate generation:
+  - model structure and original module/layer identity
+  - supported partition boundaries
+  - parameter names/ranges
+  - parameter, activation, gradient, optimizer, runtime overhead, and communication buffer estimates
+  - engine-owned plan preservation
+  - explicit BLOCKED or UNSATISFIABLE reasons for unsupported models
+- Implement joint partition/placement Planner:
+  - feedback loop: profile -> candidate partition -> placement attempt -> memory/network validation -> reject or select
+  - hard constraints before scoring: Worker health, GPU/runtime compatibility, backend availability, network reachability, physical-host mapping, valid `local_world_size`, supported partition boundary, training peak memory fit
+  - optimization priority: minimum physical Workers, minimum cross-host communication, avoidance of severe heterogeneous bottlenecks, compute balance, GPU secondary preferences, deterministic tie-break
+  - candidate rejection reason, selected reason, fallback reason, and UNSATISFIABLE reason
+  - manual override without bypassing hard constraints
 - Generate formal `ExecutionPlan` from `ParallelPlan + Placement`.
+- Distinguish distributed checkpoint used for resume from consolidated full-model export used by users.
+- Consolidate model weights on CPU by default after successful automatic partition training, preserving original parameter namespace, buffers, shared/tied parameter metadata where supported, keys, shapes, and dtypes.
 - Implement `SSHLauncher` lifecycle:
   - prepare
   - distribute
@@ -259,11 +269,14 @@ docs/
   - `shardgrid logs JOB`
   - `shardgrid stop JOB`
 
-**Gate C - Formal MVP**:
+**Gate C - Formal MVP + Automatic Partition Gate**:
 
 - From Machine A, the user runs only `shardgrid train examples/train-minimal.yaml`.
 - System completes discovery, network probe, planning, snapshotting, distribution, rank launch, rendezvous, training, logs, status, and checkpoint.
 - User can retrieve final plan, logs, diagnostics, loss trend, optimizer update proof, and checkpoint metadata by job ID.
+- For automatic partition acceptance, the user does not provide `stage0.py`, `stage1.py`, or `stage2.py`.
+- At least two supported models complete automatic profile, legal partition search, memory-aware placement, communication/heterogeneous scoring, ExecutionPlan generation, SSH-backed multi-host training, distributed checkpoint, consolidated full-model export, and reload validation.
+- Kubernetes work starts only after the automatic partition gate passes or is explicitly documented as blocked with preserved SSH fallback evidence.
 
 ### Stage D - Kubernetes + Volcano
 
@@ -271,7 +284,7 @@ docs/
 
 **Entry Conditions**:
 
-- Gate C passed.
+- Gate C passed, including automatic partition gate status.
 - SSH backend remains the known-good fallback.
 
 **Implementation Work**:
@@ -369,6 +382,8 @@ Required test suites:
 - **Multi-host Communication**: broadcast, send/recv, all_reduce for NCCL and labeled Gloo fallback.
 - **Multi-host Training**: two-stage validation model with loss decrease and checkpoint.
 - **Automated SSH Training**: full `shardgrid train` from Machine A.
+- **Automatic Partition Planning**: selected-engine-supported model profiles, partition candidates, hard-constraint rejection, minimum-Worker optimization, communication cost, heterogeneous compute balance, dry-run, and replay.
+- **Checkpoint Consolidation**: distributed checkpoint resume metadata, consolidated full-model artifact, original state-dict namespace, buffers, shared/tied parameter metadata where supported, and reload validation.
 - **Kubernetes**: GPU Pod, multi-node Pod networking, PyTorch distributed.
 - **Volcano**: gang scheduling and distributed job startup.
 - **HAMi**: GPU sharing, isolation, multi-job behavior.
@@ -422,6 +437,7 @@ CLEANUP
 | Violation | Why Needed | Simpler Alternative Rejected Because |
 |-----------|------------|-------------------------------------|
 | Multiple launcher backends | SSH must remain first working backend while Kubernetes/Volcano are future platform backends | A single launcher would either block MVP on Kubernetes or make future platform integration invasive |
-| Multiple parallel engine adapters | Galvatron compatibility is unknown on RTX 4060 + GTX 1650 + WSL2 + one-GPU-per-host | A single hard-coded engine risks blocking real training if the first candidate fails |
+| Multiple parallel engine adapters | Galvatron is selected for MVP evidence but automatic partition support still depends on real selected-engine capability and may need fallback adapters | A single hard-coded engine would either overclaim support or block supported fallback paths |
+| Joint partition/placement planning | Model partition legality, GPU memory, network cost, and heterogeneous compute must be evaluated together before launch | Fixed stage count followed by placement can choose invalid or unnecessarily expensive plans |
 | Platform abstraction layer | Commands span Ubuntu, Windows, and WSL2 with different shells and safety rules | Scattering platform checks would make doctor/bootstrap unsafe and hard to test |
 | ArtifactStore and ArtifactTransport interfaces | Stage C starts with local snapshots and SSH transfer, Stage D may need NFS, future stages may need object storage | Direct file copies everywhere would bind job semantics to one transport |

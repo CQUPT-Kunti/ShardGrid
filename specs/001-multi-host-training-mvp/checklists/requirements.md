@@ -35,3 +35,4 @@
 - No clarification markers remain.
 - The specification is ready for `/speckit-plan`.
 - Named components such as WSL2, PyTorch, NCCL, Galvatron, Kubernetes, Volcano, and HAMi are retained because they are explicit user-mandated project constraints and compatibility gates, not speculative implementation choices.
+- 2026-09-02 redesign validation passed: automatic partition scope is bounded to selected ParallelEngine-supported models, requirements are testable, no clarification markers remain, and downstream Kubernetes/Volcano/HAMi task content is only renumbered/gate-referenced.

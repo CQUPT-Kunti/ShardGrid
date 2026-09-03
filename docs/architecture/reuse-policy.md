@@ -34,7 +34,9 @@ Parallel engine support follows the same rule:
 - Prefer mature projects first
 - Evaluate compatibility on the real target environment
 - Integrate the selected engine through a narrow adapter boundary
-- Preserve the engine's original plan/runtime outputs when possible and add only ShardGrid-specific placement and launch metadata
+- Preserve the engine's original plan/runtime outputs when possible and add only ShardGrid-specific placement, launch, artifact, and diagnostic metadata
+- Use selected-engine support for model inspection, profiling, legal partition boundaries, partition materialization, engine-owned plans, and runtime/autograd integration
+- Treat static hand-authored stages as regression fixtures, not automatic partition support
 
 Galvatron is the first planned compatibility candidate. If it does not fit the target environment, the fallback path is to evaluate other mature engines rather than building a ShardGrid-owned full parallel runtime.
 

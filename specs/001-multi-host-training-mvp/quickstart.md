@@ -124,9 +124,34 @@ Formal MVP acceptance:
 - Control performs discovery, probing, planning, snapshotting, distribution, launch, rendezvous, training, monitoring, logging, and result collection.
 - Job snapshot contains code, config, plan, logs, environment, diagnostics, and checkpoint metadata.
 
+## Stage C2 - Automatic Partition Gate
+
+Do this only after the SSH MVP is real.
+
+1. Dry-run automatic partition for a supported model:
+
+   ```bash
+   shardgrid train examples/train-supported-transformer.yaml --backend ssh --dry-run
+   ```
+
+2. Run automatic partition training for two supported models:
+
+   ```bash
+   shardgrid train examples/train-supported-transformer.yaml --backend ssh
+   shardgrid train examples/train-supported-hf-style.yaml --backend ssh
+   ```
+
+Expected result:
+
+- Users do not provide `stage0.py`, `stage1.py`, or `stage2.py`.
+- The selected ParallelEngine profiles the model and supplies supported partition boundaries.
+- Planner records rejected candidates, selected reason, memory fit, communication cost, heterogeneous GPU scoring, and final placement.
+- The job completes multi-host training through SSHLauncher, saves a distributed checkpoint, creates a consolidated full-model artifact, and records reload validation.
+- Unsupported or unsatisfiable models fail before launch with explicit BLOCKED or UNSATISFIABLE reasons.
+
 ## Stage D - Kubernetes + Volcano
 
-Do this only after Stage C passes.
+Do this only after Stage C and the automatic partition gate pass or are explicitly documented as blocked with SSH fallback preserved.
 
 1. Run Kubernetes compatibility gate:
 

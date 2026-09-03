@@ -58,6 +58,19 @@ properties:
           type:
             - string
             - "null"
+        stage_metadata_ref:
+          type:
+            - string
+            - "null"
+        estimated_peak_training_memory:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        communication_edges:
+          type: array
+          items:
+            type: string
         gpu_index:
           type: integer
           minimum: 0
@@ -92,6 +105,14 @@ properties:
             - string
             - "null"
       additionalProperties: false
+  model_profile_ref:
+    type:
+      - string
+      - "null"
+  candidate_evaluation_ref:
+    type:
+      - string
+      - "null"
   placement_reason:
     type:
       - string
@@ -109,6 +130,22 @@ properties:
       - string
       - "null"
   parallel_plan_ref:
+    type:
+      - string
+      - "null"
+  original_engine_plan_ref:
+    type:
+      - string
+      - "null"
+  distributed_checkpoint_ref:
+    type:
+      - string
+      - "null"
+  consolidated_model_ref:
+    type:
+      - string
+      - "null"
+  reload_validation_ref:
     type:
       - string
       - "null"
@@ -134,3 +171,4 @@ x-shardgrid-rules:
   unique_rank: workers[*].rank
   contiguous_ranks: true
   world_size_matches_workers: true
+  automatic_partition_requires_profile_and_candidate_refs: true

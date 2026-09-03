@@ -122,7 +122,18 @@ Success output:
 - `job_id`
 - `state`
 - `snapshot_path`
+- `model_profile_path` when automatic partition is used
+- `candidate_evaluation_path` when automatic partition is used
 - `execution_plan_path`
+- `checkpoint_path` on completed training
+- `consolidated_model_path` on completed automatic-partition training
+- `reload_validation_path` on completed automatic-partition training
+
+Rules:
+
+- For automatic partition jobs, users provide a supported model reference and do not provide hand-authored `stage0.py`, `stage1.py`, or `stage2.py`.
+- `--dry-run` reports candidate rejection reasons, selected reason, fallback reason, hard-constraint failures, placement, and launch metadata without starting remote ranks.
+- Unsupported or unsatisfiable models fail at `PROFILE` or `PLAN` with BLOCKED/UNSATISFIABLE reasons; they must not silently run the static regression fixture.
 
 Failure output:
 
@@ -140,6 +151,7 @@ Inputs:
 Success output:
 
 - JobState, selected Workers, ranks, stages, backend, loss history, checkpoint reference.
+- For automatic-partition jobs: model profile, candidate evaluation, distributed checkpoint, consolidated model, and reload validation references.
 
 ## shardgrid logs JOB
 

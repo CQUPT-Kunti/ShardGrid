@@ -372,7 +372,7 @@ Validation:
 
 ### ParallelPlan
 
-Plan produced by a mature parallel engine or by the explicit minimal validation model path.
+Plan produced by a mature parallel engine or by the explicit minimal validation model regression path.
 
 Fields:
 
@@ -381,18 +381,163 @@ Fields:
 - `engine_plan_path`
 - `model_name`
 - `world_size`
-- `stages`
+- `stages`: stage metadata, not just a stage count.
+- `communication_edges`
+- `memory_estimates`
+- `candidate_evaluation_ref`
 - `requirements`
 - `limitations`
 
 Relationships:
 
 - Combined with Placement to create ExecutionPlan.
+- References ModelProfile and original engine output when available.
 
 Validation:
 
 - ShardGrid must preserve original external plan if present.
-- Static validation plans must be labeled as not arbitrary-model support.
+- Automatic plans must come from selected ParallelEngine-supported model boundaries.
+- Static validation plans must be labeled as regression fixtures, not automatic partition support.
+
+### ModelProfile
+
+Selected ParallelEngine output used by the Planner.
+
+Fields:
+
+- `model_profile_id`
+- `engine`
+- `model_name`
+- `model_type`
+- `supported`
+- `unsupported_reason`
+- `module_or_layer_graph`
+- `parameter_names`
+- `parameter_bytes`
+- `buffer_names`
+- `supported_partition_boundaries`
+- `estimated_compute`
+- `activation_estimates`
+- `gradient_estimates`
+- `required_runtime`
+- `required_backend`
+- `evidence_paths`
+
+Relationships:
+
+- Produced by ParallelEngine profile.
+- Input to PartitionCandidate generation.
+
+Validation:
+
+- Unsupported, untraceable, or engine-incompatible models cannot produce launchable automatic plans.
+- Profile records must not require the user to author stage files.
+
+### PartitionCandidate
+
+A possible automatic model split plus its resource implications before final placement.
+
+Fields:
+
+- `candidate_id`
+- `model_profile_id`
+- `stage_count`
+- `stages`
+- `communication_edges`
+- `estimated_bytes_per_step`
+- `required_worker_count`
+- `hard_constraint_status`
+- `rejection_reason`
+- `score_breakdown`
+
+Relationships:
+
+- Generated from ModelProfile.
+- Evaluated against WorkerResource and NetworkState.
+
+Validation:
+
+- Rejected candidates must record the reason.
+- A candidate cannot be accepted if any stage has unsupported boundary metadata.
+
+### StageMetadata
+
+Metadata for one automatic partition stage.
+
+Fields:
+
+- `stage_id`
+- `original_module_or_layer_identity`
+- `partition_boundary`
+- `parameter_names_or_ranges`
+- `parameter_bytes`
+- `activation_bytes`
+- `gradient_bytes`
+- `estimated_compute`
+- `estimated_peak_training_memory`
+- `required_runtime`
+- `required_backend`
+
+Relationships:
+
+- Belongs to ParallelPlan or PartitionCandidate.
+- Maps to WorkerAssignment after placement.
+
+Validation:
+
+- Stage metadata must preserve enough original identity to consolidate full model weights.
+
+### TrainingMemoryEstimate
+
+Peak training memory estimate for one stage on one candidate Worker.
+
+Fields:
+
+- `parameter_bytes`
+- `activation_bytes`
+- `gradient_bytes`
+- `optimizer_bytes`
+- `runtime_overhead_bytes`
+- `communication_buffer_bytes`
+- `estimated_peak_training_memory`
+- `memory_headroom`
+- `usable_gpu_memory_after_headroom`
+
+Relationships:
+
+- Attached to StageMetadata and candidate placement attempts.
+
+Validation:
+
+- `estimated_peak_training_memory` must be less than or equal to usable GPU memory after headroom for a valid candidate.
+
+### CommunicationEdge
+
+Estimated communication between two adjacent or otherwise connected stages.
+
+Fields:
+
+- `source_stage_id`
+- `target_stage_id`
+- `boundary_tensor_shape`
+- `boundary_activation_bytes`
+- `boundary_gradient_bytes`
+- `microbatch_count`
+- `batch_size`
+- `sequence_length`
+- `estimated_bytes_per_step`
+- `bandwidth_mbps`
+- `latency_ms`
+- `estimated_network_cost`
+
+Relationships:
+
+- Belongs to PartitionCandidate and selected ParallelPlan.
+- Evaluated against NetworkState.
+
+Validation:
+
+- Communication cost must be based on actual stage boundaries, not model parameter size alone.
 
 ### TrainingJob
 
@@ -491,11 +636,16 @@ Fields:
 - `master.address`
 - `master.port`
 - `workers`
+- `model_profile_ref`
+- `candidate_evaluation_ref`
 - `conda_environment`
 - `conda_prefix`
 - `python_executable`
 - `placement_reason`
 - `parallel_plan_ref`
+- `original_engine_plan_ref`
+- `distributed_checkpoint_ref`
+- `consolidated_model_ref`
 - `snapshot_ref`
 - `environment`
 - `labels`
@@ -504,12 +654,14 @@ Relationships:
 
 - Created from ParallelPlan plus Placement.
 - Consumed by LauncherBackend.
+- Auditable through dry-run and replay before launch.
 
 Validation:
 
 - `world_size` equals number of WorkerAssignments.
 - Each Stage A-C WorkerAssignment must have `local_rank = 0`.
 - Backend labels must distinguish NCCL success, NCCL failure, and Gloo fallback.
+- The selected plan must include enough stage and placement metadata for checkpoint consolidation and reload validation.
 
 ### WorkerAssignment
 
@@ -585,6 +737,9 @@ Fields:
 - `finished_at`
 - `failure`
 - `checkpoint_ref`
+- `distributed_checkpoint_ref`
+- `consolidated_model_ref`
+- `reload_validation_ref`
 
 Relationships:
 
@@ -595,6 +750,59 @@ Validation:
 
 - Failed jobs must include FailureRecord.
 - Completed jobs must include checkpoint reference and final metrics.
+- Completed automatic-partition jobs must include consolidated model and reload validation references.
+
+### DistributedCheckpoint
+
+Authoritative resume checkpoint for distributed training.
+
+Fields:
+
+- `checkpoint_id`
+- `manifest_path`
+- `model_shard_refs`
+- `optimizer_shard_refs`
+- `scheduler_state_refs`
+- `rng_state_refs`
+- `runtime_state_refs`
+- `partition_metadata_ref`
+
+Relationships:
+
+- Stored under JobSnapshot checkpoint path.
+- Source for resume and full-model consolidation.
+
+Validation:
+
+- Resume metadata may remain distributed and must preserve partition metadata.
+
+### ConsolidatedModelArtifact
+
+Full model export created from a completed distributed checkpoint.
+
+Fields:
+
+- `artifact_id`
+- `format`
+- `path`
+- `source_checkpoint_id`
+- `original_model_ref`
+- `parameter_namespace`
+- `state_dict_keys`
+- `buffer_keys`
+- `shared_parameter_metadata`
+- `shape_digest`
+- `dtype_digest`
+- `reload_validation_ref`
+
+Relationships:
+
+- Produced after training completion.
+- Referenced by TrainingResult and JobStatus.
+
+Validation:
+
+- Must load without requiring original Worker count, rank mapping, or stage count.
 
 ### FailureRecord
 

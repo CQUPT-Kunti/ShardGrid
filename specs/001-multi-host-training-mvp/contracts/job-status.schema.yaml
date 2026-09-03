@@ -195,6 +195,18 @@ properties:
     type:
       - string
       - "null"
+  distributed_checkpoint_ref:
+    type:
+      - string
+      - "null"
+  consolidated_model_ref:
+    type:
+      - string
+      - "null"
+  reload_validation_ref:
+    type:
+      - string
+      - "null"
 additionalProperties: false
 allOf:
   - if:

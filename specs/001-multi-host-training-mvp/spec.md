@@ -58,19 +58,20 @@
 
 ---
 
-### User Story 4 - Generate a Minimal Placement Plan Without Rebuilding Parallel Engines (Priority: P4)
+### User Story 4 - Automatically Partition Supported Models and Export Full Models (Priority: P4)
 
-作为 ShardGrid 操作员，我可以让系统分析资源和训练需求，生成稳定的 ExecutionPlan，同时优先复用已有并行训练/规划能力，而不是让 ShardGrid 自己实现完整模型并行框架。
+作为 ShardGrid 操作员，我可以提交一个受支持的真实 PyTorch 或 HuggingFace 风格模型，让系统自动分析模型、结合当前 Worker/GPU/网络状态进行模型拆分和放置、执行真实多机训练，并在完成后导出可重新加载的完整模型。
 
-**Why this priority**: 第一阶段必须证明模型拆分和 Worker placement 的闭环，但不能把自研 pipeline engine、autograd、collective communication 或大规模模型编译器变成前置工作。
+**Why this priority**: 已有静态两阶段模型证明了跨主机训练闭环；下一步必须证明用户不需要手写 stage 文件也能完成受支持模型的自动拆分、资源规划、训练、checkpoint 和完整模型导出，同时继续避免自研 pipeline engine、autograd、collective communication 或大规模模型编译器。
 
-**Independent Test**: 提交第一阶段支持的小 Transformer/Sequential 模型，确认系统保存外部 parallel plan 或 compatibility spike 结果，并只补充 ShardGrid 需要的 placement 和 launch metadata。
+**Independent Test**: 提交两个受 selected ParallelEngine 支持的模型，其中一个是现有 deterministic Transformer regression model，另一个是 PyTorch/HuggingFace 风格模型；用户不提供 `stage0.py`、`stage1.py` 或 `stage2.py`，系统自动 profile、生成候选拆分、结合 WorkerResource 与 NetworkState 选择最少合法物理 Worker、生成可审计 ExecutionPlan、完成真实多机训练、保存 distributed checkpoint、导出 consolidated full model，并重新加载完整模型验证 keys、shapes、dtypes 和 forward/inference smoke。
 
 **Acceptance Scenarios**:
 
-1. **Given** 首选并行引擎与当前 RTX 4060 + GTX 1650 + Windows/WSL2 + multi-host + one-GPU-per-host 环境兼容，**When** 用户提交支持模型，**Then** 系统复用该引擎生成或执行模型并行方案，并保存原始 plan。
-2. **Given** 首选并行引擎经真实兼容性 spike 证明不满足当前环境，**When** 系统选择替代方案，**Then** 系统保存安装、版本、GPU、runtime、multi-host、pipeline、profiler、runtime、checkpoint 等兼容性报告，并选择成熟的最小替代方案。
-3. **Given** 没有现成能力满足完整自动 partition，**When** 第一阶段仍需验证训练闭环，**Then** 系统可以使用明确支持的小模型和固定两阶段验证路径，但必须记录该限制，不能宣称支持任意模型自动切分。
+1. **Given** selected ParallelEngine 支持用户提交的模型并能提供模型结构、profile、合法 partition boundary 和 engine-owned plan，**When** 用户执行一次训练命令，**Then** 系统自动生成 ParallelPlan、保存原始 engine plan、补充 ShardGrid placement/execution metadata，并通过 SSH backend 完成真实多机训练。
+2. **Given** 当前 Worker 集群包含不同显存、算力和网络状态的 GPU Worker，**When** 系统规划自动 partition，**Then** Planner 必须先排除不健康、不兼容、不可达、显存 peak estimate 不满足或 partition boundary 不受支持的候选，再按最少物理 Worker、最少跨机通信、避免异构严重瓶颈、compute balance、GPU 次级偏好和 deterministic tie-break 的顺序选择计划。
+3. **Given** 训练完成且 distributed checkpoint 已保存，**When** 用户需要训练结果，**Then** 系统必须生成额外的 consolidated full model artifact，恢复原始模型参数命名空间和必要 buffer，并验证该完整模型不依赖原 Worker 数量或 stage 数量即可加载。
+4. **Given** 模型包含 unsupported dynamic control flow、unsupported custom CUDA op、untraceable graph、engine-incompatible module 或 unsupported tied/shared behavior，**When** 用户提交自动 partition 训练，**Then** 系统必须返回 BLOCKED 或 UNSATISFIABLE 与准确原因，不能退回手写 stage fixture 后声称自动 partition 通过。
 
 ---
 
@@ -114,8 +115,15 @@
 - 带宽或延迟低于训练验证最低要求，Planner 仍试图启动训练。
 - 优先通信 backend 失败但 fallback 成功；系统必须如实记录，不能混淆结果。
 - 首选 parallel engine 安装成功但 profiler、search、pipeline runtime 或 checkpoint 在当前环境失败。
+- selected ParallelEngine 支持静态 plan 但不支持用户提交模型的自动 profile、合法 partition boundary 或 materialization。
+- 所有 automatic partition 候选都无法在当前 WorkerResource、GPU memory headroom 或 NetworkState 下满足训练 peak memory 与通信约束。
+- 两台 RTX 4060 可以满足模型时，Planner 为了使用全部机器错误选择 RTX 4060 + GTX 1650 + RTX 4060。
+- 模型的某个候选 partition boundary 产生高 activation/gradient transfer 成本，导致跨机通信成本高于替代合法 boundary。
+- 异构 GPU 显存或算力差异明显，但 Planner 平均切分参数量导致弱 GPU 成为严重 pipeline bottleneck。
+- 用户提供手写 stage 文件试图绕过 automatic partition acceptance；系统必须把它视为静态 regression path，而不是 automatic partition 通过证据。
 - Snapshot 分发在部分 Worker 成功、部分 Worker 失败。
 - forward/backward 成功但 activation transfer、gradient transfer、optimizer update 或 checkpoint 缺失。
+- distributed checkpoint 可用于 resume，但缺少 consolidated full model artifact 或 consolidated model 无法恢复原始 parameter namespace、buffers、keys、shapes、dtypes。
 - loss 出现 NaN、无限值、未下降或下降幅度低于阈值。
 - 用户请求 stop 时部分 rank 已启动、部分 rank 未启动。
 - bootstrap 需要管理员权限、重启、BIOS 修改、用户密码或危险防火墙规则。
@@ -169,12 +177,12 @@
 - **FR-027**: The system MUST save each accepted training job under an immutable job snapshot containing code, config, plan, logs, checkpoint, diagnostics, and environment records including Conda environment identity.
 - **FR-028**: Artifact distribution MUST use mature existing file transfer mechanisms and MUST NOT invent a custom transfer protocol.
 - **FR-029**: ExecutionPlan MUST be a stable JSON or YAML structure with job ID, engine, backend, world size, master address/port, worker assignments, rank, local rank, stage, Conda/runtime identity, and launch metadata.
-- **FR-030**: If a parallel engine generates its own plan, ShardGrid MUST save the original plan and add only placement/launch metadata required for execution.
-- **FR-031**: The first Planner MUST perform placement using WorkerResource, NetworkState, and parallel engine requirements.
-- **FR-032**: The first Planner MUST enforce memory eligibility, prefer fewer Workers, prefer faster networks, consider GPU performance as secondary, and allow manual override.
-- **FR-033**: The first Planner MUST NOT claim to implement general model graph partitioning unless a compatible mature engine provides it.
-- **FR-034**: The first stage MUST include a clearly supported small Transformer or Sequential validation model.
-- **FR-035**: The validation model MUST be able to run on one GPU and be split into two stages assigned to RTX 4060 Stage 0 and GTX 1650 Stage 1.
+- **FR-030**: If a parallel engine generates its own plan, ShardGrid MUST save the original plan and add only placement, execution, artifact, and audit metadata required for orchestration.
+- **FR-031**: The Planner MUST search model partition and Worker placement jointly using selected ParallelEngine output, WorkerResource, GPU memory, and NetworkState.
+- **FR-032**: The Planner MUST enforce hard constraints before scoring: Worker health, GPU/runtime compatibility, backend availability, network reachability, physical-host mapping, valid local world size, supported partition boundary, and training peak memory fit.
+- **FR-033**: Manual override MUST NOT bypass hard constraints and MUST be replayable with the same validation rules.
+- **FR-034**: For models supported by the selected ParallelEngine, the system MUST automatically profile, partition, place, launch, checkpoint, consolidate, and reload validation output without requiring users to author pipeline stage files.
+- **FR-035**: The existing static minimal validation model MAY remain as a regression fixture, but MUST NOT be used as automatic partition acceptance evidence.
 - **FR-036**: The cross-host training test MUST execute real forward, activation transfer, forward continuation, loss, backward, gradient transfer, optimizer step, loss tracking, and checkpoint save.
 - **FR-037**: The system MUST prove optimizer-managed parameters changed on the relevant stages.
 - **FR-038**: The system MUST mark the job unsuccessful if loss does not decrease by the configured threshold for the deterministic validation workload.
@@ -200,6 +208,21 @@
 - **FR-058**: HAMi integration MUST verify GPU sharing compatibility on the actual Windows/WSL2/GPU/Kubernetes environment before exposing GPU sharing as a usable capability.
 - **FR-059**: Any failed platform integration MUST preserve the adapter boundary, compatibility report, and previously working training backend.
 - **FR-060**: The system MUST fail honestly and MUST NOT mark any skipped, simulated, or partially completed operation as successful.
+- **FR-061**: ModelProfile MUST capture model structure, supported partition boundaries, parameter identity, estimated compute, activation sizes, gradient sizes, communication edges, required backend/runtime, and evidence or diagnostics from the selected ParallelEngine.
+- **FR-062**: Training peak memory estimates MUST include parameter bytes, activation bytes, gradient bytes, optimizer bytes, runtime overhead bytes, communication buffer bytes, estimated peak training memory, and configurable memory safety headroom.
+- **FR-063**: The Planner MUST reject every candidate whose estimated peak training memory exceeds usable GPU memory after headroom, and MUST report UNSATISFIABLE when no candidate satisfies hard constraints.
+- **FR-064**: Candidate partition metadata MUST identify stage ID, original module or layer identity, partition boundary, parameter names or ranges, parameter bytes, activation bytes, gradient bytes, estimated compute, estimated peak training memory, communication edges, required runtime/backend, and original engine plan reference when available.
+- **FR-065**: Communication cost estimation MUST be based on real stage boundaries and include forward activation bytes, backward gradient bytes, microbatch count, batch size, sequence length where relevant, boundary tensor shape, estimated bytes per training step, bandwidth, and latency.
+- **FR-066**: Among legal candidates, optimization priority MUST be deterministic in this order: fewest physical Workers, least cross-physical-host communication, avoidance of severe heterogeneous pipeline bottlenecks, improved compute balance, GPU capability or secondary preferences, then deterministic tie-break.
+- **FR-067**: The Planner MUST prefer a legal two-Worker plan over a three-Worker plan when both satisfy hard constraints, and MUST NOT add Workers merely to use every available machine.
+- **FR-068**: Automatic partitioning MUST support general configured Worker counts without hard-coded assumptions about two Workers, three Workers, RTX 4060, GTX 1650, rank IDs, or stage IDs.
+- **FR-069**: Candidate evaluation MUST record candidate rejection reasons, selected reason, fallback reason, and UNSATISFIABLE reason.
+- **FR-070**: ShardGrid MUST delegate model inspection, tracing, profiling, legal partition boundary discovery, partition materialization, engine-owned plan creation, and runtime/autograd integration to the selected ParallelEngine whenever that capability exists.
+- **FR-071**: ShardGrid MUST NOT claim automatic partition support for unsupported dynamic control flow, unsupported custom CUDA operations, untraceable graphs, engine-incompatible modules, or unsupported tied/shared parameter behavior.
+- **FR-072**: Distributed checkpoint artifacts MUST remain the authoritative training resume format and MAY keep optimizer, scheduler, RNG, and runtime state distributed.
+- **FR-073**: Completed automatic-partition training MUST also produce a consolidated full-model artifact that restores the original model parameter namespace, full state dict, required buffers, shared/tied parameter metadata where supported, keys, shapes, and dtypes.
+- **FR-074**: Consolidated full-model loading MUST NOT require the user to know the partition count, original Worker count, stage names, or rank mapping.
+- **FR-075**: The automatic partition hardware gate MUST validate at least two supported models, including the existing deterministic Transformer regression model and another selected ParallelEngine-supported PyTorch/HuggingFace-style model.
 
 ### Key Entities *(include if feature involves data)*
 
@@ -238,10 +261,14 @@
 - **SC-010**: Adding Optional Machine E through configuration or registration makes it visible in Worker Inventory and eligible for Planner selection without source code changes.
 - **SC-011**: The parallel engine compatibility spike produces a written pass/fail decision for the first candidate and, if needed, at least one mature fallback candidate before ShardGrid-owned model parallel functionality is considered.
 - **SC-012**: If fallback distributed communication is used, the final job result explicitly labels preferred-path failure and fallback success in 100% of such runs.
-- **SC-013**: The first Planner refuses to start training when memory eligibility, network reachability, or Worker health requirements are not met.
+- **SC-013**: The Planner refuses to start training in 100% of cases where Worker health, runtime compatibility, network reachability, partition support, or estimated peak training memory requirements are not met.
 - **SC-014**: Kubernetes compatibility is evaluated only after the SSH-style backend has completed the real two-Worker training loop, and its gate report records pass/fail evidence for node readiness, GPU workload, multi-host networking, and distributed training.
 - **SC-015**: Volcano and HAMi phases can remain disabled with documented compatibility reports while the previously working training backend remains usable.
 - **SC-016**: No first-stage success report claims support for arbitrary user models, production cluster scheduling, GPU sharing, or platform backend readiness unless the corresponding acceptance test has passed.
+- **SC-017**: For each accepted automatic-partition job, the plan record lists all rejected candidate reasons and the selected reason before launch.
+- **SC-018**: When two legal Worker counts are available, the selected automatic plan uses the smaller physical Worker count in 100% of deterministic planner fixtures.
+- **SC-019**: The automatic partition gate completes two supported models without user-authored stage files and records profile, partition, placement, ExecutionPlan, training, checkpoint, consolidation, and reload evidence for both.
+- **SC-020**: Each completed automatic-partition job produces a consolidated full-model artifact that reloads into the original model definition and passes key, shape, dtype, and forward/inference validation.
 
 ## Assumptions
 
@@ -253,5 +280,7 @@
 - The operator can provide configuration for worker addresses, remote accounts, ports, paths, and credentials outside source code.
 - The operator is available to perform manual actions that cannot be safely automated, including administrator approval, reboots, BIOS settings, passwords, and risky firewall decisions.
 - The first supported training workload is intentionally small so GTX 1650 memory and performance do not block proof of the distributed closed loop.
+- Automatic partition support is limited to models and behaviors supported by the selected ParallelEngine in the detected runtime; unsupported models are blocked with reasons instead of silently using static stage fixtures.
+- Consolidated full-model export is required for model weights, while optimizer, scheduler, RNG, and runtime resume state may remain distributed.
 - The first stage values repeatable correctness, honest diagnostics, and architectural evolution over peak training performance.
 - Named technologies in this specification are explicit project constraints from the user and exist to prevent reinvention; detailed implementation decisions remain for planning.
