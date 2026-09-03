@@ -6,7 +6,14 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, cast
 
 from shardgrid.common.enums import Health, PhysicalOS, RuntimeOS
-from shardgrid.common.models import Hostname, WorkerId, as_hostname, as_worker_id
+from shardgrid.common.models import (
+    Hostname,
+    MachineId,
+    WorkerId,
+    as_hostname,
+    as_machine_id,
+    as_worker_id,
+)
 
 
 def _serialize(value: Any) -> Any:
@@ -69,6 +76,8 @@ class WorkerResource:
     hostname: Hostname
     physical_os: PhysicalOS
     runtime_os: RuntimeOS
+    machine_id: MachineId | None = None
+    enabled: bool = True
     environment_manager: str = "conda"
     conda_environment: str | None = None
     conda_prefix: str | None = None
@@ -101,6 +110,12 @@ class WorkerResource:
             hostname=as_hostname(str(data["hostname"])),
             physical_os=PhysicalOS(data["physical_os"]),
             runtime_os=RuntimeOS(data["runtime_os"]),
+            machine_id=(
+                None
+                if data.get("machine_id") is None
+                else as_machine_id(str(data["machine_id"]))
+            ),
+            enabled=bool(data.get("enabled", True)),
             environment_manager=str(data.get("environment_manager", "conda")),
             conda_environment=data.get("conda_environment"),
             conda_prefix=data.get("conda_prefix"),
