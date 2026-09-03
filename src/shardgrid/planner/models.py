@@ -38,7 +38,16 @@ class WorkerAssignment:
     rank: int
     local_rank: int = 0
     stage: str | None = None
+    stage_metadata_ref: str | None = None
+    estimated_peak_training_memory: int | None = None
+    communication_edges: list[str] = field(default_factory=list)
     gpu_index: int = 0
+    host: str | None = None
+    machine_id: str | None = None
+    physical_os: str | None = None
+    runtime_os: str | None = None
+    runtime: str | None = None
+    runtime_distro: str | None = None
     conda_environment: str | None = None
     conda_prefix: str | None = None
     python_executable: str | None = None
@@ -53,6 +62,11 @@ class WorkerAssignment:
             raise ValueError("rank must be >= 0")
         if self.local_rank < 0:
             raise ValueError("local_rank must be >= 0")
+        if (
+            self.estimated_peak_training_memory is not None
+            and self.estimated_peak_training_memory < 0
+        ):
+            raise ValueError("estimated_peak_training_memory must be >= 0")
         if self.gpu_index < 0:
             raise ValueError("gpu_index must be >= 0")
 
@@ -66,7 +80,22 @@ class WorkerAssignment:
             rank=int(data["rank"]),
             local_rank=int(data.get("local_rank", 0)),
             stage=data.get("stage"),
+            stage_metadata_ref=data.get("stage_metadata_ref"),
+            estimated_peak_training_memory=(
+                None
+                if data.get("estimated_peak_training_memory") is None
+                else int(data["estimated_peak_training_memory"])
+            ),
+            communication_edges=[
+                str(item) for item in data.get("communication_edges", [])
+            ],
             gpu_index=int(data.get("gpu_index", 0)),
+            host=data.get("host"),
+            machine_id=data.get("machine_id"),
+            physical_os=data.get("physical_os"),
+            runtime_os=data.get("runtime_os"),
+            runtime=data.get("runtime"),
+            runtime_distro=data.get("runtime_distro"),
             conda_environment=data.get("conda_environment"),
             conda_prefix=data.get("conda_prefix"),
             python_executable=data.get("python_executable"),
@@ -106,11 +135,17 @@ class ExecutionPlan:
     world_size: int
     master: MasterMetadata
     workers: list[WorkerAssignment]
+    model_profile_ref: str | None = None
+    candidate_evaluation_ref: str | None = None
     conda_environment: str | None = None
     conda_prefix: str | None = None
     python_executable: str | None = None
     placement_reason: str | None = None
     parallel_plan_ref: str | None = None
+    original_engine_plan_ref: str | None = None
+    distributed_checkpoint_ref: str | None = None
+    consolidated_model_ref: str | None = None
+    reload_validation_ref: str | None = None
     snapshot_ref: str | None = None
     environment: dict[str, str] = field(default_factory=dict)
     labels: dict[str, str] = field(default_factory=dict)
@@ -138,11 +173,17 @@ class ExecutionPlan:
             world_size=int(data["world_size"]),
             master=MasterMetadata.from_dict(data["master"]),
             workers=[WorkerAssignment.from_dict(item) for item in data.get("workers", [])],
+            model_profile_ref=data.get("model_profile_ref"),
+            candidate_evaluation_ref=data.get("candidate_evaluation_ref"),
             conda_environment=data.get("conda_environment"),
             conda_prefix=data.get("conda_prefix"),
             python_executable=data.get("python_executable"),
             placement_reason=data.get("placement_reason"),
             parallel_plan_ref=data.get("parallel_plan_ref"),
+            original_engine_plan_ref=data.get("original_engine_plan_ref"),
+            distributed_checkpoint_ref=data.get("distributed_checkpoint_ref"),
+            consolidated_model_ref=data.get("consolidated_model_ref"),
+            reload_validation_ref=data.get("reload_validation_ref"),
             snapshot_ref=data.get("snapshot_ref"),
             environment={
                 str(key): str(value)

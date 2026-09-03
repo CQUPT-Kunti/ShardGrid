@@ -74,6 +74,30 @@ properties:
         gpu_index:
           type: integer
           minimum: 0
+        host:
+          type:
+            - string
+            - "null"
+        machine_id:
+          type:
+            - string
+            - "null"
+        physical_os:
+          type:
+            - string
+            - "null"
+        runtime_os:
+          type:
+            - string
+            - "null"
+        runtime:
+          type:
+            - string
+            - "null"
+        runtime_distro:
+          type:
+            - string
+            - "null"
         conda_environment:
           type:
             - string

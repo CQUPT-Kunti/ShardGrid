@@ -181,7 +181,13 @@ class JobManager:
         self._source_root = Path(source_root).resolve()
         self._secrets = tuple(secret for secret in secrets if secret)
 
-    def run(self, training_config_path: str | Path, *, job_id: JobId | None = None) -> JobRunResult:
+    def run(
+        self,
+        training_config_path: str | Path,
+        *,
+        job_id: JobId | None = None,
+        dry_run: bool = False,
+    ) -> JobRunResult:
         training_config = load_training_config(training_config_path)
         job = create_training_job(
             config_path=str(training_config_path),
@@ -275,6 +281,7 @@ class JobManager:
             parallel_plan=selected_engine.parallel_plan,
             workers=selected_workers,
             snapshot=snapshot,
+            rejected_engine_ids=selected_engine.rejected_engine_ids,
         )
         current = self._persist_status(
             replace(
@@ -288,6 +295,30 @@ class JobManager:
             state=JobState.SNAPSHOTTING,
             phase="plan",
         )
+        launch_metadata = selected_engine.engine.launch_metadata(selected_engine.parallel_plan)
+
+        self._write_snapshot_metadata(
+            snapshot=snapshot,
+            job=job,
+            training_config=training_config,
+            parallel_plan=selected_engine.parallel_plan,
+            execution_plan=execution_plan,
+            network_state=network_state,
+            job_status=current,
+            launch_metadata=launch_metadata,
+            dry_run=dry_run,
+        )
+        if dry_run:
+            return JobRunResult(
+                job=job,
+                status=current,
+                snapshot=snapshot,
+                execution_plan=execution_plan,
+                parallel_plan=selected_engine.parallel_plan,
+                cluster_state=cluster_state,
+                network_state=network_state,
+            )
+
         preparation = selected_engine.engine.prepare(snapshot, execution_plan)
         if preparation.status not in (BackendStatus.AVAILABLE, BackendStatus.EXPERIMENTAL):
             failure = make_failure_record(
@@ -308,16 +339,6 @@ class JobManager:
                 cluster_state=cluster_state,
                 network_state=network_state,
             )
-
-        self._write_snapshot_metadata(
-            snapshot=snapshot,
-            job=job,
-            training_config=training_config,
-            parallel_plan=selected_engine.parallel_plan,
-            execution_plan=execution_plan,
-            network_state=network_state,
-            job_status=current,
-        )
         launcher = self._launcher_factory(training_config.job.backend)
         context = LauncherContext(
             job=job,
@@ -857,23 +878,54 @@ class JobManager:
         parallel_plan: ParallelPlan,
         workers: list[WorkerConfig],
         snapshot: JobSnapshot,
+        rejected_engine_ids: Sequence[str] = (),
     ) -> ExecutionPlan:
-        worker_map = {str(worker.worker_id): worker for worker in workers}
-        ordered_workers = [
-            worker_map.get(str(worker_id))
-            for worker_id in training_config.resources.preferred_workers
-        ]
-        selected_workers = [worker for worker in ordered_workers if worker is not None] or workers
+        worker_map = {
+            str(worker.worker_id): worker
+            for worker in self.cluster_config.workers
+            if worker.enabled
+        }
+        for worker in workers:
+            worker_map[str(worker.worker_id)] = worker
+        selected_workers = self._ordered_workers_for_execution_plan(
+            training_config=training_config,
+            parallel_plan=parallel_plan,
+            workers=workers,
+            worker_map=worker_map,
+        )
+        stage_metadata = {stage.stage_id: stage for stage in parallel_plan.stage_metadata}
+        communication_map = self._communication_map(parallel_plan)
         assignments: list[WorkerAssignment] = []
-        for rank, stage in enumerate(parallel_plan.stages):
+        for index, stage_id in enumerate(parallel_plan.stages):
+            stage = stage_metadata.get(stage_id)
+            rank = index if stage is None else stage.rank
             worker = selected_workers[rank]
+            peak_memory = None
+            if stage is not None:
+                peak_memory = (
+                    stage.estimated_peak_training_memory.planner_required_bytes
+                    or stage.estimated_peak_training_memory.estimated_peak_bytes
+                )
             assignments.append(
                 WorkerAssignment(
                     worker_id=worker.worker_id,
                     rank=rank,
                     local_rank=0,
-                    stage=stage,
-                    gpu_index=0,
+                    stage=stage_id,
+                    stage_metadata_ref=(
+                        None
+                        if stage is None
+                        else f"parallel_plan.stage_metadata[{parallel_plan.stage_metadata.index(stage)}]"
+                    ),
+                    estimated_peak_training_memory=peak_memory,
+                    communication_edges=list(communication_map.get(stage_id, ())),
+                    gpu_index=0 if stage is None or stage.placement is None else stage.placement.gpu_index,
+                    host=str(worker.host),
+                    machine_id=str(worker.machine_id),
+                    physical_os=worker.physical_os.value,
+                    runtime_os=worker.runtime_os.value,
+                    runtime=worker.runtime,
+                    runtime_distro=worker.runtime_distro,
                     conda_environment=worker.conda_environment,
                     conda_prefix=worker.conda_prefix,
                     python_executable=(
@@ -890,21 +942,123 @@ class JobManager:
                         "SHARDGRID_T074_STEPS": "2000",
                     },
                     status="pending",
-                    log_path=f"logs/{worker.worker_id}/rank{rank}-{stage}/combined.log",
+                    log_path=f"logs/{worker.worker_id}/rank{rank}-{stage_id}/combined.log",
                 )
             )
+        labels = self._execution_plan_labels(
+            parallel_plan=parallel_plan,
+            rejected_engine_ids=rejected_engine_ids,
+        )
+        rank_zero = next(assignment for assignment in assignments if assignment.rank == 0)
         return ExecutionPlan(
             job_id=job.job_id,
             engine=parallel_plan.engine,
             backend=training_config.job.communication_backend,
             world_size=job.requested_world_size,
             master=MasterMetadata(
-                address=str(selected_workers[0].host),
+                address=rank_zero.host or str(selected_workers[0].host),
                 port=self._resolved_rendezvous_port(),
             ),
             workers=assignments,
+            model_profile_ref=parallel_plan.model_profile_id,
+            candidate_evaluation_ref=parallel_plan.candidate_evaluation_ref,
+            conda_environment=self.cluster_config.runtime.conda_environment,
+            conda_prefix=self.cluster_config.runtime.conda_prefix,
+            python_executable=self.cluster_config.runtime.python_executable,
+            placement_reason=(
+                None
+                if parallel_plan.planning_provenance is None
+                else parallel_plan.planning_provenance.selected_reason
+            ),
+            parallel_plan_ref=str(Path(snapshot.plan_path) / "original-parallel-plan.json"),
+            original_engine_plan_ref=parallel_plan.engine_plan_path,
             snapshot_ref=snapshot.root_path,
+            labels=labels,
         )
+
+    def _ordered_workers_for_execution_plan(
+        self,
+        *,
+        training_config: TrainingConfig,
+        parallel_plan: ParallelPlan,
+        workers: list[WorkerConfig],
+        worker_map: dict[str, WorkerConfig],
+    ) -> list[WorkerConfig]:
+        if parallel_plan.stage_metadata:
+            ordered: list[WorkerConfig | None] = [None] * parallel_plan.world_size
+            for stage in parallel_plan.stage_metadata:
+                if stage.placement is None:
+                    raise ValueError(f"parallel plan stage {stage.stage_id} is missing placement")
+                worker = worker_map.get(stage.placement.worker_id)
+                if worker is None:
+                    raise ValueError(
+                        f"parallel plan stage {stage.stage_id} references unknown worker "
+                        f"{stage.placement.worker_id}"
+                    )
+                ordered[stage.rank] = worker
+            if any(worker is None for worker in ordered):
+                raise ValueError("parallel plan placement did not cover every rank")
+            return [worker for worker in ordered if worker is not None]
+
+        ordered_workers = [
+            worker_map.get(str(worker_id))
+            for worker_id in training_config.resources.preferred_workers
+        ]
+        selected_workers = [worker for worker in ordered_workers if worker is not None]
+        return selected_workers or workers
+
+    def _communication_map(
+        self,
+        parallel_plan: ParallelPlan,
+    ) -> dict[str, list[str]]:
+        mapping: dict[str, list[str]] = {}
+        for edge in parallel_plan.communication_edges:
+            label = (
+                f"{edge.source_stage_id}->{edge.target_stage_id}:"
+                f"{edge.estimated_bytes_per_step or 0}"
+            )
+            mapping.setdefault(edge.source_stage_id, []).append(label)
+            mapping.setdefault(edge.target_stage_id, []).append(label)
+        return mapping
+
+    def _execution_plan_labels(
+        self,
+        *,
+        parallel_plan: ParallelPlan,
+        rejected_engine_ids: Sequence[str],
+    ) -> dict[str, str]:
+        provenance = parallel_plan.planning_provenance
+        fallback_reasons: list[str] = []
+        fallback_label = "NONE"
+        if rejected_engine_ids:
+            fallback_reasons.append("rejected engines: " + "; ".join(rejected_engine_ids))
+            fallback_label = "engine_fallback"
+        if provenance is not None and provenance.fallback_reason:
+            fallback_reasons.append(provenance.fallback_reason)
+            fallback_label = (
+                "planner_fallback" if fallback_label == "NONE" else "engine_and_planner_fallback"
+            )
+        labels = {
+            "partition_source": parallel_plan.partition_source or "manual",
+            "selected_candidate_id": parallel_plan.selected_candidate_id or "NONE",
+            "selected_worker_count": (
+                "NONE"
+                if provenance is None or provenance.selected_worker_count is None
+                else str(provenance.selected_worker_count)
+            ),
+            "total_cross_worker_communication_bytes": (
+                "NONE"
+                if provenance is None
+                or provenance.total_cross_worker_communication_bytes is None
+                else str(provenance.total_cross_worker_communication_bytes)
+            ),
+            "fallback_status": "USED" if fallback_reasons else "NONE",
+            "fallback_label": fallback_label,
+            "fallback_reason": " | ".join(fallback_reasons) if fallback_reasons else "",
+        }
+        if rejected_engine_ids:
+            labels["rejected_engine_ids"] = "; ".join(rejected_engine_ids)
+        return labels
 
     def _resolved_rendezvous_port(self) -> int:
         override = self.cluster_config.manual_override.rendezvous_port
@@ -934,6 +1088,8 @@ class JobManager:
         execution_plan: ExecutionPlan,
         network_state: NetworkState,
         job_status: JobStatus,
+        launch_metadata: dict[str, object] | None = None,
+        dry_run: bool = False,
     ) -> None:
         report = build_control_report(
             self.cluster_config.control.machine_id,
@@ -950,6 +1106,8 @@ class JobManager:
             network_state=network_state,
             job_status=job_status,
             checkpoint_metadata=None,
+            launch_metadata=launch_metadata,
+            dry_run=dry_run,
             secrets=self._secrets,
         )
 
@@ -1504,6 +1662,7 @@ class JobManager:
         network_state: NetworkState,
         current: JobStatus,
         checkpoint_metadata: dict[str, object] | None = None,
+        launch_metadata: dict[str, object] | None = None,
     ) -> None:
         checkpoint_metadata = checkpoint_metadata or self._checkpoint_metadata_for_snapshot(
             snapshot,
@@ -1523,6 +1682,7 @@ class JobManager:
             network_state=network_state,
             job_status=current,
             checkpoint_metadata=checkpoint_metadata,
+            launch_metadata=launch_metadata,
             secrets=self._secrets,
         )
         self._save_status(current, snapshot=snapshot)

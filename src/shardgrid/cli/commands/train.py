@@ -8,10 +8,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from shardgrid.artifacts.metadata import load_snapshot_metadata
 from shardgrid.cli.context import EXIT_CONFIG_ERROR, EXIT_OK, EXIT_RUNTIME_ERROR
 from shardgrid.common.config import ClusterConfig, ConfigValidationError, load_cluster_config
 from shardgrid.common.enums import JobState
 from shardgrid.control.job_manager import JobManager, JobRunResult
+from shardgrid.planner.execution_plan import build_execution_plan_audit_payload
 
 _DEFAULT_CLUSTER_CONFIGS = ("shardgrid.yaml", "examples/workers.yaml")
 
@@ -26,6 +28,11 @@ def register_train_command(
         action="store_true",
         default=argparse.SUPPRESS,
         help="Emit structured JSON output",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build and snapshot the final execution plan without launching ranks",
     )
     parser.set_defaults(handler=run_train_command, command_name="train")
 
@@ -62,15 +69,30 @@ def _resolve_cluster_config(args: argparse.Namespace) -> ClusterConfig:
 
 def _payload(result: JobRunResult) -> dict[str, object]:
     snapshot = result.snapshot
+    audit = _audit_payload(result)
     return {
-        "job_id": str(result.job.job_id),
-        "backend": str(result.status.backend or result.job.backend_preference),
+        **audit,
         "state": result.status.state.value,
         "phase": result.status.phase,
         "snapshot_path": None if snapshot is None else snapshot.root_path,
+        "original_parallel_plan_path": None
+        if snapshot is None
+        else str(Path(snapshot.plan_path) / "original-parallel-plan.json"),
+        "original_parallel_plan_yaml_path": None
+        if snapshot is None
+        else str(Path(snapshot.plan_path) / "original-parallel-plan.yaml"),
         "execution_plan_path": None
         if snapshot is None
         else str(Path(snapshot.plan_path) / "execution-plan.json"),
+        "execution_plan_yaml_path": None
+        if snapshot is None
+        else str(Path(snapshot.plan_path) / "execution-plan.yaml"),
+        "snapshot_metadata_path": None
+        if snapshot is None
+        else str(Path(snapshot.diagnostics_path) / "snapshot-metadata.json"),
+        "snapshot_metadata_yaml_path": None
+        if snapshot is None
+        else str(Path(snapshot.diagnostics_path) / "snapshot-metadata.yaml"),
         "status_path": None
         if snapshot is None
         else str(Path(snapshot.diagnostics_path) / "job-status.json"),
@@ -78,18 +100,108 @@ def _payload(result: JobRunResult) -> dict[str, object]:
     }
 
 
+def _audit_payload(result: JobRunResult) -> dict[str, object]:
+    metadata_path = None
+    if result.snapshot is not None:
+        metadata_path = Path(result.snapshot.diagnostics_path) / "snapshot-metadata.json"
+    if metadata_path is not None and metadata_path.is_file():
+        metadata = load_snapshot_metadata(metadata_path)
+        if metadata.execution_plan_audit is not None:
+            return metadata.execution_plan_audit
+    if result.execution_plan is None:
+        return {
+            "job_id": str(result.job.job_id),
+            "dry_run": False,
+            "engine": None,
+            "backend": str(result.status.backend or result.job.backend_preference),
+            "world_size": result.job.requested_world_size,
+            "master": None,
+            "placement_reason": None,
+            "placement": [],
+            "assignments": [],
+            "launch_metadata": {},
+            "original_plan": {},
+            "fallback": {"status": "NONE", "label": "NONE", "reason": None},
+            "planning": {},
+            "labels": {},
+        }
+    return build_execution_plan_audit_payload(
+        result.execution_plan,
+        parallel_plan=result.parallel_plan,
+    )
+
+
 def _render_human(result: JobRunResult) -> str:
     payload = _payload(result)
     lines = [
         f"Job: {payload['job_id']}",
+        f"Dry Run: {'YES' if payload['dry_run'] else 'NO'}",
+        f"Engine: {payload['engine']}",
         f"Backend: {payload['backend']}",
         f"State: {str(payload['state']).upper()}",
         f"Phase: {payload['phase']}",
+        f"World Size: {payload['world_size']}",
     ]
+    master = payload.get("master")
+    if isinstance(master, dict):
+        lines.append(f"Master: {master.get('address')}:{master.get('port')}")
+    fallback = payload.get("fallback")
+    if isinstance(fallback, dict):
+        lines.append(
+            "Fallback: "
+            f"{fallback.get('label')} ({fallback.get('status')})"
+        )
+        if fallback.get("reason"):
+            lines.append(f"Fallback Reason: {fallback.get('reason')}")
+    original_plan = payload.get("original_plan")
+    if isinstance(original_plan, dict):
+        for label, key in (
+            ("Parallel Plan Ref", "parallel_plan_ref"),
+            ("Original Engine Plan", "original_engine_plan_ref"),
+            ("Model Profile Ref", "model_profile_ref"),
+            ("Candidate Evaluation Ref", "candidate_evaluation_ref"),
+        ):
+            if original_plan.get(key):
+                lines.append(f"{label}: {original_plan.get(key)}")
+    if payload.get("placement_reason"):
+        lines.append(f"Placement Reason: {payload['placement_reason']}")
     if payload["snapshot_path"] is not None:
         lines.append(f"Snapshot: {payload['snapshot_path']}")
+        lines.append(f"Original Parallel Plan: {payload['original_parallel_plan_path']}")
+        lines.append(
+            f"Original Parallel Plan YAML: {payload['original_parallel_plan_yaml_path']}"
+        )
         lines.append(f"Execution Plan: {payload['execution_plan_path']}")
+        lines.append(f"Execution Plan YAML: {payload['execution_plan_yaml_path']}")
+        lines.append(f"Snapshot Metadata: {payload['snapshot_metadata_path']}")
+        lines.append(f"Snapshot Metadata YAML: {payload['snapshot_metadata_yaml_path']}")
         lines.append(f"Status File: {payload['status_path']}")
+    placement = payload.get("placement")
+    if isinstance(placement, list) and placement:
+        lines.append("Placement:")
+        for item in placement:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "  "
+                f"Stage {item.get('stage')} -> Worker {item.get('worker_id')} "
+                f"-> rank {item.get('rank')} -> GPU {item.get('gpu_index')} "
+                f"({item.get('host')}, {item.get('runtime_os')})"
+            )
+    assignments = payload.get("assignments")
+    if isinstance(assignments, list) and assignments:
+        lines.append("Assignments:")
+        for item in assignments:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "  "
+                f"{item.get('worker_id')} rank={item.get('rank')} "
+                f"local_rank={item.get('local_rank')} stage={item.get('stage')} "
+                f"device={item.get('device')} machine={item.get('machine_id')} "
+                f"runtime={item.get('runtime')} "
+                f"python={item.get('python_executable')}"
+            )
     if result.status.failure is not None:
         lines.append(f"Failure Stage: {result.status.failure.stage.value}")
         lines.append(f"Failure: {result.status.failure.message}")
@@ -104,9 +216,10 @@ def run_train_command(args: argparse.Namespace) -> int:
     json_output = bool(getattr(args, "json", False)) or bool(
         getattr(args.context, "json_output", False)
     )
+    dry_run = bool(getattr(args, "dry_run", False))
     try:
         manager = JobManager(_resolve_cluster_config(args))
-        result = manager.run(args.config_path)
+        result = manager.run(args.config_path, dry_run=dry_run)
     except (FileNotFoundError, ConfigValidationError, ValueError) as error:
         print(
             json.dumps({"error": type(error).__name__, "message": str(error)}, sort_keys=True)
@@ -127,4 +240,4 @@ def run_train_command(args: argparse.Namespace) -> int:
         if json_output
         else _render_human(result)
     )
-    return _exit_code(result)
+    return EXIT_OK if dry_run and result.status.failure is None else _exit_code(result)

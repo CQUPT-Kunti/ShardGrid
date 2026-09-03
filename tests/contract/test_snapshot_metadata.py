@@ -181,12 +181,18 @@ def test_success_snapshot_metadata_round_trip_and_files(tmp_path: Path) -> None:
         ]
         == "plan-1"
     )
+    assert Path(metadata.original_parallel_plan_yaml_path or "").is_file() is True
     assert json.loads(Path(metadata.execution_plan_path).read_text())["job_id"] == "job-001"
+    assert Path(metadata.execution_plan_yaml_path or "").is_file() is True
     assert (
         json.loads(Path(metadata.network_state_path).read_text())["diagnostics_path"]
         == "/var/tmp/shardgrid/network/latest.json"
     )
     assert json.loads(Path(metadata.checkpoint_metadata_path).read_text())["step"] == 20
+    assert Path(metadata.manifest_yaml_path or "").is_file() is True
+    assert metadata.execution_plan_audit is not None
+    assert metadata.execution_plan_audit["engine"] == "galvatron"
+    assert metadata.execution_plan_audit["master"]["port"] == 29500
 
 
 def test_failed_snapshot_metadata_keeps_failure_evidence(tmp_path: Path) -> None:

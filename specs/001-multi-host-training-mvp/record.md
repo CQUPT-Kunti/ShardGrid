@@ -1,0 +1,34 @@
+## 2026-09-03 T115
+
+- train plan output: `shardgrid train --dry-run` now emits auditable `ExecutionPlan` data from the saved snapshot metadata instead of a reduced status-only summary.
+- engine/backend visibility: CLI JSON and human output show `engine`, `backend`, and engine launch metadata before any remote launch starts.
+- master/world_size visibility: dry-run output and snapshot metadata show `master.address`, `master.port`, and `world_size`.
+- placement/assignment visibility: stage-to-worker placement is preserved from T114 stage metadata and exposed as `stage -> worker -> rank -> GPU`, plus host, machine, runtime, Python, and log path details per assignment.
+- original plan visibility: `execution-plan.json` now preserves `parallel_plan_ref`, `original_engine_plan_ref`, `model_profile_ref`, and `candidate_evaluation_ref`.
+- fallback labels: audit output includes fallback status, fallback label, fallback reason, rejected engine list, and selected worker-count metadata without changing T111/T112 decisions.
+- snapshot metadata: snapshot writes `original-parallel-plan.json|yaml`, `execution-plan.json|yaml`, and `snapshot-metadata.json|yaml`, with one shared `execution_plan_audit` payload used by CLI output.
+- dry-run verification: dry-run returns after snapshot write and before `engine.prepare`, launcher creation, SSH launch, torch distributed init, or training process start.
+- JSON/YAML audit: tests verify JSON and YAML artifacts carry the same engine, backend, master, world size, placement, assignment, original-plan, and fallback fields.
+- 方案划分决策输出:
+  - `partition_source=automatic`
+  - `selected_candidate_id`, `selected_worker_count`, `attempted_worker_counts`, and `total_cross_worker_communication_bytes` are visible in audit metadata
+  - each `stage_metadata_ref` stays attached to the final assignment so the chosen stage split and worker placement can be traced back to the preserved `ParallelPlan`
+
+## 2026-09-03 T116
+
+- planner gate: added `tests/integration/test_planner_gate.py` to validate the T108-T115 automatic planner chain end to end at the planner boundary, including peak-memory fit, strict worker-count escalation, deterministic selection, persistence, replay rejection, and dry-run no-launch behavior.
+- training peak memory constraint: gate coverage now rejects plans when `estimated_peak_training_memory` exceeds worker usable memory even when raw parameter bytes still fit.
+- strict worker-count search: validation keeps the current ordered search `2 -> 3 -> 4` and confirms the search stops on the first feasible worker count instead of globally re-ranking mixed worker counts.
+- automatic partition + placement consistency: gate coverage verifies `partition_source=automatic`, one placement per stage, unique selected workers, preserved `stage_metadata_ref`, and unchanged stage-to-worker/rank/GPU mapping between selected placement, `ParallelPlan`, and `ExecutionPlan`.
+- residual/skip communication preserved: persistence checks confirm non-adjacent residual / skip communication edges survive T110 -> T114 -> T115 and remain visible in saved plan metadata.
+- deterministic planning: repeated planning with identical model/profile/cluster inputs yields the same selected worker count, worker set, candidate id, and stage placement.
+- plan persistence: JSON/YAML artifacts preserve `selected_worker_count`, `selected_worker_ids`, stage mapping, placement, memory metadata, communication metadata, `engine`, `backend`, `master`, `world_size`, assignments, and planning provenance.
+- replay safety: `src/shardgrid/planner/replay.py` now validates saved automatic-plan artifacts fail closed when worker health or usable memory changes, and it rejects silent re-placement.
+- manual override: recorded as `NOT_SUPPORTED / SKIPPED_BY_CURRENT_DESIGN` for the current planner gate; T116 does not reintroduce T113 behavior.
+- docs alignment: `docs/architecture/planner.md` now documents the real current flow `T109 -> T110 -> T111 -> T112 -> T114 -> T115 -> T116`, the memory hard gate, the communication-first ranking rule, and the deferred T117 hardware boundary.
+- temp planner design: wrote `/home/yangjilei/Code/ShardGrid/temp.md` as the current final planner design summary for audit.
+- live dry-run: on 2026-09-03, `PYTHONPATH=src /home/yangjilei/anaconda3/bin/python -m shardgrid.cli.app --config examples/workers.yaml train examples/train-minimal.yaml --dry-run --json` returned `state=snapshotting`, `phase=plan`, `metadata_equal=True`, and all assignment `pid` values remained `null`; this validates no remote rank launch, while the current example still reports `plan_mode=static` and `partition_source=manual`.
+- 方案划分决策输出:
+  - gate verifies the saved decision chain keeps `attempted_worker_counts`, `selected_worker_count`, `selected_candidate_id`, `total_cross_worker_communication_bytes`, and per-stage placement data
+  - the persisted placement remains auditable as `stage -> worker -> rank -> GPU` with usable-memory, remaining-memory, and utilization fields
+  - replay uses the saved plan; it does not recompute a new partition or new placement when resources drift

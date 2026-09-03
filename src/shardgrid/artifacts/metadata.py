@@ -7,10 +7,13 @@ from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
+import yaml
+
 from shardgrid.common.logging import redact_mapping
 from shardgrid.common.serialization import validate_execution_plan, validate_job_status
 from shardgrid.engines.models import ParallelPlan
 from shardgrid.jobs.models import JobSnapshot, JobStatus, TrainingJob
+from shardgrid.planner.execution_plan import build_execution_plan_audit_payload
 from shardgrid.planner.models import ExecutionPlan
 from shardgrid.resources.models import NetworkState
 from shardgrid.workers.environment_report import (
@@ -22,12 +25,15 @@ from shardgrid.workers.environment_report import (
 
 _CONFIG_FILE = "training-config.json"
 _ORIGINAL_PLAN_FILE = "original-parallel-plan.json"
+_ORIGINAL_PLAN_YAML_FILE = "original-parallel-plan.yaml"
 _EXECUTION_PLAN_FILE = "execution-plan.json"
+_EXECUTION_PLAN_YAML_FILE = "execution-plan.yaml"
 _NETWORK_STATE_FILE = "network-state.json"
 _CHECKPOINT_METADATA_FILE = "checkpoint-metadata.json"
 _JOB_STATUS_FILE = "job-status.json"
 _FAILURE_FILE = "failure.json"
 _MANIFEST_FILE = "snapshot-metadata.json"
+_MANIFEST_YAML_FILE = "snapshot-metadata.yaml"
 
 
 def _serialize(value: Any) -> Any:
@@ -55,7 +61,11 @@ class SnapshotMetadata:
     network_state_path: str
     checkpoint_metadata_path: str
     job_status_path: str
+    original_parallel_plan_yaml_path: str | None = None
+    execution_plan_yaml_path: str | None = None
     failure_path: str | None = None
+    manifest_yaml_path: str | None = None
+    execution_plan_audit: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)
@@ -67,12 +77,18 @@ class SnapshotMetadata:
             snapshot_root=str(data["snapshot_root"]),
             config_path=str(data["config_path"]),
             original_parallel_plan_path=str(data["original_parallel_plan_path"]),
+            original_parallel_plan_yaml_path=data.get("original_parallel_plan_yaml_path"),
             execution_plan_path=str(data["execution_plan_path"]),
+            execution_plan_yaml_path=data.get("execution_plan_yaml_path"),
             environment_report_path=str(data["environment_report_path"]),
             network_state_path=str(data["network_state_path"]),
             checkpoint_metadata_path=str(data["checkpoint_metadata_path"]),
             job_status_path=str(data["job_status_path"]),
             failure_path=data.get("failure_path"),
+            manifest_yaml_path=data.get("manifest_yaml_path"),
+            execution_plan_audit=cast(
+                dict[str, Any] | None, data.get("execution_plan_audit")
+            ),
         )
 
 
@@ -87,6 +103,8 @@ def write_snapshot_metadata(
     network_state: NetworkState,
     job_status: JobStatus,
     checkpoint_metadata: Mapping[str, Any] | None = None,
+    launch_metadata: Mapping[str, Any] | None = None,
+    dry_run: bool = False,
     secrets: Sequence[str] = (),
 ) -> SnapshotMetadata:
     _validate_inputs(
@@ -105,8 +123,14 @@ def write_snapshot_metadata(
         "parallel_plan": _contained_path(
             snapshot.plan_path, _ORIGINAL_PLAN_FILE, snapshot_root
         ),
+        "parallel_plan_yaml": _contained_path(
+            snapshot.plan_path, _ORIGINAL_PLAN_YAML_FILE, snapshot_root
+        ),
         "execution_plan": _contained_path(
             snapshot.plan_path, _EXECUTION_PLAN_FILE, snapshot_root
+        ),
+        "execution_plan_yaml": _contained_path(
+            snapshot.plan_path, _EXECUTION_PLAN_YAML_FILE, snapshot_root
         ),
         "environment_report": None,
         "network_state": _contained_path(
@@ -120,12 +144,17 @@ def write_snapshot_metadata(
         ),
         "failure": _contained_path(snapshot.diagnostics_path, _FAILURE_FILE, snapshot_root),
         "manifest": _contained_path(snapshot.diagnostics_path, _MANIFEST_FILE, snapshot_root),
+        "manifest_yaml": _contained_path(
+            snapshot.diagnostics_path, _MANIFEST_YAML_FILE, snapshot_root
+        ),
     }
 
     _write_json(paths["config"], redact_mapping(_serialize(dict(config)), secrets))
     _write_json(paths["parallel_plan"], redact_mapping(parallel_plan.to_dict(), secrets))
+    _write_yaml(paths["parallel_plan_yaml"], redact_mapping(parallel_plan.to_dict(), secrets))
     validate_execution_plan(execution_plan)
     _write_json(paths["execution_plan"], redact_mapping(execution_plan.to_dict(), secrets))
+    _write_yaml(paths["execution_plan_yaml"], redact_mapping(execution_plan.to_dict(), secrets))
 
     write_environment_report(environment_report, snapshot.environment_path)
     environment_report_path = _find_environment_report(snapshot.environment_path)
@@ -148,19 +177,33 @@ def write_snapshot_metadata(
         failure_path = str(paths["failure"])
         _write_json(paths["failure"], redact_mapping(job_status.failure.to_dict(), secrets))
 
+    audit_payload = redact_mapping(
+        build_execution_plan_audit_payload(
+            execution_plan,
+            parallel_plan=parallel_plan,
+            launch_metadata=dict(launch_metadata or {}),
+            dry_run=dry_run,
+        ),
+        secrets,
+    )
     metadata = SnapshotMetadata(
         job_id=str(job.job_id),
         snapshot_root=str(snapshot_root),
         config_path=str(paths["config"]),
         original_parallel_plan_path=str(paths["parallel_plan"]),
+        original_parallel_plan_yaml_path=str(paths["parallel_plan_yaml"]),
         execution_plan_path=str(paths["execution_plan"]),
+        execution_plan_yaml_path=str(paths["execution_plan_yaml"]),
         environment_report_path=str(paths["environment_report"]),
         network_state_path=str(paths["network_state"]),
         checkpoint_metadata_path=str(paths["checkpoint"]),
         job_status_path=str(paths["job_status"]),
         failure_path=failure_path,
+        manifest_yaml_path=str(paths["manifest_yaml"]),
+        execution_plan_audit=audit_payload,
     )
     _write_json(paths["manifest"], metadata.to_dict())
+    _write_yaml(paths["manifest_yaml"], metadata.to_dict())
     validate_snapshot_metadata(metadata.to_dict())
     return metadata
 
@@ -196,6 +239,14 @@ def validate_snapshot_metadata(payload: Mapping[str, Any]) -> None:
         "job_status_path",
     ):
         _ensure_contained(Path(str(payload[key])), snapshot_root)
+    for key in (
+        "original_parallel_plan_yaml_path",
+        "execution_plan_yaml_path",
+        "manifest_yaml_path",
+    ):
+        value = payload.get(key)
+        if value:
+            _ensure_contained(Path(str(value)), snapshot_root)
     if payload.get("failure_path"):
         _ensure_contained(Path(str(payload["failure_path"])), snapshot_root)
 
@@ -240,6 +291,11 @@ def _ensure_contained(path: Path, snapshot_root: Path) -> None:
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dict(payload), indent=2, sort_keys=True))
+
+
+def _write_yaml(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(dict(payload), sort_keys=True))
 
 
 def _find_environment_report(root: str | Path) -> Path:

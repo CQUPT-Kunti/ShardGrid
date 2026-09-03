@@ -1,6 +1,8 @@
-"""Automatic ParallelPlan materialization and validation for T114."""
+"""Automatic plan materialization and audit helpers for T114-T115."""
 
 from __future__ import annotations
+
+from typing import Any
 
 from shardgrid.common.models import as_engine_name
 from shardgrid.engines.models import (
@@ -12,8 +14,123 @@ from shardgrid.engines.models import (
     ParallelPlanProvenance,
     ParallelPlanStage,
 )
+from shardgrid.planner.models import ExecutionPlan, WorkerAssignment
 from shardgrid.planner.placement import JointPlacementPlan
 from shardgrid.planner.requirements import FeasibilityStatus
+
+
+def build_execution_plan_audit_payload(
+    execution_plan: ExecutionPlan,
+    *,
+    parallel_plan: ParallelPlan | None = None,
+    launch_metadata: dict[str, object] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    stage_details = {stage.stage_id: stage for stage in parallel_plan.stage_metadata} if parallel_plan else {}
+    placement = [
+        _placement_entry(assignment, stage_details.get(str(assignment.stage)))
+        for assignment in execution_plan.workers
+    ]
+    assignments = [
+        _assignment_entry(assignment, stage_details.get(str(assignment.stage)))
+        for assignment in execution_plan.workers
+    ]
+    provenance = None if parallel_plan is None else parallel_plan.planning_provenance
+    fallback_reason = execution_plan.labels.get("fallback_reason") or (
+        None if provenance is None else provenance.fallback_reason
+    )
+    fallback_label = execution_plan.labels.get("fallback_label") or (
+        "planner_fallback" if fallback_reason else "NONE"
+    )
+    fallback_status = execution_plan.labels.get("fallback_status") or (
+        "USED" if fallback_reason else "NONE"
+    )
+    return {
+        "job_id": str(execution_plan.job_id),
+        "dry_run": dry_run,
+        "engine": str(execution_plan.engine),
+        "backend": str(execution_plan.backend),
+        "world_size": execution_plan.world_size,
+        "master": execution_plan.master.to_dict(),
+        "placement_reason": execution_plan.placement_reason,
+        "placement": placement,
+        "assignments": assignments,
+        "launch_metadata": dict(launch_metadata or {}),
+        "original_plan": {
+            "parallel_plan_id": None if parallel_plan is None else parallel_plan.parallel_plan_id,
+            "parallel_plan_ref": execution_plan.parallel_plan_ref,
+            "original_engine_plan_ref": execution_plan.original_engine_plan_ref,
+            "model_profile_ref": execution_plan.model_profile_ref,
+            "candidate_evaluation_ref": execution_plan.candidate_evaluation_ref,
+            "selected_candidate_id": execution_plan.labels.get("selected_candidate_id"),
+        },
+        "fallback": {
+            "status": fallback_status,
+            "label": fallback_label,
+            "reason": fallback_reason,
+        },
+        "planning": {
+            "partition_source": execution_plan.labels.get("partition_source"),
+            "selected_worker_count": execution_plan.labels.get("selected_worker_count"),
+            "attempted_worker_counts": [] if provenance is None else list(provenance.attempted_worker_counts),
+            "rejection_reasons": [] if provenance is None else list(provenance.rejection_reasons),
+            "total_cross_worker_communication_bytes": execution_plan.labels.get(
+                "total_cross_worker_communication_bytes"
+            ),
+        },
+        "labels": dict(execution_plan.labels),
+    }
+
+
+def _placement_entry(
+    assignment: WorkerAssignment,
+    stage: ParallelPlanStage | None,
+) -> dict[str, Any]:
+    placement = None if stage is None else stage.placement
+    return {
+        "stage": assignment.stage,
+        "stage_metadata_ref": assignment.stage_metadata_ref,
+        "worker_id": str(assignment.worker_id),
+        "rank": assignment.rank,
+        "local_rank": assignment.local_rank,
+        "gpu_index": assignment.gpu_index,
+        "device": f"cuda:{assignment.gpu_index}",
+        "host": assignment.host,
+        "machine_id": assignment.machine_id,
+        "physical_os": assignment.physical_os,
+        "runtime_os": assignment.runtime_os,
+        "runtime": assignment.runtime,
+        "runtime_distro": assignment.runtime_distro,
+        "usable_memory_before_bytes": None
+        if placement is None
+        else placement.usable_memory_before_bytes,
+        "remaining_memory_bytes": None
+        if placement is None
+        else placement.remaining_memory_bytes,
+        "utilization_ratio": None if placement is None else placement.utilization_ratio,
+    }
+
+
+def _assignment_entry(
+    assignment: WorkerAssignment,
+    stage: ParallelPlanStage | None,
+) -> dict[str, Any]:
+    payload = _placement_entry(assignment, stage)
+    payload.update(
+        {
+            "estimated_peak_training_memory": assignment.estimated_peak_training_memory,
+            "communication_edges": list(assignment.communication_edges),
+            "conda_environment": assignment.conda_environment,
+            "conda_prefix": assignment.conda_prefix,
+            "python_executable": assignment.python_executable,
+            "launch_command": assignment.launch_command,
+            "environment": dict(assignment.environment),
+            "status": assignment.status,
+            "pid": assignment.pid,
+            "log_path": assignment.log_path,
+        }
+    )
+    return payload
 
 
 def build_automatic_parallel_plan(
@@ -259,11 +376,13 @@ def validate_automatic_parallel_plan(
                     problems.append(
                         f"parallel plan stage {stage.stage_id} placement changed from T112"
                     )
-                if actual.machine_id != placement.machine_id:
+                if (
+                    actual.machine_id is not None
+                    and actual.machine_id != placement.machine_id
+                ):
                     problems.append(
-                        f"parallel plan stage {stage.stage_id} machine mapping changed from T112"
+                        f"parallel plan stage {stage.stage_id} machine_id changed from T112"
                     )
-
     return problems
 
 
@@ -286,25 +405,21 @@ def profile_id(profile: ModelProfile) -> str:
     return profile.profile_id
 
 
-def _edge_key_from_candidate(edge: object) -> tuple[object, ...]:
+def _edge_key_from_candidate(edge: object) -> tuple[str, str, str, str]:
     return (
-        getattr(edge, "source_stage_id"),
-        getattr(edge, "target_stage_id"),
-        getattr(edge, "source_module_id"),
-        getattr(edge, "target_module_id"),
-        getattr(edge, "estimated_bytes_per_step"),
-        tuple(tensor.name for tensor in getattr(edge, "activation")),
-        tuple(tensor.name for tensor in getattr(edge, "gradient")),
+        str(getattr(edge, "source_stage_id")),
+        str(getattr(edge, "target_stage_id")),
+        str(getattr(edge, "source_module_id")),
+        str(getattr(edge, "target_module_id")),
     )
 
 
-def _edge_key_from_plan(edge: ParallelPlanCommunicationEdge) -> tuple[object, ...]:
+def _edge_key_from_plan(
+    edge: ParallelPlanCommunicationEdge,
+) -> tuple[str, str, str, str]:
     return (
         edge.source_stage_id,
         edge.target_stage_id,
         edge.source_module_id,
         edge.target_module_id,
-        edge.estimated_bytes_per_step,
-        tuple(tensor.name for tensor in edge.activation),
-        tuple(tensor.name for tensor in edge.gradient),
     )

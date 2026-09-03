@@ -1,73 +1,116 @@
 # Planner Architecture
 
-ShardGrid Planner owns resource-aware placement and launch metadata. It does not own model graph tracing, autograd, CUDA kernels, collective communication, or a full model-parallel runtime.
+ShardGrid Planner owns the automatic planning chain from model profiling through
+dry-run audit for the current MVP. It does not own autograd, CUDA kernels,
+collective implementations, or real multi-host execution.
 
-## Automatic Planning Flow
+## Current Flow
 
 ```text
-supported model
--> selected ParallelEngine profile
--> automatic partition candidates
--> WorkerResource + NetworkState validation
--> candidate rejection or selection
--> automatic ParallelPlan
--> ExecutionPlan
--> SSHLauncher
+T109 model/profile
+-> T110 automatic weighted graph partition
+-> T111 strict worker-count search + eligible worker placement
+-> T112 same-K final candidate selection
+-> T114 ParallelPlan materialization
+-> T115 ExecutionPlan audit + snapshot metadata + dry-run
+-> T116 planner gate acceptance
 ```
 
-The static minimal model remains a regression fixture. It is not evidence that automatic partitioning works.
+This is the current planner path as of 2026-09-03. The old static Stage 0 /
+Stage 1 planning path is not evidence that automatic planning works.
 
-## Hard Constraints
+## Hard Gates
 
-These are checked before any score:
+Planner rejects a candidate before any ranking when any of these fail:
 
-- Worker health
-- GPU/runtime compatibility
-- backend availability
-- network reachability
-- one valid physical host per Stage A-C Worker assignment
-- valid `local_world_size`
-- selected-engine-supported partition boundary
-- estimated peak training memory fits usable GPU memory after headroom
+- stage training peak memory exceeds worker usable memory
+- worker health, enablement, runtime, or backend eligibility fails
+- required network links for cross-worker communication are unreachable
+- one stage is missing placement or multiple stages collapse onto one physical
+  host in the Stage A-C path
+- saved plan metadata becomes inconsistent during replay
 
-Manual overrides are preferences. They cannot bypass hard constraints.
+Memory validation uses the full estimated training peak, including parameters,
+gradients, optimizer state, activations, temporary overhead, communication
+buffers, and safety headroom. Parameter bytes alone are not sufficient.
 
-## Memory Model
+## Worker Count Search
 
-Peak training memory includes:
+The current T111 rule is strict and ordered:
 
-- parameters
-- gradients
-- optimizer states
-- activations
-- temporary/runtime overhead
-- communication buffers
-- configurable safety headroom
+```text
+try 2 workers
+if feasible: stop
+else try 3 workers
+if feasible: stop
+else try 4 workers
+```
 
-A candidate is invalid when estimated peak training memory exceeds usable GPU memory after headroom.
+Planner does not precompute 2/3/4 and then globally rank them together. The
+first feasible worker count becomes the only worker-count frontier passed to
+T112.
 
-## Scoring Order
+## Automatic Partition And Placement
 
-Legal candidates are sorted deterministically:
+Automatic partitioning is derived from the profiled model graph. Each stage
+records:
 
-1. fewest physical Workers
-2. least cross-host communication
-3. avoid severe heterogeneous GPU bottlenecks
-4. improve compute balance
-5. GPU capability or secondary preferences
-6. deterministic tie-break
+- module slice and stage boundary
+- estimated training peak memory
+- forward activation and backward gradient communication
+- residual / skip cross-stage communication edges
+- selected worker, rank, GPU, usable memory, remaining memory, and utilization
 
-Communication cost is based on actual stage boundaries: activation bytes, gradient bytes, microbatch count, batch size, sequence length where relevant, boundary tensor shape, bandwidth, and latency.
+T114 must preserve the chosen partition and placement. T115 must expose the
+same data in `ExecutionPlan`, dry-run output, and saved JSON/YAML artifacts
+without recomputing partition or placement.
 
-## Required Evidence
+## Ranking
 
-Planner artifacts record:
+T112 ranks only FEASIBLE candidates that already share the same selected worker
+count.
 
-- candidate rejection reasons
-- selected reason
-- fallback reason
-- UNSATISFIABLE reason
-- original engine plan reference
-- model profile reference
-- stage metadata
-- placement metadata
+Sort order:
+
+1. minimum `total_cross_worker_communication_bytes`
+2. memory-utilization quality on near ties
+3. deterministic tie-break by saved worker, stage, and candidate identity
+
+The current planner does not use compute time, FLOPS, or GPU latency weights.
+
+## Persistence, Replay, And Dry-Run
+
+Planner artifacts must preserve:
+
+- selected worker count and attempted worker counts
+- selected workers and stage-to-worker mapping
+- stage memory and communication metadata
+- `ParallelPlan` provenance
+- `ExecutionPlan` assignments
+- engine, backend, world size, and rendezvous master
+
+Replay validation is fail-closed. If a saved worker becomes unhealthy,
+ineligible, or loses usable memory below the saved stage peak, replay is
+rejected. Replay does not silently re-place the model.
+
+`train --dry-run` must:
+
+1. probe current resources
+2. build the final plan
+3. save auditable snapshot artifacts
+4. exit before remote rank launch, torch distributed init, or real training
+
+## Manual Override
+
+T113 manual override is currently skipped by design.
+
+```text
+manual override: NOT_SUPPORTED / SKIPPED_BY_CURRENT_DESIGN
+```
+
+No manual preference path may bypass planner hard constraints.
+
+## Hardware Boundary
+
+T116 is a planner gate only. Real automatic-plan multi-host training remains a
+later hardware acceptance step in T117.

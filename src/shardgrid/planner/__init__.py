@@ -45,6 +45,12 @@ from .requirements import (
     validate_partition_boundary,
     validate_placement_feasibility,
 )
+from .replay import (
+    ReplayValidationResult,
+    load_replay_bundle,
+    validate_execution_plan_replay,
+    validate_snapshot_replay,
+)
 from .scoring import (
     PlanMemorySummary,
     select_best_joint_placement_plan,
@@ -74,15 +80,19 @@ __all__ = [
     "PlanMemorySummary",
     "PlacementFeasibilityResult",
     "PlacementRequirements",
+    "ReplayValidationResult",
     "search_joint_partition_placement",
     "select_best_joint_placement_plan",
     "StageCommunicationEdge",
     "StagePlacement",
     "StagePartition",
     "summarize_plan_memory_utilization",
+    "load_replay_bundle",
     "validate_automatic_parallel_plan",
     "validate_automatic_parallel_plan_or_raise",
+    "validate_execution_plan_replay",
     "generate_partition_candidates",
+    "validate_snapshot_replay",
     "WorkerEligibilityRequirements",
     "WorkerEligibilityResult",
     "WorkerSubsetAttempt",

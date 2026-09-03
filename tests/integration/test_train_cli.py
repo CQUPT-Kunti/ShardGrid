@@ -122,7 +122,8 @@ def test_train_uses_default_examples_cluster_config(
         def __init__(self, config) -> None:
             captured["jobs_root"] = str(config.jobs_root)
 
-        def run(self, config_path: str) -> JobRunResult:
+        def run(self, config_path: str, *, dry_run: bool = False) -> JobRunResult:
+            captured["dry_run"] = dry_run
             captured["config_path"] = config_path
             return _result(JobState.COMPLETED, tmp_path)
 
@@ -133,6 +134,7 @@ def test_train_uses_default_examples_cluster_config(
 
     output = capsys.readouterr().out
     assert exit_code == 0
+    assert captured["dry_run"] is False
     assert captured["config_path"] == "examples/train-minimal.yaml"
     assert captured["jobs_root"] == str((tmp_path / "jobs").resolve())
     assert "Job: job-20260829-abc12345" in output
@@ -148,7 +150,8 @@ def test_train_returns_nonzero_for_failed_job(tmp_path: Path, monkeypatch, capsy
         def __init__(self, config) -> None:
             del config
 
-        def run(self, config_path: str) -> JobRunResult:
+        def run(self, config_path: str, *, dry_run: bool = False) -> JobRunResult:
+            assert dry_run is False
             assert config_path == "examples/train-minimal.yaml"
             return _result(JobState.FAILED, tmp_path)
 

@@ -51,9 +51,46 @@ properties:
           type:
             - string
             - "null"
+        stage_metadata_ref:
+          type:
+            - string
+            - "null"
+        estimated_peak_training_memory:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        communication_edges:
+          type: array
+          items:
+            type: string
         gpu_index:
           type: integer
           minimum: 0
+        host:
+          type:
+            - string
+            - "null"
+        machine_id:
+          type:
+            - string
+            - "null"
+        physical_os:
+          type:
+            - string
+            - "null"
+        runtime_os:
+          type:
+            - string
+            - "null"
+        runtime:
+          type:
+            - string
+            - "null"
+        runtime_distro:
+          type:
+            - string
+            - "null"
         conda_environment:
           type:
             - string
