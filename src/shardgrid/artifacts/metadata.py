@@ -268,10 +268,13 @@ def _validate_inputs(
         raise ValueError("execution plan job_id must match training job")
     if job_status.job_id != job.job_id:
         raise ValueError("job status job_id must match training job")
-    if parallel_plan.world_size != job.requested_world_size:
-        raise ValueError("parallel plan world_size must match training job")
-    if execution_plan.world_size != job.requested_world_size:
-        raise ValueError("execution plan world_size must match training job")
+    if parallel_plan.world_size != execution_plan.world_size:
+        raise ValueError("parallel plan world_size must match execution plan")
+    if parallel_plan.partition_source != "automatic":
+        if parallel_plan.world_size != job.requested_world_size:
+            raise ValueError("parallel plan world_size must match training job")
+        if execution_plan.world_size != job.requested_world_size:
+            raise ValueError("execution plan world_size must match training job")
     if checkpoint_metadata is None and job_status.state.value == "completed":
         raise ValueError("completed job metadata requires checkpoint metadata")
 

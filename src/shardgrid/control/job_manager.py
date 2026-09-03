@@ -44,7 +44,15 @@ from shardgrid.launchers.base import (
 from shardgrid.launchers.ssh import SSHLauncher
 from shardgrid.network.mtu import parse_interface_mtu, parse_route_interface, parse_route_source_ip
 from shardgrid.network.state import build_network_state
+from shardgrid.planner import (
+    MemoryEstimationConfig,
+    build_automatic_parallel_plan,
+    build_model_profile,
+    search_joint_partition_placement,
+    select_best_joint_placement_plan,
+)
 from shardgrid.planner.models import ExecutionPlan, MasterMetadata, WorkerAssignment
+from shardgrid.planner.requirements import FeasibilityStatus
 from shardgrid.resources.models import NetworkLink, NetworkState, WorkerResource
 from shardgrid.transport.remote_access import run_remote_access_check
 from shardgrid.transport.runtime import WSLRuntimeConfig, WSLRuntimeWrapper
@@ -256,6 +264,22 @@ class JobManager:
                 network_state,
                 registry=registered_engine_registry(),
             )
+            if self._automatic_planning_enabled(training_config):
+                automatic_plan = self._build_automatic_parallel_plan(
+                    training_config=training_config,
+                    cluster_state=cluster_state,
+                    selected_engine=selected_engine,
+                )
+                selected_engine = SelectedEngine(
+                    job_id=getattr(selected_engine, "job_id", job.job_id),
+                    engine=selected_engine.engine,
+                    candidate=selected_engine.candidate,
+                    parallel_plan=automatic_plan,
+                    original_plan_path=automatic_plan.engine_plan_path,
+                    rejected_engine_ids=tuple(
+                        getattr(selected_engine, "rejected_engine_ids", ())
+                    ),
+                )
         except Exception as exc:
             failure = make_failure_record(
                 stage=FailureStage.PLAN,
@@ -295,7 +319,7 @@ class JobManager:
             state=JobState.SNAPSHOTTING,
             phase="plan",
         )
-        launch_metadata = selected_engine.engine.launch_metadata(selected_engine.parallel_plan)
+        launch_metadata = self._launch_metadata(selected_engine)
 
         self._write_snapshot_metadata(
             snapshot=snapshot,
@@ -844,11 +868,14 @@ class JobManager:
             if worker.enabled
         }
         if preferred:
-            return [
-                configured[worker_id]
-                for worker_id in preferred[: training_config.resources.world_size]
-            ]
-        return list(configured.values())[: training_config.resources.world_size]
+            ordered = [configured[worker_id] for worker_id in preferred if worker_id in configured]
+            if self._automatic_planning_enabled(training_config):
+                return ordered
+            return ordered[: training_config.resources.world_size]
+        configured_workers = list(configured.values())
+        if self._automatic_planning_enabled(training_config):
+            return configured_workers
+        return configured_workers[: training_config.resources.world_size]
 
     def _probe_failure(
         self,
@@ -915,11 +942,18 @@ class JobManager:
                     stage_metadata_ref=(
                         None
                         if stage is None
-                        else f"parallel_plan.stage_metadata[{parallel_plan.stage_metadata.index(stage)}]"
+                        else (
+                            "parallel_plan.stage_metadata["
+                            f"{parallel_plan.stage_metadata.index(stage)}]"
+                        )
                     ),
                     estimated_peak_training_memory=peak_memory,
                     communication_edges=list(communication_map.get(stage_id, ())),
-                    gpu_index=0 if stage is None or stage.placement is None else stage.placement.gpu_index,
+                    gpu_index=(
+                        0
+                        if stage is None or stage.placement is None
+                        else stage.placement.gpu_index
+                    ),
                     host=str(worker.host),
                     machine_id=str(worker.machine_id),
                     physical_os=worker.physical_os.value,
@@ -954,7 +988,7 @@ class JobManager:
             job_id=job.job_id,
             engine=parallel_plan.engine,
             backend=training_config.job.communication_backend,
-            world_size=job.requested_world_size,
+            world_size=parallel_plan.world_size,
             master=MasterMetadata(
                 address=rank_zero.host or str(selected_workers[0].host),
                 port=self._resolved_rendezvous_port(),
@@ -1110,6 +1144,132 @@ class JobManager:
             dry_run=dry_run,
             secrets=self._secrets,
         )
+
+    def _automatic_planning_enabled(self, training_config: TrainingConfig) -> bool:
+        return training_config.planning.mode == "automatic"
+
+    def _build_automatic_parallel_plan(
+        self,
+        *,
+        training_config: TrainingConfig,
+        cluster_state: ClusterState,
+        selected_engine: SelectedEngine,
+    ) -> ParallelPlan:
+        model, sample_args, sample_kwargs = self._planner_workload(training_config)
+        profile = build_model_profile(
+            model,
+            engine_id=self._selected_engine_name(selected_engine),
+            model_name=training_config.model.name,
+            sample_args=sample_args,
+            sample_kwargs=sample_kwargs,
+            memory_config=self._planner_memory_config(),
+            required_backends=self._required_backends(training_config),
+        )
+        joint = search_joint_partition_placement(
+            model,
+            profile,
+            cluster_state,
+            sample_args=sample_args,
+            sample_kwargs=sample_kwargs,
+            memory_config=self._planner_memory_config(),
+            min_worker_count=2,
+            max_worker_count=min(4, len(cluster_state.workers)),
+        )
+        if joint.status is not FeasibilityStatus.FEASIBLE:
+            reasons = ", ".join(joint.reasons) if joint.reasons else "PLANNING_INFEASIBLE"
+            raise ValueError(f"automatic planner failed: {reasons}")
+        return build_automatic_parallel_plan(
+            profile,
+            select_best_joint_placement_plan([joint]),
+        )
+
+    def _planner_workload(
+        self,
+        training_config: TrainingConfig,
+    ) -> tuple[object, tuple[object, ...], dict[str, object]]:
+        import torch
+
+        if training_config.model.type == "minimal_sequential":
+            from examples.models.minimal_transformer import (
+                MinimalTransformerConfig,
+                build_minimal_transformer,
+            )
+
+            config = MinimalTransformerConfig()
+            sample = torch.randint(
+                0,
+                config.vocab_size,
+                (2, min(config.max_seq_length, 16)),
+            )
+            return build_minimal_transformer(config, seed=42), (sample,), {}
+        if training_config.model.type == "hf_style":
+            from examples.models.partition_stress_model import (
+                build_partition_stress_model,
+                make_training_batch,
+            )
+
+            model = build_partition_stress_model(seed=42)
+            inputs, _targets = make_training_batch(seed=42, step=0)
+            return model, (inputs,), {}
+        raise ValueError(
+            "automatic planning supports model.type minimal_sequential or hf_style"
+        )
+
+    def _planner_memory_config(self) -> MemoryEstimationConfig:
+        return MemoryEstimationConfig(
+            optimizer_type="adamw",
+            gradient_dtype="float32",
+            optimizer_state_dtype="float32",
+            runtime_overhead_bytes=1024,
+            communication_buffer_bytes=2048,
+            safety_headroom_bytes=4096,
+            temporary_buffer_factor=0.25,
+        )
+
+    def _required_backends(self, training_config: TrainingConfig) -> tuple[str, ...]:
+        backend = str(training_config.job.communication_backend)
+        if backend == "auto":
+            backend = str(self.cluster_config.backend_preference.communication_backend)
+        if backend == "auto":
+            backend = "nccl"
+        return (backend,)
+
+    def _launch_metadata(self, selected_engine: SelectedEngine) -> dict[str, object]:
+        metadata = dict(selected_engine.engine.launch_metadata(selected_engine.parallel_plan))
+        plan = selected_engine.parallel_plan
+        engine_id = self._selected_engine_name(selected_engine, required=False)
+        if engine_id is not None:
+            metadata.setdefault("engine", engine_id)
+        metadata["parallel_plan_id"] = plan.parallel_plan_id
+        metadata["partition_source"] = plan.partition_source or "manual"
+        metadata["plan_mode"] = (
+            "automatic" if (plan.partition_source or "") == "automatic" else "static"
+        )
+        if plan.selected_candidate_id:
+            metadata["selected_candidate_id"] = plan.selected_candidate_id
+        if plan.planning_provenance is not None:
+            metadata["selected_worker_count"] = plan.planning_provenance.selected_worker_count
+            metadata["attempted_worker_counts"] = list(
+                plan.planning_provenance.attempted_worker_counts
+            )
+        return metadata
+
+    def _selected_engine_name(
+        self,
+        selected_engine: SelectedEngine,
+        *,
+        required: bool = True,
+    ) -> str | None:
+        engine_id = getattr(
+            selected_engine,
+            "engine_id",
+            getattr(getattr(selected_engine, "candidate", None), "engine_id", None),
+        )
+        if engine_id is not None:
+            return str(engine_id)
+        if required:
+            raise ValueError("selected engine is missing engine_id")
+        return None
 
     def _collect_artifacts(
         self,

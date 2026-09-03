@@ -26,7 +26,11 @@ def build_execution_plan_audit_payload(
     launch_metadata: dict[str, object] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    stage_details = {stage.stage_id: stage for stage in parallel_plan.stage_metadata} if parallel_plan else {}
+    stage_details = (
+        {stage.stage_id: stage for stage in parallel_plan.stage_metadata}
+        if parallel_plan
+        else {}
+    )
     placement = [
         _placement_entry(assignment, stage_details.get(str(assignment.stage)))
         for assignment in execution_plan.workers
@@ -45,9 +49,17 @@ def build_execution_plan_audit_payload(
     fallback_status = execution_plan.labels.get("fallback_status") or (
         "USED" if fallback_reason else "NONE"
     )
+    plan_mode = (launch_metadata or {}).get("plan_mode")
+    if plan_mode is None:
+        plan_mode = (
+            "automatic"
+            if execution_plan.labels.get("partition_source") == "automatic"
+            else "static"
+        )
     return {
         "job_id": str(execution_plan.job_id),
         "dry_run": dry_run,
+        "plan_mode": str(plan_mode),
         "engine": str(execution_plan.engine),
         "backend": str(execution_plan.backend),
         "world_size": execution_plan.world_size,
@@ -71,8 +83,12 @@ def build_execution_plan_audit_payload(
         },
         "planning": {
             "partition_source": execution_plan.labels.get("partition_source"),
+            "selected_candidate_id": execution_plan.labels.get("selected_candidate_id"),
             "selected_worker_count": execution_plan.labels.get("selected_worker_count"),
-            "attempted_worker_counts": [] if provenance is None else list(provenance.attempted_worker_counts),
+            "selected_workers": [item["worker_id"] for item in placement],
+            "attempted_worker_counts": (
+                [] if provenance is None else list(provenance.attempted_worker_counts)
+            ),
             "rejection_reasons": [] if provenance is None else list(provenance.rejection_reasons),
             "total_cross_worker_communication_bytes": execution_plan.labels.get(
                 "total_cross_worker_communication_bytes"
@@ -230,6 +246,7 @@ def build_automatic_parallel_plan(
             rejection_reasons=selected_plan.reasons,
         ),
         requirements={
+            "plan_mode": "automatic",
             "partition_source": "automatic",
             "required_runtime": profile.required_runtime or "",
             "required_backends": ",".join(profile.required_backends),

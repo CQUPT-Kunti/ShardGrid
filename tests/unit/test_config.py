@@ -7,6 +7,7 @@ import yaml
 
 from shardgrid.common.config import (
     ConfigValidationError,
+    TrainingConfig,
     load_cluster_config,
     load_config_data,
     load_training_config,
@@ -43,6 +44,16 @@ def test_load_training_config_from_example() -> None:
     assert config.artifacts.checkpoint.consolidation.enabled is False
     assert config.artifacts.checkpoint.consolidation.device == "auto"
     assert config.artifacts.checkpoint.consolidation.required is False
+    assert config.planning.mode == "static"
+
+
+def test_load_automatic_training_config_from_example() -> None:
+    config = load_training_config(Path("examples/train-automatic.yaml"))
+
+    assert config.job.name == "train-automatic"
+    assert config.model.type == "minimal_sequential"
+    assert config.resources.preferred_workers == ["gpu4060", "gpu1060", "gpu4060-cqupt"]
+    assert config.planning.mode == "automatic"
 
 
 def test_missing_worker_identity_is_rejected(tmp_path: Path) -> None:
@@ -103,9 +114,17 @@ def test_cluster_config_serialization_is_stable() -> None:
 
 
 def test_training_config_serialization_is_stable() -> None:
-    config = load_training_config(Path("examples/train-minimal.yaml"))
+    path = Path("examples/train-minimal.yaml")
+    config = load_training_config(path)
 
-    assert config.to_dict() == load_config_data(Path("examples/train-minimal.yaml"))
+    assert config.to_dict() == TrainingConfig.from_dict(load_config_data(path)).to_dict()
+
+
+def test_automatic_training_config_serialization_is_stable() -> None:
+    path = Path("examples/train-automatic.yaml")
+    config = load_training_config(path)
+
+    assert config.to_dict() == TrainingConfig.from_dict(load_config_data(path)).to_dict()
 
 
 def test_invalid_consolidation_device_is_rejected(tmp_path: Path) -> None:
@@ -132,5 +151,26 @@ def test_invalid_consolidation_device_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(
         ConfigValidationError,
         match="artifacts.checkpoint.consolidation.device must be one of: auto, cpu, cuda",
+    ):
+        load_training_config(path)
+
+
+def test_invalid_planning_mode_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "train-invalid-planning.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "job": {"name": "train-minimal", "backend": "ssh"},
+                "model": {"name": "tiny-sequential", "type": "minimal_sequential"},
+                "resources": {"world_size": 2},
+                "planning": {"mode": "dynamic"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ConfigValidationError,
+        match="planning.mode must be one of: static, automatic",
     ):
         load_training_config(path)

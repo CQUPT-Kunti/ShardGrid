@@ -32,3 +32,15 @@
   - gate verifies the saved decision chain keeps `attempted_worker_counts`, `selected_worker_count`, `selected_candidate_id`, `total_cross_worker_communication_bytes`, and per-stage placement data
   - the persisted placement remains auditable as `stage -> worker -> rank -> GPU` with usable-memory, remaining-memory, and utilization fields
   - replay uses the saved plan; it does not recompute a new partition or new placement when resources drift
+
+## 2026-09-03 Automatic Planner CLI Integration
+
+- real train CLI connected to the existing automatic planner path through `planning.mode=automatic`; static/manual configs keep the previous path.
+- added `examples/train-automatic.yaml` as an automatic workload config with no manual stage split or manual placement.
+- `JobManager.run()` now routes automatic dry-run planning through the existing planner chain and preserves the selected result as the final `ParallelPlan` / `ExecutionPlan`.
+- dry-run audit output now shows `plan_mode`, `partition_source`, `selected_candidate_id`, `selected_worker_count`, `attempted_worker_counts`, `selected_workers`, and cross-worker communication bytes before any launch step.
+- snapshot metadata validation now treats automatic planning correctly: `ParallelPlan.world_size` must match `ExecutionPlan.world_size`, while static/manual plans still match the requested job world size.
+- static/manual regression preserved; dry-run still exits before `engine.prepare`, launcher creation, SSH rank launch, torch distributed init, or real training.
+- 方案划分决策输出:
+  - automatic CLI path preserves `partition_source=automatic`, `selected_candidate_id`, `selected_worker_count`, `attempted_worker_counts`, and `total_cross_worker_communication_bytes`
+  - the final stage placement remains auditable as `stage -> worker -> rank -> GPU`, with per-stage estimated peak memory, usable memory, remaining memory, and utilization

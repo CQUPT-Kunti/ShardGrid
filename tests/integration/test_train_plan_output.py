@@ -9,7 +9,8 @@ from shardgrid.cli.app import main
 from shardgrid.cli.commands import train as train_command
 from shardgrid.common.config import ClusterConfig
 from shardgrid.common.enums import BackendStatus, Health, JobState, PhysicalOS, RuntimeOS
-from shardgrid.common.models import as_backend_name, as_engine_name, as_hostname, as_job_id
+from shardgrid.common.models import as_engine_name, as_hostname, as_job_id
+from shardgrid.control import job_manager as job_manager_module
 from shardgrid.control.job_manager import JobManager
 from shardgrid.engines.models import (
     ParallelEngineCandidate,
@@ -102,7 +103,11 @@ artifacts:
         + "\n",
         encoding="utf-8",
     )
-    return ClusterConfig.from_dict(yaml.safe_load(cluster_path.read_text())), cluster_path, training_path
+    return (
+        ClusterConfig.from_dict(yaml.safe_load(cluster_path.read_text())),
+        cluster_path,
+        training_path,
+    )
 
 
 def _worker_resource(
@@ -383,9 +388,33 @@ def _build_manager(tmp_path: Path, events: list[str]) -> tuple[JobManager, Path,
         return _probe_result(resources[str(worker.worker_id)])
 
     def probe_network(worker_resources):
-        del worker_resources
         events.append("network")
-        return _network_state()
+        links = []
+        for source in worker_resources:
+            for target in worker_resources:
+                if source.worker_id == target.worker_id:
+                    continue
+                links.append(
+                    NetworkLink(
+                        source_worker_id=source.worker_id,
+                        target_worker_id=target.worker_id,
+                        source_ip=source.ip or "10.0.0.10",
+                        target_ip=target.ip or "10.0.0.11",
+                        interface="eth0",
+                        tcp_reachable=True,
+                        bandwidth_mbps=940.0,
+                        latency_ms=0.8,
+                        port=29500,
+                        measured_at="2026-09-03T10:00:00+00:00",
+                    )
+                )
+        return NetworkState(
+            network_id="lan-auto",
+            workers=[item.worker_id for item in worker_resources],
+            links=links,
+            created_at="2026-09-03T10:00:00+00:00",
+            selected_interfaces={item.worker_id: "eth0" for item in worker_resources},
+        )
 
     def select_engine(engine_id, job, resources, network, *, registry=None):
         del engine_id, job, resources, network, registry
@@ -443,6 +472,7 @@ def test_dry_run_writes_complete_audit_output_and_artifacts(tmp_path: Path) -> N
     ]
 
     assert payload["dry_run"] is True
+    assert payload["plan_mode"] == "automatic"
     assert payload["engine"] == "galvatron"
     assert payload["backend"] == "nccl"
     assert payload["world_size"] == 3
@@ -455,8 +485,14 @@ def test_dry_run_writes_complete_audit_output_and_artifacts(tmp_path: Path) -> N
             "2-worker candidate exceeded usable memory headroom on gpu1060"
         ),
     }
-    assert payload["original_plan"]["original_engine_plan_ref"] == "/var/tmp/engine/original-plan.json"
-    assert payload["original_plan"]["candidate_evaluation_ref"] == "/var/tmp/planner/candidate-eval.json"
+    assert (
+        payload["original_plan"]["original_engine_plan_ref"]
+        == "/var/tmp/engine/original-plan.json"
+    )
+    assert (
+        payload["original_plan"]["candidate_evaluation_ref"]
+        == "/var/tmp/planner/candidate-eval.json"
+    )
     assert [item["stage"] for item in payload["placement"]] == ["stage0", "stage1", "stage2"]
     assert [item["worker_id"] for item in payload["assignments"]] == [
         "gpu4060",
@@ -475,10 +511,13 @@ def test_dry_run_writes_complete_audit_output_and_artifacts(tmp_path: Path) -> N
         "worker_count=2 rejected: stage1 planner_required_bytes > usable_memory"
     ]
 
+    assert "Plan Mode: automatic" in human
     assert "Engine: galvatron" in human
     assert "Backend: nccl" in human
     assert "Master: 10.0.0.10:29500" in human
     assert "World Size: 3" in human
+    assert "Partition Source: automatic" in human
+    assert "Selected Candidate: candidate-3w-a" in human
     assert "Stage stage0 -> Worker gpu4060 -> rank 0 -> GPU 0" in human
     assert "Stage stage2 -> Worker gpu3090 -> rank 2 -> GPU 0" in human
     assert "Parallel Plan Ref:" in human
@@ -531,7 +570,438 @@ def test_train_cli_passes_dry_run_and_returns_zero(tmp_path: Path, monkeypatch, 
     assert captured["config_path"] == str(training_path)
     assert captured["dry_run"] is True
     assert output["dry_run"] is True
+    assert output["plan_mode"] == "automatic"
     assert output["engine"] == "galvatron"
     assert output["backend"] == "nccl"
     assert output["master"] == {"address": "10.0.0.10", "port": 29500}
     assert len(output["assignments"]) == 3
+
+
+def test_dry_run_automatic_mode_invokes_real_planner_chain(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cluster_config = ClusterConfig.from_dict(
+        {
+            "control": {"machine_id": "machine-a", "hostname": "control-a.local"},
+            "jobs_root": str((tmp_path / "jobs").resolve()),
+            "ssh": {},
+            "runtime": {
+                "python_executable": "python3",
+                "conda_environment": "shardgrid",
+                "conda_prefix": "/opt/conda/envs/shardgrid",
+            },
+            "network": {"rendezvous_port": 29500},
+            "backend_preference": {
+                "launcher": "ssh",
+                "communication_backend": "nccl",
+                "parallel_engine": "galvatron",
+            },
+            "manual_override": {},
+            "workers": [
+                {
+                    "id": "gpu4060",
+                    "machine_id": "machine-c",
+                    "physical_os": "windows",
+                    "runtime_os": "wsl2_linux",
+                    "runtime": "wsl2",
+                    "host": "10.0.0.10",
+                    "ssh_user": "shardgrid",
+                },
+                {
+                    "id": "gpu1060",
+                    "machine_id": "machine-d",
+                    "physical_os": "windows",
+                    "runtime_os": "wsl2_linux",
+                    "runtime": "wsl2",
+                    "host": "10.0.0.11",
+                    "ssh_user": "shardgrid",
+                },
+                {
+                    "id": "gpu4060-cqupt",
+                    "machine_id": "machine-e",
+                    "physical_os": "windows",
+                    "runtime_os": "wsl2_linux",
+                    "runtime": "wsl2",
+                    "host": "10.0.0.12",
+                    "ssh_user": "shardgrid",
+                },
+            ],
+        }
+    )
+    training_path = tmp_path / "train-automatic.yaml"
+    training_path.write_text(
+        """
+job:
+  name: train-automatic
+  backend: ssh
+  communication_backend: nccl
+model:
+  name: tiny-sequential
+  type: minimal_sequential
+  stage_count: 2
+resources:
+  world_size: 4
+  preferred_workers: [gpu4060, gpu1060, gpu4060-cqupt]
+planning:
+  mode: automatic
+artifacts:
+  snapshot_name: train-automatic
+  keep_failed_snapshots: true
+  transport: auto
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    events: list[str] = []
+    planner_events: list[str] = []
+    resources = {
+        "gpu4060": _worker_resource(
+            worker_id="gpu4060",
+            host="10.0.0.10",
+            physical_os=PhysicalOS.WINDOWS,
+            runtime_os=RuntimeOS.WSL2_LINUX,
+            gpu_name="RTX 4060",
+            gpu_free_memory=8_000,
+        ),
+        "gpu1060": _worker_resource(
+            worker_id="gpu1060",
+            host="10.0.0.11",
+            physical_os=PhysicalOS.WINDOWS,
+            runtime_os=RuntimeOS.WSL2_LINUX,
+            gpu_name="GTX 1060",
+            gpu_free_memory=7_000,
+        ),
+        "gpu4060-cqupt": _worker_resource(
+            worker_id="gpu4060-cqupt",
+            host="10.0.0.12",
+            physical_os=PhysicalOS.WINDOWS,
+            runtime_os=RuntimeOS.WSL2_LINUX,
+            gpu_name="RTX 4060",
+            gpu_free_memory=8_000,
+        ),
+    }
+
+    class StaticDryRunEngine:
+        def prepare(self, job_snapshot: object, execution_plan: object):
+            del job_snapshot, execution_plan
+            events.append("engine_prepare")
+            raise AssertionError("dry-run must not call engine.prepare")
+
+        def launch_metadata(self, parallel_plan: ParallelPlan) -> dict[str, object]:
+            events.append("engine_launch_metadata")
+            return {
+                "engine": "galvatron",
+                "plan_mode": "static",
+                "parallel_plan_id": parallel_plan.parallel_plan_id,
+            }
+
+    class StaticSelectedEngine:
+        def __init__(self) -> None:
+            self.engine = StaticDryRunEngine()
+            self.candidate = ParallelEngineCandidate(
+                engine_id="galvatron",
+                name=as_engine_name("galvatron"),
+                status=BackendStatus.EXPERIMENTAL,
+                capabilities=["ssh", "nccl"],
+                limitations=["static fixture"],
+            )
+            self.parallel_plan = ParallelPlan(
+                parallel_plan_id="static-plan",
+                engine=as_engine_name("galvatron"),
+                model_name="tiny-sequential",
+                world_size=2,
+                stages=["stage0", "stage1"],
+                requirements={"plan_mode": "static"},
+            )
+            self.original_plan_path = None
+            self.rejected_engine_ids = ()
+
+    def probe_worker(worker):
+        events.append(f"probe:{worker.worker_id}")
+        return _probe_result(resources[str(worker.worker_id)])
+
+    def probe_network(worker_resources):
+        events.append("network")
+        links = []
+        for source in worker_resources:
+            for target in worker_resources:
+                if source.worker_id == target.worker_id:
+                    continue
+                links.append(
+                    NetworkLink(
+                        source_worker_id=source.worker_id,
+                        target_worker_id=target.worker_id,
+                        source_ip=source.ip or "10.0.0.10",
+                        target_ip=target.ip or "10.0.0.11",
+                        interface="eth0",
+                        tcp_reachable=True,
+                        bandwidth_mbps=940.0,
+                        latency_ms=0.8,
+                        port=29500,
+                        measured_at="2026-09-03T10:00:00+00:00",
+                    )
+                )
+        return NetworkState(
+            network_id="lan-auto",
+            workers=[item.worker_id for item in worker_resources],
+            links=links,
+            created_at="2026-09-03T10:00:00+00:00",
+            selected_interfaces={item.worker_id: "eth0" for item in worker_resources},
+        )
+
+    def select_engine(engine_id, job, resources, network, *, registry=None):
+        del engine_id, job, resources, network, registry
+        events.append("select_engine")
+        return StaticSelectedEngine()
+
+    def launcher_factory(backend: str):
+        del backend
+        events.append("launcher_factory")
+        raise AssertionError("dry-run must not create a launcher")
+
+    original_build_model_profile = job_manager_module.build_model_profile
+    original_search_joint_partition_placement = job_manager_module.search_joint_partition_placement
+    original_select_best_joint_placement_plan = job_manager_module.select_best_joint_placement_plan
+    original_build_automatic_parallel_plan = job_manager_module.build_automatic_parallel_plan
+
+    def wrapped_build_model_profile(*args, **kwargs):
+        planner_events.append("t109")
+        return original_build_model_profile(*args, **kwargs)
+
+    def wrapped_search_joint_partition_placement(*args, **kwargs):
+        planner_events.append("t111")
+        return original_search_joint_partition_placement(*args, **kwargs)
+
+    def wrapped_select_best_joint_placement_plan(*args, **kwargs):
+        planner_events.append("t112")
+        return original_select_best_joint_placement_plan(*args, **kwargs)
+
+    def wrapped_build_automatic_parallel_plan(*args, **kwargs):
+        planner_events.append("t114")
+        return original_build_automatic_parallel_plan(*args, **kwargs)
+
+    monkeypatch.setattr(job_manager_module, "build_model_profile", wrapped_build_model_profile)
+    monkeypatch.setattr(
+        job_manager_module,
+        "search_joint_partition_placement",
+        wrapped_search_joint_partition_placement,
+    )
+    monkeypatch.setattr(
+        job_manager_module,
+        "select_best_joint_placement_plan",
+        wrapped_select_best_joint_placement_plan,
+    )
+    monkeypatch.setattr(
+        job_manager_module,
+        "build_automatic_parallel_plan",
+        wrapped_build_automatic_parallel_plan,
+    )
+
+    manager = JobManager(
+        cluster_config,
+        probe_worker=probe_worker,
+        probe_network=probe_network,
+        select_engine=select_engine,
+        launcher_factory=launcher_factory,
+        source_root=Path(__file__).resolve().parents[2],
+    )
+
+    result = manager.run(training_path, job_id=as_job_id("job-auto-cli"), dry_run=True)
+    payload = train_command._payload(result)
+    human = train_command._render_human(result)
+    metadata_json = json.loads(
+        (Path(result.snapshot.root_path) / "diagnostics" / "snapshot-metadata.json").read_text()
+    )
+
+    assert planner_events == ["t109", "t111", "t112", "t114"]
+    assert events == [
+        "probe:gpu4060",
+        "probe:gpu1060",
+        "probe:gpu4060-cqupt",
+        "network",
+        "select_engine",
+        "engine_launch_metadata",
+    ]
+    assert result.parallel_plan is not None
+    assert result.parallel_plan.partition_source == "automatic"
+    assert result.parallel_plan.requirements["plan_mode"] == "automatic"
+    assert payload["plan_mode"] == "automatic"
+    assert payload["planning"]["partition_source"] == "automatic"
+    assert payload["planning"]["selected_worker_count"] == "2"
+    assert payload["planning"]["attempted_worker_counts"] == [2]
+    assert payload["planning"]["selected_workers"] == [
+        item["worker_id"] for item in payload["placement"]
+    ]
+    assert set(payload["planning"]["selected_workers"]) == {"gpu4060", "gpu4060-cqupt"}
+    assert payload["world_size"] == 2
+    assert len(payload["placement"]) == 2
+    assert len(payload["assignments"]) == 2
+    assert metadata_json["execution_plan_audit"]["plan_mode"] == "automatic"
+    assert metadata_json["execution_plan_audit"]["planning"] == payload["planning"]
+    assert "Plan Mode: automatic" in human
+    assert "Partition Source: automatic" in human
+    assert "Selected Worker Count: 2" in human
+    assert "Attempted Worker Counts: 2" in human
+    assert "Selected Workers: gpu4060, gpu4060-cqupt" in human
+
+
+def test_static_dry_run_path_still_uses_engine_plan(tmp_path: Path) -> None:
+    cluster_config = ClusterConfig.from_dict(
+        {
+            "control": {"machine_id": "machine-a", "hostname": "control-a.local"},
+            "jobs_root": str((tmp_path / "jobs").resolve()),
+            "ssh": {},
+            "runtime": {
+                "python_executable": "python3",
+                "conda_environment": "shardgrid",
+                "conda_prefix": "/opt/conda/envs/shardgrid",
+            },
+            "network": {"rendezvous_port": 29500},
+            "backend_preference": {
+                "launcher": "ssh",
+                "communication_backend": "nccl",
+                "parallel_engine": "galvatron",
+            },
+            "manual_override": {},
+            "workers": [
+                {
+                    "id": "gpu4060",
+                    "machine_id": "machine-c",
+                    "physical_os": "windows",
+                    "runtime_os": "wsl2_linux",
+                    "runtime": "wsl2",
+                    "host": "10.0.0.10",
+                    "ssh_user": "shardgrid",
+                },
+                {
+                    "id": "gpu1060",
+                    "machine_id": "machine-d",
+                    "physical_os": "windows",
+                    "runtime_os": "wsl2_linux",
+                    "runtime": "wsl2",
+                    "host": "10.0.0.11",
+                    "ssh_user": "shardgrid",
+                },
+            ],
+        }
+    )
+    training_path = tmp_path / "train-static.yaml"
+    training_path.write_text(
+        """
+job:
+  name: train-static
+  backend: ssh
+  communication_backend: nccl
+model:
+  name: tiny-sequential
+  type: minimal_sequential
+resources:
+  world_size: 2
+  preferred_workers: [gpu4060, gpu1060]
+artifacts:
+  snapshot_name: train-static
+  keep_failed_snapshots: true
+  transport: auto
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    events: list[str] = []
+    resources = {
+        "gpu4060": _worker_resource(
+            worker_id="gpu4060",
+            host="10.0.0.10",
+            physical_os=PhysicalOS.WINDOWS,
+            runtime_os=RuntimeOS.WSL2_LINUX,
+            gpu_name="RTX 4060",
+            gpu_free_memory=8_000,
+        ),
+        "gpu1060": _worker_resource(
+            worker_id="gpu1060",
+            host="10.0.0.11",
+            physical_os=PhysicalOS.WINDOWS,
+            runtime_os=RuntimeOS.WSL2_LINUX,
+            gpu_name="GTX 1060",
+            gpu_free_memory=7_000,
+        ),
+    }
+
+    class StaticDryRunEngine:
+        def prepare(self, job_snapshot: object, execution_plan: object):
+            del job_snapshot, execution_plan
+            events.append("engine_prepare")
+            raise AssertionError("dry-run must not call engine.prepare")
+
+        def launch_metadata(self, parallel_plan: ParallelPlan) -> dict[str, object]:
+            events.append("engine_launch_metadata")
+            return {
+                "engine": "galvatron",
+                "plan_mode": "static",
+                "parallel_plan_id": parallel_plan.parallel_plan_id,
+            }
+
+    class StaticSelectedEngine:
+        def __init__(self) -> None:
+            self.engine = StaticDryRunEngine()
+            self.candidate = ParallelEngineCandidate(
+                engine_id="galvatron",
+                name=as_engine_name("galvatron"),
+                status=BackendStatus.EXPERIMENTAL,
+                capabilities=["ssh", "nccl"],
+                limitations=["static fixture"],
+            )
+            self.parallel_plan = ParallelPlan(
+                parallel_plan_id="static-plan",
+                engine=as_engine_name("galvatron"),
+                model_name="tiny-sequential",
+                world_size=2,
+                stages=["stage0", "stage1"],
+                requirements={"plan_mode": "static"},
+            )
+            self.original_plan_path = None
+            self.rejected_engine_ids = ()
+
+    def probe_worker(worker):
+        events.append(f"probe:{worker.worker_id}")
+        return _probe_result(resources[str(worker.worker_id)])
+
+    def probe_network(worker_resources):
+        del worker_resources
+        events.append("network")
+        return _network_state()
+
+    def select_engine(engine_id, job, resources, network, *, registry=None):
+        del engine_id, job, resources, network, registry
+        events.append("select_engine")
+        return StaticSelectedEngine()
+
+    def launcher_factory(backend: str):
+        del backend
+        events.append("launcher_factory")
+        raise AssertionError("dry-run must not create a launcher")
+
+    manager = JobManager(
+        cluster_config,
+        probe_worker=probe_worker,
+        probe_network=probe_network,
+        select_engine=select_engine,
+        launcher_factory=launcher_factory,
+        source_root=Path(__file__).resolve().parents[2],
+    )
+
+    result = manager.run(training_path, job_id=as_job_id("job-static-cli"), dry_run=True)
+    payload = train_command._payload(result)
+
+    assert result.parallel_plan is not None
+    assert result.parallel_plan.partition_source is None
+    assert payload["plan_mode"] == "static"
+    assert payload["planning"]["partition_source"] == "manual"
+    assert payload["world_size"] == 2
+    assert events == [
+        "probe:gpu4060",
+        "probe:gpu1060",
+        "network",
+        "select_engine",
+        "engine_launch_metadata",
+    ]

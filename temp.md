@@ -93,3 +93,26 @@ NOT part of T116
 ```
 
 Automatic-plan real hardware training remains a later hardware gate.
+
+## CLI Integration
+
+Automatic planner is reachable from the real `shardgrid train` CLI.
+
+```text
+automatic config
+-> T109 profile
+-> T111 worker-count search + placement
+-> T112 selection
+-> T114 ParallelPlan
+-> T115 ExecutionPlan
+-> dry-run audit
+```
+
+Verified:
+
+```text
+plan_mode=automatic
+partition_source=automatic
+```
+
+Static/manual path remains available for compatibility.

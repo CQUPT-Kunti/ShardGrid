@@ -136,6 +136,7 @@ def _render_human(result: JobRunResult) -> str:
     lines = [
         f"Job: {payload['job_id']}",
         f"Dry Run: {'YES' if payload['dry_run'] else 'NO'}",
+        f"Plan Mode: {payload.get('plan_mode')}",
         f"Engine: {payload['engine']}",
         f"Backend: {payload['backend']}",
         f"State: {str(payload['state']).upper()}",
@@ -165,6 +166,27 @@ def _render_human(result: JobRunResult) -> str:
                 lines.append(f"{label}: {original_plan.get(key)}")
     if payload.get("placement_reason"):
         lines.append(f"Placement Reason: {payload['placement_reason']}")
+    planning = payload.get("planning")
+    if isinstance(planning, dict):
+        if planning.get("partition_source"):
+            lines.append(f"Partition Source: {planning.get('partition_source')}")
+        if planning.get("selected_candidate_id"):
+            lines.append(f"Selected Candidate: {planning.get('selected_candidate_id')}")
+        if planning.get("selected_worker_count"):
+            lines.append(f"Selected Worker Count: {planning.get('selected_worker_count')}")
+        attempted = planning.get("attempted_worker_counts")
+        if isinstance(attempted, list) and attempted:
+            lines.append(
+                "Attempted Worker Counts: " + ", ".join(str(item) for item in attempted)
+            )
+        selected_workers = planning.get("selected_workers")
+        if isinstance(selected_workers, list) and selected_workers:
+            lines.append("Selected Workers: " + ", ".join(str(item) for item in selected_workers))
+        if planning.get("total_cross_worker_communication_bytes"):
+            lines.append(
+                "Cross-Worker Communication Bytes: "
+                f"{planning.get('total_cross_worker_communication_bytes')}"
+            )
     if payload["snapshot_path"] is not None:
         lines.append(f"Snapshot: {payload['snapshot_path']}")
         lines.append(f"Original Parallel Plan: {payload['original_parallel_plan_path']}")

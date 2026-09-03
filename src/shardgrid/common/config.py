@@ -499,11 +499,17 @@ class TrainingCheckpointConsolidationConfig:
 
 
 @dataclass(frozen=True)
+class TrainingPlanningConfig:
+    mode: str = "static"
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     job: TrainingJobConfig
     model: TrainingModelConfig
     resources: TrainingResourcesConfig
     artifacts: TrainingArtifactsConfig
+    planning: TrainingPlanningConfig = field(default_factory=TrainingPlanningConfig)
 
     @classmethod
     def from_dict(cls, data: object) -> TrainingConfig:
@@ -513,6 +519,9 @@ class TrainingConfig:
         resources_payload = _require_mapping(payload.get("resources"), field_name="resources")
         artifacts_payload = _require_mapping(
             payload.get("artifacts", {}), field_name="artifacts"
+        )
+        planning_payload = _require_mapping(
+            payload.get("planning", {}), field_name="planning"
         )
         checkpoint_payload = _require_mapping(
             artifacts_payload.get("checkpoint", {}), field_name="artifacts.checkpoint"
@@ -528,6 +537,14 @@ class TrainingConfig:
         if consolidation_device not in {"auto", "cpu", "cuda"}:
             raise ConfigValidationError(
                 "artifacts.checkpoint.consolidation.device must be one of: auto, cpu, cuda"
+            )
+        planning_mode = _require_string(
+            planning_payload.get("mode", "static"),
+            field_name="planning.mode",
+        ).lower()
+        if planning_mode not in {"static", "automatic"}:
+            raise ConfigValidationError(
+                "planning.mode must be one of: static, automatic"
             )
         return cls(
             job=TrainingJobConfig(
@@ -605,6 +622,7 @@ class TrainingConfig:
                     )
                 ),
             ),
+            planning=TrainingPlanningConfig(mode=planning_mode),
         )
 
     def to_dict(self) -> dict[str, Any]:
