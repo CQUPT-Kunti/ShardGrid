@@ -26,6 +26,11 @@ def _optional_int(data: dict[str, Any], key: str) -> int | None:
     return None if value is None else int(value)
 
 
+def _optional_float(data: dict[str, Any], key: str) -> float | None:
+    value = data.get(key)
+    return None if value is None else float(value)
+
+
 @dataclass(frozen=True)
 class ParallelEngineCandidate:
     engine_id: str
@@ -485,6 +490,289 @@ class CompatibilitySpikeReport:
 
 
 @dataclass(frozen=True)
+class ParallelPlanPlacement:
+    worker_id: str
+    rank: int
+    machine_id: str | None = None
+    gpu_index: int = 0
+    usable_memory_before_bytes: int | None = None
+    remaining_memory_bytes: int | None = None
+    utilization_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.worker_id.strip():
+            raise ValueError("worker_id must be a non-empty string")
+        if self.rank < 0:
+            raise ValueError("rank must be >= 0")
+        if self.gpu_index < 0:
+            raise ValueError("gpu_index must be >= 0")
+        for field_name in (
+            "usable_memory_before_bytes",
+            "remaining_memory_bytes",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and value < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+        if self.utilization_ratio is not None and self.utilization_ratio < 0:
+            raise ValueError("utilization_ratio must be >= 0")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ParallelPlanPlacement":
+        return cls(
+            worker_id=str(data["worker_id"]),
+            rank=int(data["rank"]),
+            machine_id=data.get("machine_id"),
+            gpu_index=int(data.get("gpu_index", 0)),
+            usable_memory_before_bytes=_optional_int(
+                data, "usable_memory_before_bytes"
+            ),
+            remaining_memory_bytes=_optional_int(data, "remaining_memory_bytes"),
+            utilization_ratio=_optional_float(data, "utilization_ratio"),
+        )
+
+
+@dataclass(frozen=True)
+class ParallelPlanStage:
+    stage_id: str
+    rank: int
+    module_ids: tuple[str, ...]
+    module_paths: tuple[str, ...]
+    start_index: int
+    stop_index: int
+    boundary_before_id: str | None = None
+    boundary_after_id: str | None = None
+    parameter_names_or_ranges: tuple[str, ...] = ()
+    parameter_bytes: int = 0
+    gradient_bytes: int | None = None
+    activation_bytes: int | None = None
+    estimated_compute_units: int = 0
+    estimated_peak_training_memory: TrainingMemoryEstimate = TrainingMemoryEstimate()
+    required_runtime: str | None = None
+    required_backends: tuple[str, ...] = ()
+    placement: ParallelPlanPlacement | None = None
+
+    def __post_init__(self) -> None:
+        if not self.stage_id.strip():
+            raise ValueError("stage_id must be a non-empty string")
+        if self.rank < 0:
+            raise ValueError("rank must be >= 0")
+        if not self.module_ids:
+            raise ValueError("module_ids must not be empty")
+        if not self.module_paths:
+            raise ValueError("module_paths must not be empty")
+        if len(self.module_ids) != len(self.module_paths):
+            raise ValueError("module_ids and module_paths must align")
+        if self.start_index < 0 or self.stop_index <= self.start_index:
+            raise ValueError("stage indices must define a non-empty range")
+        for field_name in ("parameter_bytes", "estimated_compute_units"):
+            if getattr(self, field_name) < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+        for field_name in ("gradient_bytes", "activation_bytes"):
+            value = getattr(self, field_name)
+            if value is not None and value < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ParallelPlanStage":
+        return cls(
+            stage_id=str(data["stage_id"]),
+            rank=int(data["rank"]),
+            module_ids=tuple(str(item) for item in data.get("module_ids", ())),
+            module_paths=tuple(str(item) for item in data.get("module_paths", ())),
+            start_index=int(data["start_index"]),
+            stop_index=int(data["stop_index"]),
+            boundary_before_id=data.get("boundary_before_id"),
+            boundary_after_id=data.get("boundary_after_id"),
+            parameter_names_or_ranges=tuple(
+                str(item) for item in data.get("parameter_names_or_ranges", ())
+            ),
+            parameter_bytes=int(data.get("parameter_bytes", 0)),
+            gradient_bytes=_optional_int(data, "gradient_bytes"),
+            activation_bytes=_optional_int(data, "activation_bytes"),
+            estimated_compute_units=int(data.get("estimated_compute_units", 0)),
+            estimated_peak_training_memory=TrainingMemoryEstimate.from_dict(
+                data.get("estimated_peak_training_memory", {})
+            ),
+            required_runtime=data.get("required_runtime"),
+            required_backends=tuple(
+                str(item) for item in data.get("required_backends", ())
+            ),
+            placement=(
+                None
+                if data.get("placement") is None
+                else ParallelPlanPlacement.from_dict(data["placement"])
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ParallelPlanCommunicationEdge:
+    source_stage_id: str
+    target_stage_id: str
+    source_module_id: str
+    target_module_id: str
+    activation: tuple[TensorMetadata, ...] = ()
+    gradient: tuple[TensorMetadata, ...] = ()
+    activation_bytes: int | None = None
+    gradient_bytes: int | None = None
+    estimated_bytes_per_step: int | None = None
+    estimate_kind: EstimateKind = EstimateKind.UNKNOWN
+    bandwidth_mbps: float | None = None
+    latency_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "source_stage_id",
+            "target_stage_id",
+            "source_module_id",
+            "target_module_id",
+        ):
+            if not getattr(self, field_name).strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+        for field_name in (
+            "activation_bytes",
+            "gradient_bytes",
+            "estimated_bytes_per_step",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and value < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+        for field_name in ("bandwidth_mbps", "latency_ms"):
+            value = getattr(self, field_name)
+            if value is not None and value < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+        if self.activation_bytes is None:
+            object.__setattr__(
+                self,
+                "activation_bytes",
+                sum(
+                    tensor.estimated_bytes or 0 for tensor in self.activation
+                ) or None,
+            )
+        if self.gradient_bytes is None:
+            object.__setattr__(
+                self,
+                "gradient_bytes",
+                sum(
+                    tensor.estimated_bytes or 0 for tensor in self.gradient
+                ) or None,
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ParallelPlanCommunicationEdge":
+        return cls(
+            source_stage_id=str(data["source_stage_id"]),
+            target_stage_id=str(data["target_stage_id"]),
+            source_module_id=str(data["source_module_id"]),
+            target_module_id=str(data["target_module_id"]),
+            activation=tuple(
+                TensorMetadata.from_dict(item) for item in data.get("activation", ())
+            ),
+            gradient=tuple(
+                TensorMetadata.from_dict(item) for item in data.get("gradient", ())
+            ),
+            activation_bytes=_optional_int(data, "activation_bytes"),
+            gradient_bytes=_optional_int(data, "gradient_bytes"),
+            estimated_bytes_per_step=_optional_int(data, "estimated_bytes_per_step"),
+            estimate_kind=EstimateKind(
+                data.get("estimate_kind", EstimateKind.UNKNOWN.value)
+            ),
+            bandwidth_mbps=_optional_float(data, "bandwidth_mbps"),
+            latency_ms=_optional_float(data, "latency_ms"),
+        )
+
+
+@dataclass(frozen=True)
+class ParallelPlanAttempt:
+    worker_count: int
+    worker_ids: tuple[str, ...]
+    candidate_id: str | None = None
+    status: str = "unknown"
+    reasons: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.worker_count <= 0:
+            raise ValueError("worker_count must be > 0")
+        if not self.worker_ids:
+            raise ValueError("worker_ids must not be empty")
+        if not self.status.strip():
+            raise ValueError("status must be a non-empty string")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ParallelPlanAttempt":
+        return cls(
+            worker_count=int(data["worker_count"]),
+            worker_ids=tuple(str(item) for item in data.get("worker_ids", ())),
+            candidate_id=data.get("candidate_id"),
+            status=str(data.get("status", "unknown")),
+            reasons=tuple(str(item) for item in data.get("reasons", ())),
+        )
+
+
+@dataclass(frozen=True)
+class ParallelPlanProvenance:
+    partition_source: str = "automatic"
+    model_profile_id: str | None = None
+    selected_candidate_id: str | None = None
+    selected_worker_count: int | None = None
+    attempted_worker_counts: tuple[int, ...] = ()
+    attempts: tuple[ParallelPlanAttempt, ...] = ()
+    partition_algorithm: str | None = None
+    total_cross_worker_communication_bytes: int | None = None
+    selected_reason: str | None = None
+    fallback_reason: str | None = None
+    rejection_reasons: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.partition_source.strip():
+            raise ValueError("partition_source must be a non-empty string")
+        if self.selected_worker_count is not None and self.selected_worker_count <= 0:
+            raise ValueError("selected_worker_count must be > 0")
+        if (
+            self.total_cross_worker_communication_bytes is not None
+            and self.total_cross_worker_communication_bytes < 0
+        ):
+            raise ValueError("total_cross_worker_communication_bytes must be >= 0")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ParallelPlanProvenance":
+        return cls(
+            partition_source=str(data.get("partition_source", "automatic")),
+            model_profile_id=data.get("model_profile_id"),
+            selected_candidate_id=data.get("selected_candidate_id"),
+            selected_worker_count=_optional_int(data, "selected_worker_count"),
+            attempted_worker_counts=tuple(
+                int(item) for item in data.get("attempted_worker_counts", ())
+            ),
+            attempts=tuple(
+                ParallelPlanAttempt.from_dict(item) for item in data.get("attempts", ())
+            ),
+            partition_algorithm=data.get("partition_algorithm"),
+            total_cross_worker_communication_bytes=_optional_int(
+                data, "total_cross_worker_communication_bytes"
+            ),
+            selected_reason=data.get("selected_reason"),
+            fallback_reason=data.get("fallback_reason"),
+            rejection_reasons=tuple(str(item) for item in data.get("rejection_reasons", ())),
+        )
+
+
+@dataclass(frozen=True)
 class ParallelPlan:
     parallel_plan_id: str
     engine: EngineName
@@ -492,12 +780,25 @@ class ParallelPlan:
     model_name: str = ""
     world_size: int = 1
     stages: list[str] = field(default_factory=list)
+    partition_source: str | None = None
+    model_profile_id: str | None = None
+    selected_candidate_id: str | None = None
+    candidate_evaluation_ref: str | None = None
+    stage_metadata: list[ParallelPlanStage] = field(default_factory=list)
+    communication_edges: list[ParallelPlanCommunicationEdge] = field(default_factory=list)
+    planning_provenance: ParallelPlanProvenance | None = None
     requirements: dict[str, str] = field(default_factory=dict)
     limitations: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.world_size <= 0:
             raise ValueError("world_size must be > 0")
+        if self.stage_metadata and len(self.stage_metadata) != self.world_size:
+            raise ValueError("stage_metadata count must match world_size")
+        if self.stages and self.stage_metadata:
+            metadata_ids = [stage.stage_id for stage in self.stage_metadata]
+            if self.stages != metadata_ids:
+                raise ValueError("stages must match stage_metadata stage ids")
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(self)
@@ -511,6 +812,23 @@ class ParallelPlan:
             model_name=str(data.get("model_name", "")),
             world_size=int(data.get("world_size", 1)),
             stages=[str(item) for item in data.get("stages", [])],
+            partition_source=data.get("partition_source"),
+            model_profile_id=data.get("model_profile_id"),
+            selected_candidate_id=data.get("selected_candidate_id"),
+            candidate_evaluation_ref=data.get("candidate_evaluation_ref"),
+            stage_metadata=[
+                ParallelPlanStage.from_dict(item)
+                for item in data.get("stage_metadata", [])
+            ],
+            communication_edges=[
+                ParallelPlanCommunicationEdge.from_dict(item)
+                for item in data.get("communication_edges", [])
+            ],
+            planning_provenance=(
+                None
+                if data.get("planning_provenance") is None
+                else ParallelPlanProvenance.from_dict(data["planning_provenance"])
+            ),
             requirements={
                 str(key): str(value)
                 for key, value in data.get("requirements", {}).items()

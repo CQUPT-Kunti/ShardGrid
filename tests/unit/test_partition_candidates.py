@@ -114,6 +114,7 @@ def test_minimal_transformer_generates_automatic_candidates_without_stage_fixtur
         memory_config=_memory_config(),
         required_backends=("nccl", "gloo"),
     )
+    support = discover_partition_support(model, profile, sample_args=(input_ids,))
 
     result_a = build_partition_profile(
         model,
@@ -130,12 +131,24 @@ def test_minimal_transformer_generates_automatic_candidates_without_stage_fixtur
         original_engine_plan_ref="/tmp/engine-plan.json",
     )
 
+    assert support.status.value == "supported"
+    assert any(
+        "embed->blocks.0.ln1" in boundary.forward_dependencies
+        for boundary in support.boundaries
+    )
+    assert all(
+        "embed->pos" not in boundary.forward_dependencies
+        for boundary in support.boundaries
+    )
     assert result_a.status == FeasibilityStatus.FEASIBLE
     assert len(result_a.candidates) >= 1
     assert [candidate.candidate_id for candidate in result_a.candidates] == [
         candidate.candidate_id for candidate in result_b.candidates
     ]
-    assert all(candidate.original_engine_plan_ref == "/tmp/engine-plan.json" for candidate in result_a.candidates)
+    assert all(
+        candidate.original_engine_plan_ref == "/tmp/engine-plan.json"
+        for candidate in result_a.candidates
+    )
 
 
 def test_residual_skip_model_generates_candidates_and_preserves_skip_dependencies() -> None:
@@ -197,6 +210,73 @@ def test_feasible_candidates_cover_each_parameter_exactly_once() -> None:
         assert actual == expected
 
 
+def test_partition_candidates_respect_usable_memory_margin() -> None:
+    model = build_partition_stress_model(seed=42)
+    inputs, _targets = make_training_batch(seed=41, step=0)
+    profile = build_model_profile(
+        model,
+        engine_id="pytorch_pipeline",
+        model_name="partition-stress-model",
+        sample_args=(inputs,),
+        memory_config=_memory_config(),
+    )
+
+    result = build_partition_profile(
+        model,
+        profile,
+        sample_args=(inputs,),
+        memory_config=_memory_config(),
+        usable_memory_bytes=(120_000, 120_000, 120_000),
+        max_stage_count=3,
+    )
+
+    by_stage_count = {candidate.stage_count: candidate for candidate in result.candidates}
+
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert by_stage_count[2].hard_constraint_status == FeasibilityStatus.INFEASIBLE
+    assert any(
+        "usable GPU memory after headroom" in reason
+        for reason in by_stage_count[2].rejection_reasons
+    )
+    assert by_stage_count[3].hard_constraint_status == FeasibilityStatus.FEASIBLE
+    assert all(
+        stage.estimated_peak_training_memory.planner_required_bytes <= 120_000
+        for stage in by_stage_count[3].stages
+    )
+
+
+def test_equal_capacity_partition_avoids_extreme_imbalance() -> None:
+    model = build_partition_stress_model(seed=42)
+    inputs, _targets = make_training_batch(seed=43, step=0)
+    profile = build_model_profile(
+        model,
+        engine_id="pytorch_pipeline",
+        model_name="partition-stress-model",
+        sample_args=(inputs,),
+        memory_config=_memory_config(),
+    )
+
+    result = build_partition_profile(
+        model,
+        profile,
+        sample_args=(inputs,),
+        memory_config=_memory_config(),
+        usable_memory_bytes=(400_000, 400_000),
+        max_stage_count=2,
+    )
+    candidate = next(
+        candidate for candidate in result.candidates if candidate.stage_count == 2
+    )
+
+    assert candidate.hard_constraint_status == FeasibilityStatus.FEASIBLE
+    assert 10 <= candidate.stages[0].stop_index <= 18
+    stage_bytes = [
+        stage.estimated_peak_training_memory.planner_required_bytes
+        for stage in candidate.stages
+    ]
+    assert max(stage_bytes) - min(stage_bytes) < 80_000
+
+
 class DynamicControlFlowModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -246,6 +326,16 @@ class SharedParameterModel(nn.Module):
         hidden = self.left(x)
         hidden = self.right(hidden)
         return self.out(hidden)
+
+
+class ImbalancedTwoStageModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.small = nn.Linear(4, 4)
+        self.big = nn.Linear(4, 4096)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.big(self.small(x))
 
 
 def test_untraceable_dynamic_control_flow_returns_structured_unsupported() -> None:
@@ -311,12 +401,47 @@ def test_shared_parameter_boundary_is_rejected_explicitly() -> None:
     )
 
     assert result.candidates
-    assert all(
-        candidate.hard_constraint_status is not FeasibilityStatus.FEASIBLE
+    assert any(
+        candidate.hard_constraint_status is FeasibilityStatus.FEASIBLE
         for candidate in result.candidates
     )
     assert any(
         "shared/tied parameter crosses boundary" in reason
         for candidate in result.candidates
         for reason in candidate.rejection_reasons
+    )
+    assert all(
+        "b0000" not in candidate.selected_boundary_ids
+        for candidate in result.candidates
+        if candidate.hard_constraint_status is FeasibilityStatus.FEASIBLE
+    )
+
+
+def test_extreme_imbalance_is_infeasible_for_similar_gpu_capacities() -> None:
+    model = ImbalancedTwoStageModel()
+    sample = torch.ones((2, 4))
+    profile = build_model_profile(
+        model,
+        engine_id="pytorch_pipeline",
+        model_name="imbalanced-two-stage-model",
+        sample_args=(sample,),
+        memory_config=_memory_config(),
+    )
+
+    result = build_partition_profile(
+        model,
+        profile,
+        sample_args=(sample,),
+        memory_config=_memory_config(),
+        usable_memory_bytes=(100_000_000, 100_000_000),
+        min_stage_count=2,
+        max_stage_count=2,
+    )
+
+    assert result.status == FeasibilityStatus.INFEASIBLE
+    assert result.candidates
+    assert result.candidates[0].hard_constraint_status == FeasibilityStatus.INFEASIBLE
+    assert any(
+        "capacity-aware imbalance is too extreme" in reason
+        for reason in result.candidates[0].rejection_reasons
     )

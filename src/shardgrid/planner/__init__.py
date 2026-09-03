@@ -1,5 +1,10 @@
 """Planner package skeleton for ShardGrid."""
 
+from .execution_plan import (
+    build_automatic_parallel_plan,
+    validate_automatic_parallel_plan,
+    validate_automatic_parallel_plan_or_raise,
+)
 from .memory import (
     MemoryEstimationConfig,
     StageMemoryFit,
@@ -20,6 +25,12 @@ from .partitioning import (
     generate_partition_candidates,
     validate_partition_candidate,
 )
+from .placement import (
+    JointPlacementPlan,
+    StagePlacement,
+    WorkerSubsetAttempt,
+    search_joint_partition_placement,
+)
 from .requirements import (
     CommunicationRequirement,
     ConstraintViolation,
@@ -34,8 +45,14 @@ from .requirements import (
     validate_partition_boundary,
     validate_placement_feasibility,
 )
+from .scoring import (
+    PlanMemorySummary,
+    select_best_joint_placement_plan,
+    summarize_plan_memory_utilization,
+)
 
 __all__ = [
+    "JointPlacementPlan",
     "MemoryEstimationConfig",
     "StageMemoryFit",
     "CommunicationRequirement",
@@ -48,18 +65,27 @@ __all__ = [
     "estimate_stage_memory",
     "evaluate_stage_memory_fit",
     "FeasibilityStatus",
+    "build_automatic_parallel_plan",
     "MemoryConstraint",
     "normalize_dtype_name",
     "PartitionCandidate",
     "PartitionGenerationResult",
     "ParallelPlanningRequirements",
+    "PlanMemorySummary",
     "PlacementFeasibilityResult",
     "PlacementRequirements",
+    "search_joint_partition_placement",
+    "select_best_joint_placement_plan",
     "StageCommunicationEdge",
+    "StagePlacement",
     "StagePartition",
+    "summarize_plan_memory_utilization",
+    "validate_automatic_parallel_plan",
+    "validate_automatic_parallel_plan_or_raise",
     "generate_partition_candidates",
     "WorkerEligibilityRequirements",
     "WorkerEligibilityResult",
+    "WorkerSubsetAttempt",
     "evaluate_worker_eligibility",
     "validate_partition_candidate",
     "validate_partition_boundary",
