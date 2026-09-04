@@ -117,6 +117,21 @@ def test_status_store_persists_terminal_states_and_repeated_updates(tmp_path: Pa
     assert store.load("job-0091") == repeated
 
 
+def test_status_store_reserves_and_releases_worker_gpus(tmp_path: Path) -> None:
+    store = StatusStore(tmp_path)
+    assignments = _assignments()
+
+    assert store.reserve_resources("job-a", assignments) == []
+    conflicts = store.reserve_resources("job-b", [assignments[0]])
+    assert conflicts[0]["job_id"] == "job-a"
+    assert conflicts[0]["worker_id"] == "gpu4060"
+
+    store.release_resources("job-a")
+
+    assert store.active_reservations() == []
+    assert store.reserve_resources("job-b", [assignments[0]]) == []
+
+
 def test_job_status_allows_legal_transitions_and_rejects_illegal_terminal_backtracking() -> None:
     status = JobStatus(job_id=as_job_id("job-0091"), state=JobState.CREATED, phase="created")
 

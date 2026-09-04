@@ -226,7 +226,10 @@ class JobManager:
             raise_or_return = self._failed_run_result(job, current)
             return raise_or_return
 
-        worker_resources = [result.worker_resource for result in probe_results]
+        worker_resources = self._apply_active_resource_reservations(
+            [result.worker_resource for result in probe_results],
+            current_job_id=job.job_id,
+        )
         cluster_state = self._resource_manager.build_cluster_state(
             worker_resources,
             network_state=None,
@@ -476,6 +479,42 @@ class JobManager:
                 launcher_result=distribute_result,
             )
 
+        conflicts = self._status_store.reserve_resources(job.job_id, execution_plan.workers)
+        if conflicts:
+            current = self._failed_status(
+                self._load_status(snapshot, current),
+                phase="launch",
+                failure=make_failure_record(
+                    stage=FailureStage.LAUNCH,
+                    host=str(self.cluster_config.control.hostname),
+                    message="GPU resource reservation conflict before launch",
+                    recommended_action="wait for the running job to finish or choose different workers",
+                    runtime_environment={
+                        "conflicts": json.dumps(conflicts, sort_keys=True),
+                    },
+                    secrets=self._secrets,
+                ),
+            )
+            self._save_terminal_snapshot(
+                snapshot,
+                job,
+                training_config,
+                selected_engine.parallel_plan,
+                execution_plan,
+                network_state,
+                current,
+            )
+            return self._failed_run_result(
+                job,
+                current,
+                snapshot=snapshot,
+                execution_plan=execution_plan,
+                parallel_plan=selected_engine.parallel_plan,
+                cluster_state=cluster_state,
+                network_state=network_state,
+                launcher_result=distribute_result,
+            )
+
         current = self._persist_status(
             self._load_status(snapshot, current),
             snapshot=snapshot,
@@ -503,6 +542,7 @@ class JobManager:
                 network_state,
                 current,
             )
+            self._status_store.release_resources(job.job_id)
             return self._failed_run_result(
                 job,
                 current,
@@ -541,6 +581,7 @@ class JobManager:
                 context=replace(context, job_status=current),
             )
             current = self._load_status(snapshot, current)
+            self._status_store.release_resources(job.job_id)
             self._save_terminal_snapshot(
                 snapshot,
                 job,
@@ -561,6 +602,7 @@ class JobManager:
                 launcher_result=monitor_result,
             )
 
+        self._status_store.release_resources(job.job_id)
         current = self._persist_status(
             current,
             snapshot=snapshot,
@@ -1054,7 +1096,12 @@ class JobManager:
         stage_id: str,
     ) -> dict[str, str]:
         if parallel_plan.partition_source == "automatic":
-            automatic_microbatches = max(2, parallel_plan.world_size)
+            parameters = training_config.model.parameters
+            automatic_microbatches = max(
+                2,
+                parallel_plan.world_size,
+                int(parameters.get("microbatch_count", parallel_plan.world_size)),
+            )
             return {
                 "SHARDGRID_PLAN_MODE": "automatic",
                 "SHARDGRID_PARTITION_SOURCE": "automatic",
@@ -1062,8 +1109,8 @@ class JobManager:
                 "SHARDGRID_AUTOMATIC_STAGE_ID": stage_id,
                 "SHARDGRID_AUTOMATIC_MODEL_NAME": training_config.model.name,
                 "SHARDGRID_AUTOMATIC_MODEL_TYPE": training_config.model.type,
-                "SHARDGRID_AUTOMATIC_STEPS": "5",
-                "SHARDGRID_AUTOMATIC_LR": "1e-3",
+                "SHARDGRID_AUTOMATIC_STEPS": str(int(parameters.get("training_steps", 5))),
+                "SHARDGRID_AUTOMATIC_LR": str(parameters.get("learning_rate", "1e-3")),
                 "SHARDGRID_AUTOMATIC_MICROBATCHES": str(automatic_microbatches),
                 "SHARDGRID_AUTOMATIC_CHECKPOINT_DIR": "checkpoint",
             }
@@ -1198,6 +1245,28 @@ class JobManager:
             ),
         )
         return updated_plan, refreshed_cluster, refreshed_network
+
+    def _apply_active_resource_reservations(
+        self,
+        resources: list[WorkerResource],
+        *,
+        current_job_id: JobId,
+    ) -> list[WorkerResource]:
+        reserved = {
+            (str(item.get("worker_id")), int(item.get("gpu_index", 0)))
+            for item in self._status_store.active_reservations()
+            if str(item.get("job_id")) != str(current_job_id)
+        }
+        if not reserved:
+            return resources
+        adjusted: list[WorkerResource] = []
+        for resource in resources:
+            key = (str(resource.worker_id), 0)
+            if key in reserved:
+                adjusted.append(replace(resource, gpu_free_memory=0, gpu_utilization=100.0))
+            else:
+                adjusted.append(resource)
+        return adjusted
 
     def _revalidate_execution_resources(
         self,
@@ -1395,8 +1464,27 @@ class JobManager:
             model = build_partition_stress_model(seed=42)
             inputs, _targets = make_training_batch(seed=42, step=0)
             return model, (inputs,), {}
+        if training_config.model.type == "large_residual_transformer":
+            from examples.models.large_residual_transformer import (
+                LargeResidualTransformerConfig,
+                build_large_residual_transformer,
+                make_large_residual_batch,
+            )
+
+            config = LargeResidualTransformerConfig.from_mapping(
+                training_config.model.parameters
+            )
+            model = build_large_residual_transformer(config, seed=42, device="meta")
+            inputs, _targets = make_large_residual_batch(
+                config,
+                seed=42,
+                step=0,
+                device="meta",
+            )
+            return model, (inputs,), {}
         raise ValueError(
-            "automatic planning supports model.type minimal_sequential or hf_style"
+            "automatic planning supports model.type minimal_sequential, hf_style, "
+            "or large_residual_transformer"
         )
 
     def _planner_memory_config(self) -> MemoryEstimationConfig:

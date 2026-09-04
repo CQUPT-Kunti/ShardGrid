@@ -60,3 +60,27 @@
   - automatic live path keeps planner-owned split decisions from `ParallelPlan.stage_metadata`, including stage module paths, selected candidate id, selected worker count, attempted worker counts, and cross-worker communication bytes
   - launch-time code does not recompute partition or placement; it only validates the saved plan against fresh worker/network state
   - status on 2026-09-03: implementation and local regression coverage passed; live hardware evidence remains pending because this turn did not execute a real worker run
+
+## 2026-09-04 Automatic Stage-Local Materialization
+
+- worker runtime path: `examples/models/train_automatic_plan.py` no longer uses `build_large_residual_transformer() -> pipeline(full_model) -> get_stage_module()` for `large_residual_transformer`; it now reads the assigned `stage_metadata`, materializes only that stage, and builds `PipelineStage` directly from the local stage module.
+- stage-local model builder: `examples/models/large_residual_transformer.py` now exposes `build_large_residual_transformer_stage(...)`, `large_residual_module_paths(...)`, and `make_large_residual_stage_inputs(...)` so the worker can execute contiguous leaf-module slices while preserving residual and long-skip semantics.
+- control-plane planning: `JobManager._planner_workload()` now constructs the large model on `device="meta"` and feeds meta sample inputs into `build_model_profile()` and the existing automatic partition/placement search; no real large parameter storage is created on the control node for this planning path.
+- gate helper planning: `tests/multi_host/large_model_gate.py::estimate_large_model()` now also uses `device="meta"` so the hardware gate does not pre-materialize a full real large model before entering `JobManager`.
+- meta shared-parameter fix: `src/shardgrid/planner/memory.py` now keys shared-parameter detection by `id(parameter)` for meta tensors, avoiding the false tied-weight rejection caused by identical meta `data_ptr()` placeholders.
+- worker evidence: large automatic workers now record `owned_module_paths`, `materialized_parameter_names`, `materialized_parameter_count`, `materialized_parameter_bytes`, `full_model_materialized=false`, `initial_weights_received_from_control=false`, RSS before/after CPU materialization, CUDA allocated before/after `.to(device)`, and training-time `peak_gpu_memory_bytes`.
+- local verification:
+  - `tests/unit/test_train_automatic_plan.py` proves the large automatic worker path does not call the full model builder.
+  - `tests/unit/test_large_training_model.py` verifies parameter ownership, reduced per-stage parameter bytes, stage-chain residual/long-skip equivalence against the full model, and full-model meta construction.
+  - `tests/integration/test_train_orchestration.py` verifies the large automatic planner workload returns a meta-parameter model and meta sample inputs.
+  - `tests/multi_host/test_large_model_partition_gate.py` verifies meta estimation locally and, in hardware mode, audits per-worker stage-local evidence.
+- real hardware gate:
+  - command: `SHARDGRID_ENABLE_HARDWARE_TESTS=1 SHARDGRID_ENABLE_MULTI_HOST_TESTS=1 SHARDGRID_RUN_LARGE_MODEL_HW=1 PYTHONPATH=src python -m pytest tests/multi_host/test_large_model_partition_gate.py --run-hardware --run-multi-host -q`
+  - result on 2026-09-04: PASS
+  - selected planning decision: `selected_worker_count=2`, `attempted_worker_counts=[2]`, `selected_candidate_id=pytorch_pipeline:large-b:0:22-22:36`, `total_cross_worker_communication_bytes=851968`
+  - observed stage split from monitor artifacts:
+    - `stage0 -> gpu4060`: `token_embedding`, `position_embedding`, `blocks.0.*`, `blocks.1.*`, `blocks.2.norm1`, `blocks.2.attn.qkv`, `blocks.2.attn.out_proj`, `blocks.2.norm2`; `materialized_parameter_bytes=1147277312`; `full_model_materialized=false`
+    - `stage1 -> gpu4060-cqupt`: `blocks.2.ffn.0`, `blocks.2.ffn.1`, `blocks.2.ffn.2`, `blocks.2.memory_pressure`, `blocks.3.*`, `norm`, `output_head`; `materialized_parameter_bytes=1138851840`; `full_model_materialized=false`
+  - observed training memory evidence:
+    - `stage0 peak_gpu_memory_bytes=5766092800`
+    - `stage1 peak_gpu_memory_bytes=5725571072`

@@ -235,8 +235,11 @@ def _eligible_workers(
             reasons.extend(entry.exclusion_reasons)
             continue
         evaluation = evaluate_worker_eligibility(entry.resource, requirements)
-        if evaluation.eligible:
+        if evaluation.eligible and (_usable_memory_bytes(entry.resource) or 0) > 0:
             eligible.append(entry)
+            continue
+        if evaluation.eligible:
+            reasons.append("worker has no usable GPU memory")
             continue
         reasons.extend(violation.reason for violation in evaluation.violations)
     ordered = tuple(

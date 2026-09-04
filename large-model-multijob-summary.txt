@@ -1,0 +1,72 @@
+Large Model + Multi-Job Stress Gate Summary
+Date: 2026-09-04
+
+Scope
+- Added a configurable large PyTorch model: LargeResidualTransformer.
+- Integrated the model into automatic planning and automatic training.
+- Added GPU reservation handling for multi-job conflicts.
+- Added real multi-host hardware gate tests for Large-B and multi-job contention.
+
+Why the control machine appears to hang
+- The heavy work starts on the control machine before remote training begins.
+- Automatic planning builds the large model locally and runs local profiling/tracing.
+- The current flow builds/profiles the large model more than once:
+  - hardware gate helper estimate_large_model()
+  - JobManager automatic planner build_model_profile()
+- build_model_profile() executes one real local forward pass with sample inputs.
+- For Large-B, memory_bank_rows is scaled from live usable VRAM, so the local model can be multi-GB.
+- Result: local RAM pressure, paging, and long periods without stdout, which looks like a hang.
+
+Key fixes made in this round
+- Added examples/models/large_residual_transformer.py.
+- Wired model.parameters into config loading.
+- Added large_residual_transformer support in JobManager automatic workload selection.
+- Added large_residual_transformer support in examples/models/train_automatic_plan.py.
+- Fixed automatic training loss path to use cross-entropy for token targets.
+- Fixed rank0 stage probe batch shape mismatch in automatic pipeline training.
+- Switched large model checkpoints to metadata_only during this gate to avoid multi-GB scp artifact transfers.
+- Added StatusStore GPU reservation/release support.
+- Made planner worker eligibility reject zero-usable-memory reserved GPUs before partition search.
+- Added hardware tests for:
+  - Large-B automatic 2-worker gate
+  - multi-job reservation/rejection gate
+
+Verified results
+- Large-B hardware gate: PASS
+  - single-GPU estimated peak > best worker usable memory
+  - automatic planner attempted_worker_counts = [2]
+  - selected_worker_count = 2
+  - real two-host SSH training completed
+  - audit artifacts completed
+- Multi-job hardware gate: PASS
+  - Job A reserved two GPUs
+  - Job B was rejected before CUDA OOM
+  - reservation was released after completion
+
+Large-C status
+- Evaluated with live worker usable memory:
+  - gpu4060: about 7867 MiB free
+  - gpu4060-cqupt: about 6942 MiB free
+  - gpu1060: about 3403 MiB free
+- Scan results reached:
+  - rows=350000: 2-worker feasible
+  - rows=400000: 2-worker feasible
+  - rows=450000: infeasible for both 2 and 3 workers
+  - rows=500000: infeasible for both 2 and 3 workers
+- Current hardware does not show a clean 2-worker-infeasible but 3-worker-feasible window so far.
+- Treat Large-C as blocked by available hardware unless a better parameter window is found later.
+
+Files in this archive
+- examples/models/large_residual_transformer.py
+- examples/models/train_automatic_plan.py
+- src/shardgrid/common/config.py
+- src/shardgrid/control/job_manager.py
+- src/shardgrid/control/status_store.py
+- src/shardgrid/planner/placement.py
+- tests/multi_host/large_model_gate.py
+- tests/multi_host/test_large_model_partition_gate.py
+- tests/multi_host/test_multi_job_resource_gate.py
+- tests/unit/test_large_training_model.py
+- tests/unit/test_config.py
+- tests/unit/test_job_status.py
+- tests/integration/test_train_orchestration.py

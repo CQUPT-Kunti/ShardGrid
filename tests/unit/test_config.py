@@ -127,6 +127,35 @@ def test_automatic_training_config_serialization_is_stable() -> None:
     assert config.to_dict() == TrainingConfig.from_dict(load_config_data(path)).to_dict()
 
 
+def test_training_model_parameters_are_preserved(tmp_path: Path) -> None:
+    path = tmp_path / "train-large.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "job": {"name": "train-large", "backend": "ssh"},
+                "model": {
+                    "name": "large-b",
+                    "type": "large_residual_transformer",
+                    "parameters": {
+                        "hidden_size": 512,
+                        "num_layers": 4,
+                        "memory_bank_rows": 1024,
+                    },
+                },
+                "resources": {"world_size": 4},
+                "planning": {"mode": "automatic"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_training_config(path)
+
+    assert config.model.parameters["hidden_size"] == 512
+    assert config.model.parameters["memory_bank_rows"] == 1024
+    assert TrainingConfig.from_dict(config.to_dict()).model.parameters == config.model.parameters
+
+
 def test_invalid_consolidation_device_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "train-invalid-consolidation.yaml"
     path.write_text(

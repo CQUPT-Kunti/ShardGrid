@@ -89,6 +89,17 @@ def _require_string_mapping(value: object, *, field_name: str) -> dict[str, str]
     }
 
 
+def _require_scalar_mapping(value: object, *, field_name: str) -> dict[str, object]:
+    mapping = _require_mapping(value, field_name=field_name)
+    result: dict[str, object] = {}
+    for key, item in mapping.items():
+        name = _require_string(key, field_name=field_name)
+        if item is not None and not isinstance(item, (str, int, float, bool)):
+            raise ConfigValidationError(f"{field_name}.{name} must be a scalar")
+        result[name] = item
+    return result
+
+
 def _serialize(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -465,6 +476,7 @@ class TrainingModelConfig:
     stage_count: int = 2
     max_train_minutes: int = 15
     min_loss_decrease_percent: float = 5.0
+    parameters: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -571,6 +583,10 @@ class TrainingConfig:
                 ),
                 min_loss_decrease_percent=float(
                     model_payload.get("min_loss_decrease_percent", 5.0)
+                ),
+                parameters=_require_scalar_mapping(
+                    model_payload.get("parameters", {}),
+                    field_name="model.parameters",
                 ),
             ),
             resources=TrainingResourcesConfig(

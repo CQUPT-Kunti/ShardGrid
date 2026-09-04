@@ -708,6 +708,40 @@ def _automatic_parallel_plan() -> ParallelPlan:
     )
 
 
+def _large_automatic_training_config(tmp_path: Path) -> Path:
+    path = tmp_path / "train-large-auto.yaml"
+    path.write_text(
+        """
+job:
+  name: train-large-auto
+  backend: ssh
+  communication_backend: nccl
+model:
+  name: large-auto
+  type: large_residual_transformer
+  stage_count: 2
+  parameters:
+    vocab_size: 128
+    hidden_size: 32
+    num_layers: 2
+    num_heads: 4
+    ffn_size: 64
+    sequence_length: 8
+    batch_size: 2
+    memory_bank_rows: 16
+    memory_bank_touch_rows: 2
+resources:
+  world_size: 2
+  preferred_workers: [gpu4060, gpu1060]
+planning:
+  mode: automatic
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_orchestrates_full_training_lifecycle(tmp_path: Path) -> None:
     events: list[str] = []
     manager, config_path = _build_manager(tmp_path, events)
@@ -756,6 +790,20 @@ def test_orchestrates_full_training_lifecycle(tmp_path: Path) -> None:
         "launcher_monitor",
         "collector_collect",
     ]
+
+
+def test_large_planner_workload_uses_meta_parameters(tmp_path: Path) -> None:
+    events: list[str] = []
+    manager, _config_path = _build_manager(tmp_path, events)
+    training_config = load_training_config(_large_automatic_training_config(tmp_path))
+
+    model, sample_args, sample_kwargs = manager._planner_workload(training_config)
+
+    assert sample_kwargs == {}
+    assert {str(parameter.device) for parameter in model.parameters()} == {"meta"}
+    assert len(sample_args) == 1
+    assert isinstance(sample_args[0], torch.Tensor)
+    assert sample_args[0].device.type == "meta"
 
 
 def test_prepare_live_execution_plan_rejects_resource_drift(tmp_path: Path) -> None:
@@ -918,6 +966,33 @@ def test_probe_network_link_sets_measurement_timestamp(tmp_path: Path) -> None:
 
     assert link.interface == "eth3"
     assert link.measured_at is not None
+
+
+def test_active_reservation_removes_worker_free_memory_from_planning(tmp_path: Path) -> None:
+    events: list[str] = []
+    manager, _config_path = _build_manager(tmp_path, events)
+    resource = _worker_resource("gpu4060", "10.87.5.155", "RTX 4060")
+    assignment = WorkerAssignment(
+        worker_id=as_worker_id("gpu4060"),
+        rank=0,
+        stage="stage0",
+        estimated_peak_training_memory=1024,
+    )
+    manager._status_store.reserve_resources("job-a", [assignment])
+
+    adjusted = manager._apply_active_resource_reservations(
+        [resource],
+        current_job_id=as_job_id("job-b"),
+    )
+
+    assert adjusted[0].gpu_free_memory == 0
+    assert adjusted[0].gpu_utilization == 100.0
+
+    same_job = manager._apply_active_resource_reservations(
+        [resource],
+        current_job_id=as_job_id("job-a"),
+    )
+    assert same_job[0].gpu_free_memory == resource.gpu_free_memory
 
 
 def test_collection_failure_persists_diagnostics_and_first_artifact_failure(

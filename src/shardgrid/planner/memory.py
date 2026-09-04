@@ -602,7 +602,8 @@ def _worker_usable_bytes(worker: WorkerResource) -> int | None:
 def _shared_parameter_groups(model: "nn.Module") -> tuple[tuple[str, ...], ...]:
     groups: dict[int, list[str]] = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
-        groups.setdefault(int(parameter.data_ptr()), []).append(name)
+        key = id(parameter) if getattr(parameter, "is_meta", False) else int(parameter.data_ptr())
+        groups.setdefault(key, []).append(name)
     shared = [tuple(names) for names in groups.values() if len(names) > 1]
     return tuple(sorted(shared))
 
