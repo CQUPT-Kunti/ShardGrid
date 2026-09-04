@@ -853,6 +853,17 @@ artifacts:
     )
     assert metadata_json["execution_plan_audit"]["plan_mode"] == "automatic"
     assert metadata_json["execution_plan_audit"]["planning"] == payload["planning"]
+    planning_evidence = payload["launch_metadata"]["planning_evidence"]
+    assert set(planning_evidence) >= {
+        "planner_worker_resources",
+        "control_rss_before_planning",
+        "control_rss_after_profile",
+        "control_rss_after_plan_created",
+        "control_rss_after_cleanup",
+    }
+    assert metadata_json["execution_plan_audit"]["launch_metadata"]["planning_evidence"] == (
+        planning_evidence
+    )
     assert "Plan Mode: automatic" in human
     assert "Partition Source: automatic" in human
     assert "Selected Worker Count: 2" in human

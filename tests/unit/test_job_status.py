@@ -122,14 +122,29 @@ def test_status_store_reserves_and_releases_worker_gpus(tmp_path: Path) -> None:
     assignments = _assignments()
 
     assert store.reserve_resources("job-a", assignments) == []
-    conflicts = store.reserve_resources("job-b", [assignments[0]])
-    assert conflicts[0]["job_id"] == "job-a"
-    assert conflicts[0]["worker_id"] == "gpu4060"
+    assert store.reserve_resources("job-b", [assignments[0]]) == []
+    assert store.reserve_resources("job-b", [assignments[0]]) == []
+
+    reservations = store.active_reservations()
+    assert len(reservations) == 3
+    assert sum(1 for item in reservations if item["job_id"] == "job-b") == 1
+    assert {
+        (item["job_id"], item["worker_id"], item["gpu_index"])
+        for item in reservations
+    } == {
+        ("job-a", "gpu4060", 0),
+        ("job-a", "gpu1060", 0),
+        ("job-b", "gpu4060", 0),
+    }
 
     store.release_resources("job-a")
 
+    remaining = store.active_reservations()
+    assert len(remaining) == 1
+    assert remaining[0]["job_id"] == "job-b"
+
+    store.release_resources("job-b")
     assert store.active_reservations() == []
-    assert store.reserve_resources("job-b", [assignments[0]]) == []
 
 
 def test_job_status_allows_legal_transitions_and_rejects_illegal_terminal_backtracking() -> None:

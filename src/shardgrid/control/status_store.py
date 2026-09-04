@@ -68,17 +68,6 @@ class StatusStore:
                 for item in payload.get("reservations", [])
                 if str(item.get("job_id")) != str(job_id)
             ]
-            requested = {
-                (str(assignment.worker_id), int(assignment.gpu_index))
-                for assignment in assignments
-            }
-            conflicts = [
-                item
-                for item in existing
-                if (str(item.get("worker_id")), int(item.get("gpu_index", 0))) in requested
-            ]
-            if conflicts:
-                return conflicts
             timestamp = _now()
             payload["reservations"] = existing + [
                 {

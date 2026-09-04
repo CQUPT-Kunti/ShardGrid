@@ -95,7 +95,7 @@ def _payload(result: JobRunResult) -> dict[str, object]:
         else str(Path(snapshot.diagnostics_path) / "snapshot-metadata.yaml"),
         "status_path": None
         if snapshot is None
-        else str(Path(snapshot.diagnostics_path) / "job-status.json"),
+        else str(Path(snapshot.root_path) / "job-status.json"),
         "failure": None if result.status.failure is None else result.status.failure.to_dict(),
     }
 

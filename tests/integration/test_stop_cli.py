@@ -81,6 +81,13 @@ def _assignment(worker_id: str, rank: int, stage: str, pid: int) -> WorkerAssign
     )
 
 
+def _assignments() -> list[WorkerAssignment]:
+    return [
+        _assignment("gpu4060", 0, "stage0", 4100),
+        _assignment("gpu1060", 1, "stage1", 4200),
+    ]
+
+
 def _write_job(
     tmp_path: Path,
     *,
@@ -99,10 +106,7 @@ def _write_job(
         backend_preference=as_backend_name("ssh"),
         runtime_environment_ref="env:cluster/shardgrid",
     )
-    assignments = [
-        _assignment("gpu4060", 0, "stage0", 4100),
-        _assignment("gpu1060", 1, "stage1", 4200),
-    ]
+    assignments = _assignments()
     plan = ExecutionPlan(
         job_id=job.job_id,
         engine=as_engine_name("torchrun"),
@@ -141,7 +145,7 @@ def _write_job(
         json.dumps(plan.to_dict(), indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    StatusStore(tmp_path / "jobs").save_path(root / "diagnostics" / "job-status.json", status)
+    StatusStore(tmp_path / "jobs").save_path(root / "job-status.json", status)
     return root
 
 
@@ -290,15 +294,14 @@ def test_stop_running_job_returns_structured_human_output_and_updates_status(
 ) -> None:
     config = _config_path(tmp_path)
     root = _write_job(tmp_path)
+    store = StatusStore(tmp_path / "jobs")
+    store.reserve_resources("job-0104", _assignments())
     final_status = JobStatus(
         job_id=as_job_id("job-0104"),
         state=JobState.STOPPED,
         phase="stopped",
         workers=[as_worker_id("gpu4060"), as_worker_id("gpu1060")],
-        assignments=[
-            _assignment("gpu4060", 0, "stage0", 4100),
-            _assignment("gpu1060", 1, "stage1", 4200),
-        ],
+        assignments=_assignments(),
         runtime_environment_refs={"0": "env:gpu4060/shardgrid", "1": "env:gpu1060/shardgrid"},
         backend=as_backend_name("nccl"),
         started_at="2026-08-29T12:00:00+00:00",
@@ -309,7 +312,7 @@ def test_stop_running_job_returns_structured_human_output_and_updates_status(
         "_execute_stop",
         lambda context, status: (
             StatusStore(tmp_path / "jobs").save_path(
-                root / "diagnostics" / "job-status.json",
+                root / "job-status.json",
                 final_status,
             ),
             _stop_result(
@@ -332,11 +335,77 @@ def test_stop_running_job_returns_structured_human_output_and_updates_status(
     assert "worker=gpu4060 rank=0 stage=stage0 pid=4100 status=SUCCESS" in captured.out
     assert "worker=gpu1060 rank=1 stage=stage1 pid=4200 status=SUCCESS" in captured.out
     persisted = StatusStore(tmp_path / "jobs").load_path(
-        root / "diagnostics" / "job-status.json"
+        root / "job-status.json"
     )
     assert persisted.state is JobState.STOPPED
     assert persisted.phase == "stopped"
     assert persisted.finished_at is not None
+    assert store.active_reservations() == []
+
+
+def test_stop_noop_releases_only_target_job_reservation(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = _config_path(tmp_path)
+    _write_job(tmp_path, state=JobState.STOPPED, phase="stopped")
+    store = StatusStore(tmp_path / "jobs")
+    store.reserve_resources("job-0104", [_assignment("gpu4060", 0, "stage0", 4100)])
+    store.reserve_resources("job-0200", [_assignment("gpu4060", 0, "stage0", 5100)])
+
+    monkeypatch.setattr(
+        stop_command,
+        "_execute_stop",
+        lambda context, status: _stop_result(
+            job_id=str(status.job_id),
+            status=LauncherResultStatus.NOOP,
+            next_state=JobState.STOPPED,
+        ),
+    )
+
+    exit_code = main(["--config", str(config), "stop", "job-0104", "--yes"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Overall Stop Result: NOOP" in captured.out
+    reservations = store.active_reservations()
+    assert reservations == [
+        {
+            "job_id": "job-0200",
+            "worker_id": "gpu4060",
+            "rank": 0,
+            "stage": "stage0",
+            "gpu_index": 0,
+            "estimated_peak_training_memory": None,
+            "created_at": reservations[0]["created_at"],
+        }
+    ]
+
+
+def test_stop_partial_does_not_release_reservations_when_job_not_stopped(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = _config_path(tmp_path)
+    _write_job(tmp_path, state=JobState.TRAINING, phase="training")
+    store = StatusStore(tmp_path / "jobs")
+    store.reserve_resources("job-0104", _assignments())
+
+    monkeypatch.setattr(
+        stop_command,
+        "_execute_stop",
+        lambda context, status: _stop_result(
+            job_id=str(status.job_id),
+            status=LauncherResultStatus.PARTIAL,
+            next_state=JobState.FAILED,
+            failure_stage=FailureStage.STOP,
+        ),
+    )
+
+    exit_code = main(["--config", str(config), "stop", "job-0104", "--yes"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Overall Stop Result: PARTIAL" in captured.out
+    assert all(item["job_id"] == "job-0104" for item in store.active_reservations())
 
 
 def test_stop_completed_job_is_noop_and_preserves_completed_state(

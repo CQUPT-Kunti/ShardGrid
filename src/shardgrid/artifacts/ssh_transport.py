@@ -35,7 +35,7 @@ _REMOTE_REQUIRED_RELATIVE_PATHS = (
     "plan/original-parallel-plan.json",
     "plan/execution-plan.json",
     "diagnostics/network-state.json",
-    "diagnostics/job-status.json",
+    "job-status.json",
     "diagnostics/snapshot-metadata.json",
     "checkpoint/checkpoint-metadata.json",
 )

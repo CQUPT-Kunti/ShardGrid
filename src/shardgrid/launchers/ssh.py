@@ -3264,7 +3264,7 @@ class SSHLauncher(Launcher):
     def _job_status_path(self, context: LauncherContext) -> Path | None:
         if context.snapshot is None:
             return None
-        return Path(context.snapshot.diagnostics_path) / "job-status.json"
+        return Path(context.snapshot.root_path) / "job-status.json"
 
     def _initial_job_status(self, context: LauncherContext):
         return JobStatus(

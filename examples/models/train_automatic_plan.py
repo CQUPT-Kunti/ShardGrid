@@ -34,6 +34,7 @@ from examples.models.large_residual_transformer import (
     build_large_residual_transformer_stage,
     make_large_residual_batch,
     make_large_residual_stage_inputs,
+    required_boundary_state_names,
 )
 from examples.models.partition_stress_model import (
     PartitionStressConfig,
@@ -288,6 +289,25 @@ def _large_stage_materialization(
     return stage_module, stage, materialization
 
 
+def _large_boundary_state_names(
+    plan: ParallelPlan,
+) -> tuple[dict[int, tuple[str, ...]], dict[int, tuple[str, ...]]]:
+    input_names: dict[int, tuple[str, ...]] = {}
+    output_names: dict[int, tuple[str, ...]] = {}
+    next_stage_inputs: tuple[str, ...] | None = None
+    for stage_index in range(len(plan.stage_metadata) - 1, -1, -1):
+        stage_metadata = plan.stage_metadata[stage_index]
+        current_outputs = ("x",) if next_stage_inputs is None else next_stage_inputs
+        current_inputs = required_boundary_state_names(
+            stage_metadata.module_paths,
+            current_outputs,
+        )
+        input_names[stage_index] = current_inputs
+        output_names[stage_index] = current_outputs
+        next_stage_inputs = current_inputs
+    return input_names, output_names
+
+
 def _build_large_stage_module(
     training_config: TrainingConfig,
     plan: ParallelPlan,
@@ -303,6 +323,7 @@ def _build_large_stage_module(
 ]:
     config = LargeResidualTransformerConfig.from_mapping(training_config.model.parameters)
     stage_metadata = plan.stage_metadata[stage_index]
+    stage_input_names, stage_output_names = _large_boundary_state_names(plan)
     next_stage_start_path = (
         None
         if stage_index + 1 >= len(plan.stage_metadata)
@@ -314,6 +335,8 @@ def _build_large_stage_module(
         config,
         stage_metadata=stage_metadata,
         next_stage_start_path=next_stage_start_path,
+        input_state_names=stage_input_names[stage_index],
+        output_state_names=stage_output_names[stage_index],
         seed=42,
     )
     rss_after = _process_rss_bytes()
@@ -324,6 +347,7 @@ def _build_large_stage_module(
     sample_inputs = make_large_residual_stage_inputs(
         config,
         stage_metadata.module_paths[0],
+        state_names=stage_input_names[stage_index],
         seed=42,
         step=0,
         batch_size=sample_batch_size,
@@ -342,8 +366,12 @@ def _build_large_stage_module(
         "initial_weights_received_from_control": False,
         "process_rss_before_materialization_bytes": rss_before,
         "process_rss_after_materialization_bytes": rss_after,
+        "process_rss_before_materialization": rss_before,
+        "process_rss_after_materialization": rss_after,
         "cuda_allocated_before_stage_to_device_bytes": cuda_before,
         "cuda_allocated_after_stage_to_device_bytes": cuda_after,
+        "cuda_before_stage_move_bytes": cuda_before,
+        "cuda_after_stage_move_bytes": cuda_after,
     }
 
 
@@ -385,8 +413,12 @@ def _build_runtime_stage(
         "initial_weights_received_from_control": False,
         "process_rss_before_materialization_bytes": None,
         "process_rss_after_materialization_bytes": None,
+        "process_rss_before_materialization": None,
+        "process_rss_after_materialization": None,
         "cuda_allocated_before_stage_to_device_bytes": None,
         "cuda_allocated_after_stage_to_device_bytes": None,
+        "cuda_before_stage_move_bytes": None,
+        "cuda_after_stage_move_bytes": None,
     }
 
 
@@ -403,6 +435,7 @@ def _placement_payload(
     named = dict(module.named_parameters())
     return {
         "hostname": socket.gethostname(),
+        "pid": os.getpid(),
         "job_id": str(execution.job_id),
         "rank": rank,
         "world_size": world_size,
@@ -565,11 +598,55 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
         step_times.append(time.perf_counter() - step_started)
+        step_peak_gpu_memory_bytes = torch.cuda.max_memory_allocated(device)
+        _emit_line(
+            TRAIN_MARKER
+            + json.dumps(
+                {
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "job_id": str(execution.job_id),
+                    "rank": rank,
+                    "world_size": world_size,
+                    "worker_id": str(assignment.worker_id),
+                    "stage_id": assignment.stage,
+                    "device": str(device),
+                    "gpu_name": torch.cuda.get_device_name(device),
+                    "steps": step + 1,
+                    "model_name": training_config.model.name,
+                    "model_type": training_config.model.type,
+                    "loss_history": loss_history,
+                    "initial_loss": initial_loss,
+                    "final_loss": final_loss,
+                    "loss_isfinite": all(math.isfinite(item) for item in loss_history),
+                    "checkpoint_mode": "in_progress",
+                    "step_times": step_times,
+                    "total_training_time": sum(step_times),
+                    "peak_gpu_memory_bytes": step_peak_gpu_memory_bytes,
+                    "cuda_training_peak_bytes": step_peak_gpu_memory_bytes,
+                    "partition_source": execution.labels.get("partition_source"),
+                    "selected_candidate_id": execution.labels.get("selected_candidate_id"),
+                    "communication_edges": list(assignment.communication_edges),
+                    **materialization,
+                    "distributed_initialized": True,
+                    "stage_materialized": True,
+                    "optimizer_step_completed": True,
+                    "activation_transfer_ok": world_size > 1,
+                    "gradient_transfer_ok": world_size > 1,
+                    "cross_stage_dependency_preserved": bool(
+                        stage_probe_arity is None or stage_probe_arity > 1
+                    ),
+                    "stage_output_arity": stage_probe_arity,
+                },
+                sort_keys=True,
+            )
+        )
         _emit_line("OPTIMIZER_STEP_END")
         _emit_line("TRAIN_STEP_END")
 
     params_after = _checksum(stage_module)
     param_update_ok = params_before != params_after
+    peak_gpu_memory_bytes = torch.cuda.max_memory_allocated(device)
     metadata = {
         "model_name": training_config.model.name,
         "model_type": training_config.model.type,
@@ -651,13 +728,19 @@ def main() -> None:
         "stage_to_worker": placement["stage_to_worker"],
         "step_times": step_times,
         "total_training_time": sum(step_times),
-        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+        "cuda_training_peak_bytes": peak_gpu_memory_bytes,
+        "distributed_initialized": True,
+        "stage_materialized": True,
+        "optimizer_step_completed": True,
+        "pid": os.getpid(),
         **materialization,
     }
     _write_checkpoint_metadata(checkpoint_dir / "checkpoint-metadata.json", metadata_payload)
 
     train_payload = {
         "hostname": socket.gethostname(),
+        "pid": os.getpid(),
         "job_id": str(execution.job_id),
         "rank": rank,
         "world_size": world_size,
@@ -686,11 +769,15 @@ def main() -> None:
         "checkpoint_path": str(checkpoint_path),
         "step_times": step_times,
         "total_training_time": sum(step_times),
-        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+        "cuda_training_peak_bytes": peak_gpu_memory_bytes,
         "partition_source": execution.labels.get("partition_source"),
         "selected_candidate_id": execution.labels.get("selected_candidate_id"),
         "communication_edges": list(assignment.communication_edges),
         **materialization,
+        "distributed_initialized": True,
+        "stage_materialized": True,
+        "optimizer_step_completed": True,
         "activation_transfer_ok": world_size > 1,
         "gradient_transfer_ok": world_size > 1,
         "cross_stage_dependency_preserved": bool(stage_probe_arity is None or stage_probe_arity > 1),

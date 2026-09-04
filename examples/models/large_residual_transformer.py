@@ -203,6 +203,105 @@ class _StageState:
     ffn_hidden: torch.Tensor | None = None
 
 
+_STATE_ORDER = (
+    "input_ids",
+    "x",
+    "long_skip",
+    "norm1_out",
+    "attn_merged",
+    "norm2_out",
+    "ffn_hidden",
+)
+
+
+def _ordered_state_names(names: set[str]) -> tuple[str, ...]:
+    return tuple(name for name in _STATE_ORDER if name in names)
+
+
+def _path_uses(path: str) -> set[str]:
+    if path == "token_embedding":
+        return {"input_ids"}
+    if path == "position_embedding":
+        return {"x"}
+    if path in {"norm", "output_head"}:
+        return {"x"}
+    if path.endswith("norm1"):
+        return {"x"}
+    if path.endswith("attn.qkv"):
+        return {"norm1_out"}
+    if path.endswith("attn.out_proj"):
+        return {"x", "attn_merged"}
+    if path.endswith("norm2"):
+        return {"x"}
+    if path == "ffn.0" or path.endswith("ffn.0"):
+        return {"norm2_out"}
+    if path.endswith(("ffn.1", "ffn.2")):
+        return {"ffn_hidden"}
+    if path.endswith("memory_pressure"):
+        names = {"x", "ffn_hidden"}
+        block_index = int(path.split(".")[1])
+        if block_index % 2 == 1:
+            names.add("long_skip")
+        return names
+    raise ValueError(f"unsupported stage module path {path!r}")
+
+
+def _path_defs(path: str) -> set[str]:
+    if path == "token_embedding":
+        return {"x"}
+    if path == "position_embedding":
+        return {"x", "long_skip"}
+    if path in {"norm", "output_head"}:
+        return {"x"}
+    if path.endswith("norm1"):
+        return {"norm1_out"}
+    if path.endswith("attn.qkv"):
+        return {"attn_merged"}
+    if path.endswith("attn.out_proj"):
+        return {"x"}
+    if path.endswith("norm2"):
+        return {"norm2_out"}
+    if path.endswith(("ffn.0", "ffn.1", "ffn.2")):
+        return {"ffn_hidden"}
+    if path.endswith("memory_pressure"):
+        names = {"x"}
+        block_index = int(path.split(".")[1])
+        if block_index % 2 == 1:
+            names.add("long_skip")
+        return names
+    raise ValueError(f"unsupported stage module path {path!r}")
+
+
+def _default_boundary_state_names_for_start_path(start_path: str) -> tuple[str, ...]:
+    if start_path == "token_embedding":
+        return ("input_ids",)
+    if start_path in {"position_embedding", "norm", "output_head"}:
+        return ("x",)
+    if start_path.endswith(("norm1", "norm2")):
+        return ("x", "long_skip")
+    if start_path.endswith("attn.qkv"):
+        return ("x", "long_skip", "norm1_out")
+    if start_path.endswith("attn.out_proj"):
+        return ("x", "long_skip", "attn_merged")
+    if start_path.endswith("ffn.0"):
+        return ("x", "long_skip", "norm2_out")
+    if start_path.endswith(("ffn.1", "ffn.2", "memory_pressure")):
+        return ("x", "long_skip", "ffn_hidden")
+    raise ValueError(f"unsupported stage start path {start_path!r}")
+
+
+def required_boundary_state_names(
+    module_paths: Sequence[str],
+    required_outputs: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if not module_paths:
+        raise ValueError("module_paths must not be empty")
+    live = set(required_outputs or ("x",))
+    for path in reversed(tuple(module_paths)):
+        live = (live - _path_defs(path)) | _path_uses(path)
+    return _ordered_state_names(live)
+
+
 class LargeResidualTransformerStage(nn.Module):
     def __init__(
         self,
@@ -211,6 +310,8 @@ class LargeResidualTransformerStage(nn.Module):
         stage_id: str,
         module_paths: Sequence[str],
         next_stage_start_path: str | None,
+        input_state_names: Sequence[str] | None = None,
+        output_state_names: Sequence[str] | None = None,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -220,6 +321,17 @@ class LargeResidualTransformerStage(nn.Module):
         self.stage_id = stage_id
         self.module_paths = tuple(str(path) for path in module_paths)
         self.next_stage_start_path = next_stage_start_path
+        self.input_state_names = tuple(
+            input_state_names or _default_boundary_state_names_for_start_path(self.module_paths[0])
+        )
+        self.output_state_names = tuple(
+            output_state_names
+            or (
+                ("x",)
+                if next_stage_start_path is None
+                else _default_boundary_state_names_for_start_path(next_stage_start_path)
+            )
+        )
         path_order = {
             path: index for index, path in enumerate(large_residual_module_paths(config))
         }
@@ -310,33 +422,12 @@ class LargeResidualTransformerStage(nn.Module):
         raise ValueError(f"unsupported stage module path {path!r}")
 
     def _decode_inputs(self, args: Sequence[torch.Tensor]) -> _StageState:
-        start_path = self.module_paths[0]
         values = tuple(args)
-        if start_path == "token_embedding":
-            _expect_arity(start_path, values, 1)
-            return _StageState(input_ids=values[0])
-        if start_path == "position_embedding":
-            _expect_arity(start_path, values, 1)
-            return _StageState(x=values[0])
-        if start_path in {"norm", "output_head"}:
-            _expect_arity(start_path, values, 1)
-            return _StageState(x=values[0])
-        if start_path.endswith(("norm1", "norm2")):
-            _expect_arity(start_path, values, 2)
-            return _StageState(x=values[0], long_skip=values[1])
-        if start_path.endswith("attn.qkv"):
-            _expect_arity(start_path, values, 3)
-            return _StageState(x=values[0], long_skip=values[1], norm1_out=values[2])
-        if start_path.endswith("attn.out_proj"):
-            _expect_arity(start_path, values, 3)
-            return _StageState(x=values[0], long_skip=values[1], attn_merged=values[2])
-        if start_path.endswith("ffn.0"):
-            _expect_arity(start_path, values, 3)
-            return _StageState(x=values[0], long_skip=values[1], norm2_out=values[2])
-        if start_path.endswith(("ffn.1", "ffn.2", "memory_pressure")):
-            _expect_arity(start_path, values, 3)
-            return _StageState(x=values[0], long_skip=values[1], ffn_hidden=values[2])
-        raise ValueError(f"unsupported stage start path {start_path!r}")
+        _expect_arity(self.module_paths[0], values, len(self.input_state_names))
+        state = _StageState()
+        for name, value in zip(self.input_state_names, values, strict=True):
+            setattr(state, name, value)
+        return state
 
     def _apply_path(self, path: str, state: _StageState) -> None:
         module = self._path_modules[path]
@@ -391,38 +482,10 @@ class LargeResidualTransformerStage(nn.Module):
         raise ValueError(f"unsupported stage module path {path!r}")
 
     def _encode_outputs(self, state: _StageState) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        next_path = self.next_stage_start_path
-        if next_path is None:
-            return _require(state.x, "x")
-        if next_path in {"position_embedding", "norm", "output_head"}:
-            return (_require(state.x, "x"),)
-        if next_path.endswith(("norm1", "norm2")):
-            return (_require(state.x, "x"), _require(state.long_skip, "long_skip"))
-        if next_path.endswith("attn.qkv"):
-            return (
-                _require(state.x, "x"),
-                _require(state.long_skip, "long_skip"),
-                _require(state.norm1_out, "norm1_out"),
-            )
-        if next_path.endswith("attn.out_proj"):
-            return (
-                _require(state.x, "x"),
-                _require(state.long_skip, "long_skip"),
-                _require(state.attn_merged, "attn_merged"),
-            )
-        if next_path.endswith("ffn.0"):
-            return (
-                _require(state.x, "x"),
-                _require(state.long_skip, "long_skip"),
-                _require(state.norm2_out, "norm2_out"),
-            )
-        if next_path.endswith(("ffn.1", "ffn.2", "memory_pressure")):
-            return (
-                _require(state.x, "x"),
-                _require(state.long_skip, "long_skip"),
-                _require(state.ffn_hidden, "ffn_hidden"),
-            )
-        raise ValueError(f"unsupported next stage path {next_path!r}")
+        values = tuple(_require(getattr(state, name), name) for name in self.output_state_names)
+        if len(values) == 1:
+            return values[0]
+        return values
 
 
 def build_large_residual_transformer(
@@ -441,6 +504,8 @@ def build_large_residual_transformer_stage(
     *,
     stage_metadata: Any,
     next_stage_start_path: str | None,
+    input_state_names: Sequence[str] | None = None,
+    output_state_names: Sequence[str] | None = None,
     seed: int = 42,
 ) -> LargeResidualTransformerStage:
     return LargeResidualTransformerStage(
@@ -448,6 +513,8 @@ def build_large_residual_transformer_stage(
         stage_id=str(stage_metadata.stage_id),
         module_paths=tuple(str(path) for path in stage_metadata.module_paths),
         next_stage_start_path=next_stage_start_path,
+        input_state_names=input_state_names,
+        output_state_names=output_state_names,
         seed=seed,
     )
 
@@ -456,6 +523,7 @@ def make_large_residual_stage_inputs(
     config: LargeResidualTransformerConfig,
     start_path: str,
     *,
+    state_names: Sequence[str] | None = None,
     seed: int = 42,
     step: int = 0,
     batch_size: int | None = None,
@@ -463,6 +531,7 @@ def make_large_residual_stage_inputs(
 ) -> tuple[torch.Tensor, ...]:
     effective_batch_size = config.batch_size if batch_size is None else batch_size
     shape = (effective_batch_size, config.sequence_length, config.hidden_size)
+    names = tuple(state_names or _default_boundary_state_names_for_start_path(start_path))
     if start_path == "token_embedding":
         inputs, _targets = make_large_residual_batch(
             config,
@@ -472,27 +541,22 @@ def make_large_residual_stage_inputs(
             device=device,
         )
         return (inputs,)
-    if start_path in {"position_embedding", "norm", "output_head"}:
-        return (torch.zeros(shape, device=device),)
-    if start_path.endswith(("norm1", "norm2")):
-        tensor = torch.zeros(shape, device=device)
-        return (tensor, torch.zeros_like(tensor))
-    if start_path.endswith(("attn.qkv", "attn.out_proj", "ffn.0")):
-        tensor = torch.zeros(shape, device=device)
-        return (tensor, torch.zeros_like(tensor), torch.zeros_like(tensor))
-    if start_path.endswith(("ffn.1", "ffn.2")):
-        tensor = torch.zeros(shape, device=device)
-        hidden = torch.zeros(
+    tensors: dict[str, torch.Tensor] = {
+        "x": torch.zeros(shape, device=device),
+        "long_skip": torch.zeros(shape, device=device),
+        "norm1_out": torch.zeros(shape, device=device),
+        "attn_merged": torch.zeros(shape, device=device),
+        "norm2_out": torch.zeros(shape, device=device),
+        "ffn_hidden": torch.zeros(
             effective_batch_size,
             config.sequence_length,
             config.ffn_size,
             device=device,
-        )
-        return (tensor, torch.zeros_like(tensor), hidden)
-    if start_path.endswith("memory_pressure"):
-        tensor = torch.zeros(shape, device=device)
-        return (tensor, torch.zeros_like(tensor), torch.zeros_like(tensor))
-    raise ValueError(f"unsupported stage start path {start_path!r}")
+        ),
+    }
+    if "input_ids" in names:
+        raise ValueError("input_ids stage inputs must start at token_embedding")
+    return tuple(tensors[name] for name in names)
 
 
 def make_large_residual_batch(

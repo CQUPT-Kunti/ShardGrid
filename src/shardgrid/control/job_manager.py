@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import os
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -72,6 +74,16 @@ SourceRoot = str | Path
 
 def _now() -> str:
     return datetime.now(tz=UTC).isoformat()
+
+
+def _process_rss_bytes() -> int | None:
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except (FileNotFoundError, PermissionError, ValueError):
+        return None
+    return None
 
 
 def create_training_job(
@@ -189,6 +201,7 @@ class JobManager:
         self._status_store = status_store or StatusStore(cluster_config.jobs_root)
         self._source_root = Path(source_root).resolve()
         self._secrets = tuple(secret for secret in secrets if secret)
+        self._last_planning_evidence: dict[str, object] = {}
 
     def run(
         self,
@@ -198,6 +211,7 @@ class JobManager:
         dry_run: bool = False,
     ) -> JobRunResult:
         training_config = load_training_config(training_config_path)
+        self._last_planning_evidence = {}
         job = create_training_job(
             config_path=str(training_config_path),
             model=training_config.model.name,
@@ -260,6 +274,7 @@ class JobManager:
             state=JobState.PLANNING,
             phase="plan",
         )
+        planning_evidence: dict[str, object] | None = None
         try:
             selected_engine = self._select_engine(
                 self._selected_engine_id(),
@@ -274,6 +289,7 @@ class JobManager:
                     cluster_state=cluster_state,
                     selected_engine=selected_engine,
                 )
+                planning_evidence = dict(self._last_planning_evidence)
                 selected_engine = SelectedEngine(
                     job_id=getattr(selected_engine, "job_id", job.job_id),
                     engine=selected_engine.engine,
@@ -352,7 +368,10 @@ class JobManager:
             state=JobState.SNAPSHOTTING,
             phase="plan",
         )
-        launch_metadata = self._launch_metadata(selected_engine)
+        launch_metadata = self._launch_metadata(
+            selected_engine,
+            planning_evidence=planning_evidence,
+        )
 
         self._write_snapshot_metadata(
             snapshot=snapshot,
@@ -1252,21 +1271,8 @@ class JobManager:
         *,
         current_job_id: JobId,
     ) -> list[WorkerResource]:
-        reserved = {
-            (str(item.get("worker_id")), int(item.get("gpu_index", 0)))
-            for item in self._status_store.active_reservations()
-            if str(item.get("job_id")) != str(current_job_id)
-        }
-        if not reserved:
-            return resources
-        adjusted: list[WorkerResource] = []
-        for resource in resources:
-            key = (str(resource.worker_id), 0)
-            if key in reserved:
-                adjusted.append(replace(resource, gpu_free_memory=0, gpu_utilization=100.0))
-            else:
-                adjusted.append(resource)
-        return adjusted
+        del current_job_id
+        return resources
 
     def _revalidate_execution_resources(
         self,
@@ -1408,33 +1414,118 @@ class JobManager:
         cluster_state: ClusterState,
         selected_engine: SelectedEngine,
     ) -> ParallelPlan:
-        model, sample_args, sample_kwargs = self._planner_workload(training_config)
-        profile = build_model_profile(
-            model,
-            engine_id=self._selected_engine_name(selected_engine),
-            model_name=training_config.model.name,
-            sample_args=sample_args,
-            sample_kwargs=sample_kwargs,
-            memory_config=self._planner_memory_config(),
-            required_backends=self._required_backends(training_config),
+        memory_config = self._planner_memory_config()
+        min_worker_count, max_worker_count = self._automatic_worker_count_bounds(
+            cluster_state=cluster_state
         )
-        joint = search_joint_partition_placement(
-            model,
-            profile,
-            cluster_state,
-            sample_args=sample_args,
-            sample_kwargs=sample_kwargs,
-            memory_config=self._planner_memory_config(),
-            min_worker_count=2,
-            max_worker_count=min(4, len(cluster_state.workers)),
-        )
-        if joint.status is not FeasibilityStatus.FEASIBLE:
-            reasons = ", ".join(joint.reasons) if joint.reasons else "PLANNING_INFEASIBLE"
-            raise ValueError(f"automatic planner failed: {reasons}")
-        return build_automatic_parallel_plan(
-            profile,
-            select_best_joint_placement_plan([joint]),
-        )
+        evidence: dict[str, object] = {
+            "planner_worker_resources": [
+                {
+                    "worker_id": str(worker.worker_id),
+                    "gpu_index": 0,
+                    "gpu_total_memory_mb": worker.resource.gpu_total_memory,
+                    "gpu_free_memory_mb": worker.resource.gpu_free_memory,
+                    "gpu_utilization": worker.resource.gpu_utilization,
+                }
+                for worker in cluster_state.workers
+            ],
+            "planner_worker_count_bounds": {
+                "min_worker_count": min_worker_count,
+                "max_worker_count": max_worker_count,
+            },
+            "control_rss_before_planning": _process_rss_bytes(),
+        }
+        model: object | None = None
+        sample_args: tuple[object, ...] = ()
+        sample_kwargs: dict[str, object] = {}
+        profile = None
+        joint = None
+        try:
+            model, sample_args, sample_kwargs = self._planner_workload(training_config)
+            profile = build_model_profile(
+                model,
+                engine_id=self._selected_engine_name(selected_engine),
+                model_name=training_config.model.name,
+                sample_args=sample_args,
+                sample_kwargs=sample_kwargs,
+                memory_config=memory_config,
+                required_backends=self._required_backends(training_config),
+            )
+            evidence["control_rss_after_profile"] = _process_rss_bytes()
+            joint = search_joint_partition_placement(
+                model,
+                profile,
+                cluster_state,
+                sample_args=sample_args,
+                sample_kwargs=sample_kwargs,
+                memory_config=memory_config,
+                min_worker_count=min_worker_count,
+                max_worker_count=max_worker_count,
+            )
+            if joint.status is not FeasibilityStatus.FEASIBLE:
+                reasons = ", ".join(joint.reasons) if joint.reasons else "PLANNING_INFEASIBLE"
+                raise ValueError(f"automatic planner failed: {reasons}")
+            plan = build_automatic_parallel_plan(
+                profile,
+                select_best_joint_placement_plan([joint]),
+            )
+            evidence["control_rss_after_plan_created"] = _process_rss_bytes()
+            return plan
+        finally:
+            model = None
+            sample_args = ()
+            sample_kwargs = {}
+            profile = None
+            joint = None
+            gc.collect()
+            evidence["control_rss_after_cleanup"] = _process_rss_bytes()
+            self._last_planning_evidence = dict(evidence)
+
+    def _automatic_worker_count_bounds(
+        self,
+        *,
+        cluster_state: ClusterState,
+    ) -> tuple[int, int]:
+        available_worker_count = len(cluster_state.workers)
+        max_worker_count = min(4, available_worker_count)
+        min_worker_count = 2
+        min_override = os.environ.get("SHARDGRID_AUTOMATIC_MIN_WORKERS", "").strip()
+        max_override = os.environ.get("SHARDGRID_AUTOMATIC_MAX_WORKERS", "").strip()
+        if max_override:
+            try:
+                requested_max = int(max_override)
+            except ValueError as exc:
+                raise ValueError(
+                    "invalid SHARDGRID_AUTOMATIC_MAX_WORKERS: must be an integer"
+                ) from exc
+            if requested_max < 2:
+                raise ValueError(
+                    "invalid SHARDGRID_AUTOMATIC_MAX_WORKERS: must be >= 2"
+                )
+            if requested_max > available_worker_count:
+                raise ValueError(
+                    "invalid SHARDGRID_AUTOMATIC_MAX_WORKERS: exceeds available worker count"
+                )
+            max_worker_count = min(max_worker_count, requested_max)
+        if not min_override:
+            if min_worker_count > max_worker_count:
+                raise ValueError("automatic planning requires at least two available workers")
+            return min_worker_count, max_worker_count
+        try:
+            requested = int(min_override)
+        except ValueError as exc:
+            raise ValueError(
+                "invalid SHARDGRID_AUTOMATIC_MIN_WORKERS: must be an integer"
+            ) from exc
+        if requested < 2:
+            raise ValueError(
+                "invalid SHARDGRID_AUTOMATIC_MIN_WORKERS: must be >= 2"
+            )
+        if requested > max_worker_count:
+            raise ValueError(
+                "invalid SHARDGRID_AUTOMATIC_MIN_WORKERS: exceeds max worker count"
+            )
+        return requested, max_worker_count
 
     def _planner_workload(
         self,
@@ -1506,7 +1597,12 @@ class JobManager:
             backend = "nccl"
         return (backend,)
 
-    def _launch_metadata(self, selected_engine: SelectedEngine) -> dict[str, object]:
+    def _launch_metadata(
+        self,
+        selected_engine: SelectedEngine,
+        *,
+        planning_evidence: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         metadata = dict(selected_engine.engine.launch_metadata(selected_engine.parallel_plan))
         plan = selected_engine.parallel_plan
         engine_id = self._selected_engine_name(selected_engine, required=False)
@@ -1524,6 +1620,8 @@ class JobManager:
             metadata["attempted_worker_counts"] = list(
                 plan.planning_provenance.attempted_worker_counts
             )
+        if planning_evidence:
+            metadata["planning_evidence"] = dict(planning_evidence)
         return metadata
 
     def _selected_engine_name(
@@ -2037,13 +2135,8 @@ class JobManager:
         *,
         snapshot: JobSnapshot | None = None,
     ) -> JobStatus:
-        persisted = self._status_store.save(status)
-        if snapshot is not None:
-            self._status_store.save_path(
-                Path(snapshot.diagnostics_path) / "job-status.json",
-                persisted,
-            )
-        return persisted
+        del snapshot
+        return self._status_store.save(status)
 
     def _failed_status(
         self,
@@ -2084,7 +2177,7 @@ class JobManager:
         )
 
     def _load_status(self, snapshot: JobSnapshot, fallback: JobStatus) -> JobStatus:
-        path = Path(snapshot.diagnostics_path) / "job-status.json"
+        path = Path(snapshot.root_path) / "job-status.json"
         return self._status_store.load_path(path) if path.exists() else fallback
 
     def _save_terminal_snapshot(

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
+import weakref
 from dataclasses import replace
 from pathlib import Path
 
@@ -42,6 +44,7 @@ from shardgrid.common.models import (
     as_worker_id,
 )
 from shardgrid.control.job_manager import JobManager, create_training_job
+from shardgrid.control.resource_manager import ResourceManager
 from shardgrid.control.status_store import StatusStore
 from shardgrid.engines.models import (
     ParallelPlan,
@@ -435,7 +438,7 @@ class FakeLauncher:
                 )
             ),
         )
-        path = Path(context.snapshot.diagnostics_path) / "job-status.json"
+        path = Path(context.snapshot.root_path) / "job-status.json"
         path.write_text(json.dumps(status.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
         result_status = (
             LauncherResultStatus.SUCCESS
@@ -754,7 +757,7 @@ def test_orchestrates_full_training_lifecycle(tmp_path: Path) -> None:
     )
     persisted = JobStatus.from_dict(
         json.loads(
-            (Path(result.snapshot.diagnostics_path) / "job-status.json").read_text(
+            (Path(result.snapshot.root_path) / "job-status.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -773,6 +776,7 @@ def test_orchestrates_full_training_lifecycle(tmp_path: Path) -> None:
     assert persisted.final_metrics["final_loss"] == 0.25
     assert persisted.checkpoint_ref == "checkpoint/manifest.json"
     assert metadata["job_status_path"].endswith("job-status.json")
+    assert not (Path(result.snapshot.diagnostics_path) / "job-status.json").exists()
     manifest = json.loads((Path(result.snapshot.checkpoint_path) / "manifest.json").read_text())
     assert manifest["checkpoint_ref"] == "checkpoint/manifest.json"
     assert manifest["required_shard_count"] == 2
@@ -968,7 +972,7 @@ def test_probe_network_link_sets_measurement_timestamp(tmp_path: Path) -> None:
     assert link.measured_at is not None
 
 
-def test_active_reservation_removes_worker_free_memory_from_planning(tmp_path: Path) -> None:
+def test_active_reservation_preserves_fresh_worker_memory_for_planning(tmp_path: Path) -> None:
     events: list[str] = []
     manager, _config_path = _build_manager(tmp_path, events)
     resource = _worker_resource("gpu4060", "10.87.5.155", "RTX 4060")
@@ -985,14 +989,100 @@ def test_active_reservation_removes_worker_free_memory_from_planning(tmp_path: P
         current_job_id=as_job_id("job-b"),
     )
 
-    assert adjusted[0].gpu_free_memory == 0
-    assert adjusted[0].gpu_utilization == 100.0
+    assert adjusted[0].gpu_free_memory == resource.gpu_free_memory
+    assert adjusted[0].gpu_utilization == resource.gpu_utilization
 
     same_job = manager._apply_active_resource_reservations(
         [resource],
         current_job_id=as_job_id("job-a"),
     )
     assert same_job[0].gpu_free_memory == resource.gpu_free_memory
+
+
+def test_repeated_large_model_planning_does_not_retain_models(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    manager, _config_path = _build_manager(tmp_path, events)
+    training_config = load_training_config(_large_automatic_training_config(tmp_path))
+    cluster_state = manager._resource_manager.build_cluster_state(
+        [
+            _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+            _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+        ],
+        network_state=_network_state(),
+        require_network=True,
+    )
+    original_planner_workload = manager._planner_workload
+    seen: list[weakref.ReferenceType[object]] = []
+
+    def wrapped_planner_workload(config):
+        model, sample_args, sample_kwargs = original_planner_workload(config)
+        seen.append(weakref.ref(model))
+        return model, sample_args, sample_kwargs
+
+    manager._planner_workload = wrapped_planner_workload
+
+    for _ in range(5):
+        plan = manager._build_automatic_parallel_plan(
+            training_config=training_config,
+            cluster_state=cluster_state,
+            selected_engine=FakeSelectedEngine(events),
+        )
+        gc.collect()
+
+        evidence = manager._last_planning_evidence
+        assert plan.partition_source == "automatic"
+        assert all(reference() is None for reference in seen)
+        assert set(evidence) >= {
+            "planner_worker_resources",
+            "control_rss_before_planning",
+            "control_rss_after_profile",
+            "control_rss_after_plan_created",
+            "control_rss_after_cleanup",
+        }
+        assert [item["worker_id"] for item in evidence["planner_worker_resources"]] == sorted(
+            ["gpu4060", "gpu1060"]
+        )
+
+
+def test_automatic_worker_count_bounds_honor_test_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    manager, _config_path = _build_manager(tmp_path, events)
+    cluster_state = manager._resource_manager.build_cluster_state(
+        [
+            _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+            _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+            _worker_resource("gpu4060-cqupt", "10.87.5.188", "RTX 4060"),
+        ],
+        network_state=None,
+        require_network=False,
+    )
+
+    monkeypatch.setenv("SHARDGRID_AUTOMATIC_MIN_WORKERS", "3")
+
+    assert manager._automatic_worker_count_bounds(cluster_state=cluster_state) == (3, 3)
+
+
+def test_automatic_worker_count_bounds_honor_max_worker_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _config_path = _build_manager(tmp_path, [])
+    cluster_state = ResourceManager().build_cluster_state(
+        [
+            _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+            _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+            _worker_resource("gpu4060-cqupt", "10.87.5.188", "RTX 4060"),
+        ]
+    )
+
+    monkeypatch.setenv("SHARDGRID_AUTOMATIC_MAX_WORKERS", "2")
+
+    assert manager._automatic_worker_count_bounds(cluster_state=cluster_state) == (2, 2)
 
 
 def test_collection_failure_persists_diagnostics_and_first_artifact_failure(
@@ -1052,7 +1142,7 @@ def test_collection_failure_persists_diagnostics_and_first_artifact_failure(
     diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
     canonical = StatusStore(tmp_path / "jobs").load(result.job.job_id)
     mirror = StatusStore(tmp_path / "jobs").load_path(
-        Path(result.snapshot.diagnostics_path) / "job-status.json"
+        Path(result.snapshot.root_path) / "job-status.json"
     )
 
     assert result.status.state is JobState.FAILED
@@ -1061,6 +1151,7 @@ def test_collection_failure_persists_diagnostics_and_first_artifact_failure(
     assert mirror.state is JobState.FAILED
     assert mirror.phase == canonical.phase
     assert mirror.failure == canonical.failure
+    assert not (Path(result.snapshot.diagnostics_path) / "job-status.json").exists()
     assert result.status.failure is not None
     assert result.status.failure.message == "ARTIFACT_SCP_FAILED: scp failed"
     assert result.status.failure.exit_code == 1

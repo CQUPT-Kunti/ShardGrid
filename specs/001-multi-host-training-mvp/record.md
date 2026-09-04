@@ -84,3 +84,69 @@
   - observed training memory evidence:
     - `stage0 peak_gpu_memory_bytes=5766092800`
     - `stage1 peak_gpu_memory_bytes=5725571072`
+
+## 2026-09-04 Three-Worker Gate + Scheme D Progress
+
+- three-worker hardware gate:
+  - command: `SHARDGRID_ENABLE_HARDWARE_TESTS=1 SHARDGRID_ENABLE_MULTI_HOST_TESTS=1 SHARDGRID_RUN_THREE_WORKER_HW=1 PYTHONPATH=src python -m pytest tests/multi_host/test_large_model_partition_gate.py::test_large_residual_transformer_three_worker_training_passes --run-hardware --run-multi-host -q`
+  - result: `PASS` on 2026-09-04
+  - selected planner mode: `SHARDGRID_AUTOMATIC_MIN_WORKERS=3`
+  - selected decision:
+    - `selected_worker_count=3`
+    - `attempted_worker_counts=[3]`
+    - `selected_candidate_id=pytorch_pipeline:three-worker-large:0:19-19:26-26:36`
+  - observed split:
+    - `stage0 -> gpu4060`
+    - `stage1 -> gpu1060`
+    - `stage2 -> gpu4060-cqupt`
+  - worker evidence now records `pid`, `distributed_initialized`, `stage_materialized`, `optimizer_step_completed`, `process_rss_before/after_materialization`, `cuda_before/after_stage_move`, and `cuda_training_peak_bytes`.
+- Scheme D test harness fixes:
+  - `tests/multi_host/large_model_gate.py` now reads live status from `diagnostics/job-status.json`, not the stale top-level file.
+  - running jobs now emit step-level `T074_TRAIN_EVIDENCE` during training, so the multi-job gate can stop at `>=3` real steps instead of waiting for full job completion.
+  - Scheme D dry-run `job_id` values are added to `known_job_ids` before each real launch so `wait_for_job_ids()` does not mistake a dry-run snapshot for the real long-running job.
+  - actual long-running Scheme D jobs now override `training_steps` in the submitted training config instead of only the parent control-process environment.
+- Scheme D live status on 2026-09-04:
+  - not yet re-verified end-to-end after the final `known_job_ids` fix.
+  - latest confirmed live A-only evidence before cleanup:
+    - `job-20260904085802-d775017f`
+    - `state=training`
+    - running steps observed from monitor payloads: `gpu4060=33+`, `gpu1060=34+`, `gpu4060-cqupt=35+`
+    - `AFTER_A` probe during live load took about `32.5s` and reported roughly:
+      - `gpu4060 free ~= 2122 MB`
+      - `gpu1060 free ~= 7 MB`
+      - `gpu4060-cqupt free ~= 3694 MB`
+  - cleanup after interrupted verification:
+    - stopped `job-20260904084012-3e42b7d6`
+    - stopped `job-20260904084820-eb38fedd`
+    - stopped `job-20260904085802-d775017f`
+    - no persistent reservation should remain after stop success
+
+## 2026-09-04 Job Status + Two-Worker Sharing Fix
+
+- authoritative job status:
+  - `JobStatus` now uses one mutable path only: `jobs/<job-id>/job-status.json`
+  - `JobManager`, `SSHLauncher`, `train`, `logs`, `stop`, multi-host helpers, and snapshot metadata now read/write the same file
+  - `diagnostics/job-status.json` is no longer written as a second mutable copy
+- stop lifecycle cleanup:
+  - `shardgrid stop` now releases reservations only after the persisted job state proves the job is stopped, or when a `NOOP` stop confirms an already-terminal job with no live tracked process to stop
+  - partial stop results do not release reservations early
+  - shared-GPU reservations are released per job id, so stopping Job A does not remove Job B on the same GPU
+- worker-count bounds for two-host gates:
+  - automatic planner test overrides now support `SHARDGRID_AUTOMATIC_MAX_WORKERS`
+  - this keeps D1/D2 hardware validation on exactly two workers without changing planner search rules
+- two-worker Scheme D hardware gates:
+  - replaced the old three-worker `large + medium + small` stress harness with two focused gates:
+    - `D1`: `medium + small`
+    - `D2`: `large + small`
+  - both gates force two-worker planning, require real training evidence for both jobs, require the second job to plan against reduced live free memory, and require at least one physical GPU to hold stages from both jobs at the same time
+  - cleanup for both gates now verifies:
+    - `status = stopped`
+    - reservations released
+    - no remaining test pids
+- local verification on 2026-09-04:
+  - `PYTHONPATH=src /home/yangjilei/anaconda3/bin/python -m pytest tests/unit/test_job_status.py tests/integration/test_stop_cli.py tests/integration/test_train_orchestration.py::test_orchestrates_full_training_lifecycle tests/integration/test_train_orchestration.py::test_automatic_worker_count_bounds_honor_test_override tests/integration/test_train_orchestration.py::test_automatic_worker_count_bounds_honor_max_worker_override tests/integration/test_logs_cli.py tests/integration/test_ssh_monitor.py tests/integration/test_ssh_stop.py tests/integration/test_ssh_cleanup.py --run-integration -q`
+  - result: `55 passed`
+  - separate compile/smoke pass including the multi-host gate modules without hardware flags:
+    - result: `6 passed, 88 skipped`
+- hardware note:
+  - this turn implemented the two-worker D1/D2 gates but did not rerun the real two-host hardware validation end to end after the lifecycle fix

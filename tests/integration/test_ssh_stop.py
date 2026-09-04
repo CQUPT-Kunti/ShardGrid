@@ -342,7 +342,7 @@ def _train_log(checkpoint_path: str, *, final_loss: float = 0.25) -> str:
 
 def _persisted_status(context) -> JobStatus:
     return JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
 

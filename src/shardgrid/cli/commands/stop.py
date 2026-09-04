@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from shardgrid.cli.context import EXIT_CONFIG_ERROR, EXIT_OK, EXIT_RUNTIME_ERROR, EXIT_USAGE
+from shardgrid.common.enums import JobState
 from shardgrid.common.models import as_backend_name, as_job_id
 from shardgrid.control.resource_manager import ResourceManager
 from shardgrid.control.status_store import StatusStore
@@ -67,7 +68,7 @@ def _load_execution_plan(job_root: Path) -> ExecutionPlan:
 
 
 def _load_job_status(job_root: Path, job_id: str) -> JobStatus:
-    path = job_root / "diagnostics" / "job-status.json"
+    path = job_root / "job-status.json"
     if not path.is_file():
         raise RuntimeError(f"job status not found: {path}")
     return StatusStore(job_root.parent).load_path(path)
@@ -136,6 +137,23 @@ def _execute_stop(context: LauncherContext, status: JobStatus) -> LauncherResult
     del status
     cluster_config = getattr(context, "_cluster_config")
     return _build_launcher(cluster_config).stop(context)
+
+
+def _should_release_resources(
+    *,
+    previous_status: JobStatus,
+    current_status: JobStatus,
+    result: LauncherResult,
+) -> bool:
+    if current_status.state is JobState.STOPPED:
+        return True
+    if result.status is LauncherResultStatus.NOOP and previous_status.state in {
+        JobState.STOPPED,
+        JobState.COMPLETED,
+        JobState.FAILED,
+    }:
+        return True
+    return False
 
 
 def _result_payload(
@@ -217,6 +235,13 @@ def run_stop_command(args: argparse.Namespace) -> int:
             print("stop: cancelled; no action taken")
             return EXIT_OK
         result = _execute_stop(context, previous_status)
+        current_status = _load_job_status(_job_root(args), args.job_id)
+        if _should_release_resources(
+            previous_status=previous_status,
+            current_status=current_status,
+            result=result,
+        ):
+            StatusStore(_jobs_root(args)).release_resources(args.job_id)
     except ValueError as error:
         print(f"stop: {error}")
         return EXIT_USAGE

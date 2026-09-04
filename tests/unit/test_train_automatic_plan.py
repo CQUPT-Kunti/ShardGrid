@@ -136,3 +136,29 @@ def test_large_runtime_stage_build_does_not_call_full_model_builder(
     assert isinstance(sample_outputs, tuple)
     assert evidence["full_model_materialized"] is False
     assert evidence["owned_module_paths"][0] == "token_embedding"
+    assert evidence["process_rss_before_materialization"] == evidence[
+        "process_rss_before_materialization_bytes"
+    ]
+    assert evidence["process_rss_after_materialization"] == evidence[
+        "process_rss_after_materialization_bytes"
+    ]
+    assert evidence["cuda_before_stage_move_bytes"] == evidence[
+        "cuda_allocated_before_stage_to_device_bytes"
+    ]
+    assert evidence["cuda_after_stage_move_bytes"] == evidence[
+        "cuda_allocated_after_stage_to_device_bytes"
+    ]
+
+
+def test_large_runtime_stage_build_prunes_unused_boundary_state() -> None:
+    module, sample_inputs, sample_outputs, _evidence = _build_large_stage_module(
+        _large_training_config(),
+        _large_parallel_plan(),
+        stage_index=1,
+        device=torch.device("cpu"),
+        sample_batch_size=1,
+    )
+
+    assert module.__class__.__name__ == "LargeResidualTransformerStage"
+    assert len(sample_inputs) == 2
+    assert isinstance(sample_outputs, torch.Tensor)

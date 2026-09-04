@@ -11,6 +11,7 @@ from examples.models.large_residual_transformer import (
     build_large_residual_transformer_stage,
     large_residual_module_paths,
     make_large_residual_batch,
+    required_boundary_state_names,
     train_step,
 )
 
@@ -20,6 +21,20 @@ def _small_config() -> LargeResidualTransformerConfig:
         vocab_size=128,
         hidden_size=32,
         num_layers=4,
+        num_heads=4,
+        ffn_size=64,
+        sequence_length=8,
+        batch_size=2,
+        memory_bank_rows=16,
+        memory_bank_touch_rows=2,
+    )
+
+
+def _three_layer_config() -> LargeResidualTransformerConfig:
+    return LargeResidualTransformerConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_layers=3,
         num_heads=4,
         ffn_size=64,
         sequence_length=8,
@@ -172,3 +187,61 @@ def test_large_full_builder_can_materialize_meta_parameters() -> None:
     config = _small_config()
     model = build_large_residual_transformer(config, seed=42, device="meta")
     assert {str(parameter.device) for parameter in model.parameters()} == {"meta"}
+
+
+def test_required_boundary_state_names_drop_unused_long_skip_for_attn_split() -> None:
+    config = _three_layer_config()
+    paths = large_residual_module_paths(config)
+    stage1_paths = paths[19:]
+
+    assert stage1_paths[0] == "blocks.2.attn.qkv"
+    assert required_boundary_state_names(stage1_paths, ("x",)) == ("x", "norm1_out")
+
+
+def test_stage_boundary_backward_keeps_gradients_for_split_19() -> None:
+    config = _three_layer_config()
+    full = build_large_residual_transformer(config, seed=42)
+    paths = large_residual_module_paths(config)
+    split = 19
+    stage1_inputs = required_boundary_state_names(paths[split:], ("x",))
+    stage0 = build_large_residual_transformer_stage(
+        config,
+        stage_metadata=_stage_meta("stage0", paths[:split]),
+        next_stage_start_path=paths[split],
+        input_state_names=("input_ids",),
+        output_state_names=stage1_inputs,
+        seed=42,
+    )
+    stage1 = build_large_residual_transformer_stage(
+        config,
+        stage_metadata=_stage_meta("stage1", paths[split:]),
+        next_stage_start_path=None,
+        input_state_names=stage1_inputs,
+        output_state_names=("x",),
+        seed=42,
+    )
+
+    full_state = full.state_dict()
+    stage0.load_state_dict(
+        {name: tensor for name, tensor in full_state.items() if name in stage0.state_dict()},
+        strict=True,
+    )
+    stage1.load_state_dict(
+        {name: tensor for name, tensor in full_state.items() if name in stage1.state_dict()},
+        strict=True,
+    )
+
+    inputs, targets = make_large_residual_batch(config, seed=9, step=1)
+    boundary = stage0(inputs)
+    assert isinstance(boundary, tuple)
+    assert len(boundary) == 2
+    for tensor in boundary:
+        tensor.retain_grad()
+    logits = stage1(*boundary)
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+    )
+    loss.backward()
+
+    assert all(tensor.grad is not None for tensor in boundary)

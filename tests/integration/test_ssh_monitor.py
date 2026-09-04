@@ -384,7 +384,7 @@ def test_monitor_persists_completed_status_and_deduplicates_loss_history(tmp_pat
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.SUCCESS
@@ -442,7 +442,7 @@ def test_monitor_accepts_rank_local_checkpoint_evidence_without_rank0_final_loss
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.SUCCESS
@@ -479,7 +479,7 @@ def test_monitor_reports_running_rendezvous_without_faking_training(tmp_path: Pa
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.SUCCESS
@@ -525,7 +525,7 @@ def test_monitor_tracks_training_progress_and_is_idempotent(tmp_path: Path) -> N
     first = launcher.monitor(context)
     second = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert first.status is LauncherResultStatus.SUCCESS
@@ -611,7 +611,7 @@ def test_monitor_keeps_alive_rank_running_when_log_read_times_out(tmp_path: Path
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
     monitor_payload = json.loads(
         (Path(context.snapshot.diagnostics_path) / "monitor-gpu4060-rank0.json").read_text()
@@ -669,7 +669,7 @@ def test_monitor_keeps_unknown_process_state_nonterminal_when_liveness_probe_tim
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
     monitor_payload = json.loads(
         (Path(context.snapshot.diagnostics_path) / "monitor-gpu4060-rank0.json").read_text()
@@ -713,7 +713,7 @@ def test_monitor_keeps_transport_probe_failure_as_unknown_not_exited(tmp_path: P
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
     monitor_payload = json.loads(
         (Path(context.snapshot.diagnostics_path) / "monitor-gpu4060-rank0.json").read_text()
@@ -764,7 +764,7 @@ def test_monitor_marks_rank_crash_failed_without_losing_other_rank(tmp_path: Pat
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.PARTIAL
@@ -814,7 +814,7 @@ def test_monitor_exit_without_checkpoint_does_not_mark_completed(tmp_path: Path)
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.FAILED
@@ -848,7 +848,7 @@ def test_monitor_fails_rendezvous_timeout_from_config_based_threshold(tmp_path: 
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.FAILED
@@ -889,7 +889,7 @@ def test_monitor_plain_training_markers_cancel_rendezvous_timeout(tmp_path: Path
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.SUCCESS
@@ -934,7 +934,7 @@ def test_monitor_training_progress_uses_last_progress_timestamp_not_launch_time(
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.SUCCESS
@@ -984,7 +984,7 @@ def test_monitor_fails_training_stall_from_last_progress_timestamp(tmp_path: Pat
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
     monitor_payload = json.loads(
         (Path(context.snapshot.diagnostics_path) / "monitor-gpu4060-rank0.json").read_text()
@@ -1069,7 +1069,7 @@ def test_monitor_reports_lost_connection_without_faking_terminal_failure(tmp_pat
 
     result = launcher.monitor(context)
     persisted = JobStatus.from_dict(
-        json.loads((Path(context.snapshot.diagnostics_path) / "job-status.json").read_text())
+        json.loads((Path(context.snapshot.root_path) / "job-status.json").read_text())
     )
 
     assert result.status is LauncherResultStatus.PARTIAL

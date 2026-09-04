@@ -398,7 +398,7 @@ def _failure(worker_id: str, message: str) -> FailureRecord:
 
 
 def _persisted_status(context: LauncherContext) -> JobStatus:
-    path = Path(context.snapshot.diagnostics_path) / "job-status.json"
+    path = Path(context.snapshot.root_path) / "job-status.json"
     if not path.is_file():
         return context.job_status
     return JobStatus.from_dict(json.loads(path.read_text(encoding="utf-8")))
@@ -425,7 +425,7 @@ def test_cleanup_after_completed_job_removes_temp_and_preserves_snapshot(
     local_log = Path(context.snapshot.logs_path) / "gpu4060" / "rank0-stage0" / "stdout.log"
     local_log.parent.mkdir(parents=True, exist_ok=True)
     local_log.write_text("local log", encoding="utf-8")
-    diagnostics = Path(context.snapshot.diagnostics_path) / "job-status.json"
+    diagnostics = Path(context.snapshot.root_path) / "job-status.json"
     diagnostics.write_text(json.dumps(context.job_status.to_dict()), encoding="utf-8")
     checkpoint = (
         Path(context.snapshot.checkpoint_path) / "files" / "gpu4060" / "rank0-stage0" / "model.pt"

@@ -139,9 +139,7 @@ def write_snapshot_metadata(
         "checkpoint": _contained_path(
             snapshot.checkpoint_path, _CHECKPOINT_METADATA_FILE, snapshot_root
         ),
-        "job_status": _contained_path(
-            snapshot.diagnostics_path, _JOB_STATUS_FILE, snapshot_root
-        ),
+        "job_status": _contained_path(snapshot.root_path, _JOB_STATUS_FILE, snapshot_root),
         "failure": _contained_path(snapshot.diagnostics_path, _FAILURE_FILE, snapshot_root),
         "manifest": _contained_path(snapshot.diagnostics_path, _MANIFEST_FILE, snapshot_root),
         "manifest_yaml": _contained_path(

@@ -71,7 +71,7 @@ def _load_execution_plan(job_root: Path) -> ExecutionPlan:
 
 
 def _load_job_status(job_root: Path) -> JobStatus:
-    path = job_root / "diagnostics" / "job-status.json"
+    path = job_root / "job-status.json"
     if not path.is_file():
         raise RuntimeError(f"job status not found: {path}")
     return JobStatus.from_dict(json.loads(path.read_text(encoding="utf-8")))

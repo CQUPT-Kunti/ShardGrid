@@ -192,7 +192,7 @@ def _write_snapshot_metadata(
         json.dumps(plan.to_dict(), indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    (root / "diagnostics" / "job-status.json").write_text(
+    (root / "job-status.json").write_text(
         json.dumps(status.to_dict(), indent=2, sort_keys=True),
         encoding="utf-8",
     )
