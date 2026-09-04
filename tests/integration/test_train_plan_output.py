@@ -811,7 +811,7 @@ artifacts:
     payload = train_command._payload(result)
     human = train_command._render_human(result)
     metadata_json = json.loads(
-        (Path(result.snapshot.root_path) / "diagnostics" / "snapshot-metadata.json").read_text()
+        (Path(result.snapshot.diagnostics_path) / "snapshot-metadata.json").read_text()
     )
 
     assert planner_events == ["t109", "t111", "t112", "t114"]
@@ -837,6 +837,20 @@ artifacts:
     assert payload["world_size"] == 2
     assert len(payload["placement"]) == 2
     assert len(payload["assignments"]) == 2
+    assert result.execution_plan.workers[0].launch_command == (
+        "python examples/models/train_automatic_plan.py --rank 0"
+    )
+    assert result.execution_plan.workers[1].launch_command == (
+        "python examples/models/train_automatic_plan.py --rank 1"
+    )
+    assert result.execution_plan.workers[0].environment["SHARDGRID_PARTITION_SOURCE"] == "automatic"
+    assert result.execution_plan.workers[0].environment["SHARDGRID_SELECTED_CANDIDATE_ID"]
+    assert result.execution_plan.workers[0].environment["SHARDGRID_AUTOMATIC_MICROBATCHES"] == "2"
+    assert result.execution_plan.workers[1].environment["SHARDGRID_AUTOMATIC_MICROBATCHES"] == "2"
+    assert (
+        result.execution_plan.workers[0].environment["SHARDGRID_AUTOMATIC_CHECKPOINT_DIR"]
+        == "checkpoint"
+    )
     assert metadata_json["execution_plan_audit"]["plan_mode"] == "automatic"
     assert metadata_json["execution_plan_audit"]["planning"] == payload["planning"]
     assert "Plan Mode: automatic" in human

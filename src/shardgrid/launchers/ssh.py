@@ -33,6 +33,7 @@ from shardgrid.common.enums import BackendStatus, FailureStage, JobState
 from shardgrid.common.errors import make_failure_record
 from shardgrid.common.process import ProcessResult, redact_text
 from shardgrid.control.status_store import StatusStore
+from shardgrid.distributed.backend import select_backend
 from shardgrid.jobs.models import FailureRecord, JobStatus
 from shardgrid.launchers.base import (
     Launcher,
@@ -3820,13 +3821,14 @@ class SSHLauncher(Launcher):
             {
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONUNBUFFERED": "1",
-                "PYTHONPATH": remote_code_root,
+                "PYTHONPATH": f"{remote_code_root}:{remote_code_root}/src",
                 "RANK": str(assignment.rank),
                 "WORLD_SIZE": str(context.execution_plan.world_size),
                 "LOCAL_RANK": str(assignment.local_rank),
                 "MASTER_ADDR": context.execution_plan.master.address,
                 "MASTER_PORT": str(context.execution_plan.master.port),
                 "SHARDGRID_JOB_ID": str(context.job.job_id),
+                "SHARDGRID_REMOTE_SNAPSHOT_ROOT": self._remote_job_root(context),
                 "SHARDGRID_STAGE": assignment.stage or "",
                 "SHARDGRID_LOG_PATH": log_path,
                 _LAUNCHER_OWNS_LOG_ENV: "1",
@@ -3834,7 +3836,7 @@ class SSHLauncher(Launcher):
                 **network_env,
             }
         )
-        backend = str(context.execution_plan.backend)
+        backend = select_backend(str(context.execution_plan.backend))
         env.setdefault("SHARDGRID_BACKEND", backend)
         env.setdefault("GLOO_SOCKET_IFNAME", env.get("GLOO_SOCKET_IFNAME", ""))
         env.setdefault("NCCL_SOCKET_IFNAME", env.get("NCCL_SOCKET_IFNAME", ""))

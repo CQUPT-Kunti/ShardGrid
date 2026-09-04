@@ -44,3 +44,19 @@
 - 方案划分决策输出:
   - automatic CLI path preserves `partition_source=automatic`, `selected_candidate_id`, `selected_worker_count`, `attempted_worker_counts`, and `total_cross_worker_communication_bytes`
   - the final stage placement remains auditable as `stage -> worker -> rank -> GPU`, with per-stage estimated peak memory, usable memory, remaining memory, and utilization
+
+## 2026-09-03 Automatic Plan Hardware Gate
+
+- automatic CLI invocation: added `examples/train-automatic-hf.yaml` and `tests/multi_host/test_automatic_partition_gate.py` so the live gate starts from `shardgrid train` with `planning.mode=automatic`, not a hand-built `ExecutionPlan`.
+- selected worker count / selected workers / attempted worker counts: the live gate reads the saved audit payload from `snapshot-metadata.json` and verifies planner-selected workers from the real automatic plan output.
+- stage -> worker mapping: automatic live runs preserve `stage -> worker -> rank -> GPU` through the saved `ParallelPlan`, `ExecutionPlan`, rank placement evidence, and checkpoint metadata.
+- training peak / usable memory: non-dry-run automatic launches now re-probe selected workers immediately before launch and fail closed with `RESOURCE_CHANGED` if current free memory drops below the saved per-stage `estimated_peak_training_memory`.
+- communication metadata: automatic assignments preserve `selected_candidate_id`, communication-edge labels, and saved placement metadata; the new runner uses PyTorch pipeline splitting from saved stage boundaries instead of static `stage0.py` / `stage1.py`.
+- SSH launch: automatic plans now launch `examples/models/train_automatic_plan.py` via `SSHLauncher`; static/manual plans keep the existing `train_pipeline.py` path.
+- forward / activation transfer / loss / backward / gradient transfer / optimizer update: `train_automatic_plan.py` rebuilds the full supported model, recreates PyTorch pipeline stages from saved module boundaries, runs short real training steps, records finite loss on the last stage, and persists parameter-update evidence.
+- checkpoint: per-rank checkpoints plus `checkpoint-metadata.json` now record `job_id`, `partition_source`, `selected_candidate_id`, `selected_worker_count`, `master`, and `stage_to_worker`.
+- cleanup / evidence paths: live gate evidence is designed to land in the normal job snapshot under `plan/`, `diagnostics/`, `logs/`, and `checkpoint/`; new compatibility note: `docs/compatibility/automatic-partition.md`.
+- 方案划分决策输出:
+  - automatic live path keeps planner-owned split decisions from `ParallelPlan.stage_metadata`, including stage module paths, selected candidate id, selected worker count, attempted worker counts, and cross-worker communication bytes
+  - launch-time code does not recompute partition or placement; it only validates the saved plan against fresh worker/network state
+  - status on 2026-09-03: implementation and local regression coverage passed; live hardware evidence remains pending because this turn did not execute a real worker run

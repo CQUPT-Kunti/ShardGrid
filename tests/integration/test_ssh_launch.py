@@ -324,6 +324,8 @@ def test_launch_injects_remote_snapshot_env_and_independent_logs(tmp_path: Path)
     assert rank0["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert rank0["env"]["MASTER_ADDR"] == "10.87.5.155"
     assert rank0["env"]["MASTER_PORT"] == "29500"
+    assert rank0["env"]["SHARDGRID_BACKEND"] == "nccl"
+    assert rank1["env"]["SHARDGRID_BACKEND"] == "nccl"
     assert rank0["env"]["NCCL_SOCKET_IFNAME"] == "eth3"
     assert rank1["env"]["NCCL_SOCKET_IFNAME"] == "eth0"
     assert rank0["env"]["GLOO_SOCKET_IFNAME"] == "eth3"
@@ -340,7 +342,14 @@ def test_launch_injects_remote_snapshot_env_and_independent_logs(tmp_path: Path)
     assert rank1["env"]["SHARDGRID_STAGE"] == "stage1"
     assert rank0["env"]["SHARDGRID_LAUNCHER_OWNS_LOG_SINK"] == "1"
     assert rank1["env"]["SHARDGRID_LAUNCHER_OWNS_LOG_SINK"] == "1"
-    assert rank0["env"]["PYTHONPATH"] == "/var/tmp/shardgrid/jobs/job-0096/code"
+    assert rank0["env"]["PYTHONPATH"] == (
+        "/var/tmp/shardgrid/jobs/job-0096/code:/var/tmp/shardgrid/jobs/job-0096/code/src"
+    )
+    assert rank1["env"]["PYTHONPATH"] == (
+        "/var/tmp/shardgrid/jobs/job-0096/code:/var/tmp/shardgrid/jobs/job-0096/code/src"
+    )
+    assert rank0["env"]["SHARDGRID_REMOTE_SNAPSHOT_ROOT"] == "/var/tmp/shardgrid/jobs/job-0096"
+    assert rank1["env"]["SHARDGRID_REMOTE_SNAPSHOT_ROOT"] == "/var/tmp/shardgrid/jobs/job-0096"
     assert rank0["env"]["CUDA_VISIBLE_DEVICES"] == "0"
     assert rank1["env"]["CUDA_VISIBLE_DEVICES"] == "0"
     assert rank0["log_path"] == (
@@ -362,6 +371,35 @@ def test_launch_injects_remote_snapshot_env_and_independent_logs(tmp_path: Path)
         (0, 4100, "stage0"),
         (1, 4200, "stage1"),
     }
+
+
+@pytest.mark.integration
+def test_launch_resolves_auto_backend_before_remote_launch(tmp_path: Path) -> None:
+    base = _context(tmp_path)
+    context = replace(
+        base,
+        execution_plan=replace(base.execution_plan, backend=as_backend_name("auto")),
+    )
+    runtimes = {
+        "gpu4060": FakeRuntime(script_results=[_result("launch", stdout="4100")]),
+        "gpu1060": FakeRuntime(script_results=[_result("launch", stdout="4200")]),
+    }
+    launcher = SSHLauncher(
+        _cluster_config(),
+        runtime_factory=lambda worker: runtimes[str(worker.worker_id)],
+    )
+    launcher._distribution_records = _distribution_records(
+        str(context.job.job_id),
+        "/var/tmp/shardgrid/jobs/job-0096",
+    )
+
+    result = launcher.launch(context)
+
+    assert result.status is LauncherResultStatus.SUCCESS
+    rank0 = _payload(runtimes["gpu4060"].script_calls[0])
+    rank1 = _payload(runtimes["gpu1060"].script_calls[0])
+    assert rank0["env"]["SHARDGRID_BACKEND"] == "nccl"
+    assert rank1["env"]["SHARDGRID_BACKEND"] == "nccl"
 
 
 @pytest.mark.integration

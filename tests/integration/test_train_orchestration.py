@@ -43,7 +43,13 @@ from shardgrid.common.models import (
 )
 from shardgrid.control.job_manager import JobManager, create_training_job
 from shardgrid.control.status_store import StatusStore
-from shardgrid.engines.models import ParallelPlan
+from shardgrid.engines.models import (
+    ParallelPlan,
+    ParallelPlanPlacement,
+    ParallelPlanProvenance,
+    ParallelPlanStage,
+    TrainingMemoryEstimate,
+)
 from shardgrid.jobs.models import JobStatus
 from shardgrid.launchers.base import (
     LauncherOperation,
@@ -51,7 +57,11 @@ from shardgrid.launchers.base import (
     LauncherResultStatus,
     WorkerResult,
 )
-from shardgrid.planner.models import ExecutionPlan, MasterMetadata, WorkerAssignment
+from shardgrid.planner.models import (
+    ExecutionPlan,
+    MasterMetadata,
+    WorkerAssignment,
+)
 from shardgrid.resources.models import NetworkLink, NetworkState, WorkerResource
 from shardgrid.workers.models import WorkerRuntime
 from shardgrid.workers.probe import (
@@ -636,6 +646,68 @@ def _build_manager(
     return manager, config_path
 
 
+def _automatic_parallel_plan() -> ParallelPlan:
+    return ParallelPlan(
+        parallel_plan_id="auto-plan-1",
+        engine=as_engine_name("galvatron"),
+        model_name="partition-stress",
+        world_size=2,
+        stages=["stage0", "stage1"],
+        partition_source="automatic",
+        selected_candidate_id="candidate-auto-1",
+        stage_metadata=[
+            ParallelPlanStage(
+                stage_id="stage0",
+                rank=0,
+                module_ids=("m0", "m1"),
+                module_paths=("input_proj", "up_proj"),
+                start_index=0,
+                stop_index=6,
+                estimated_peak_training_memory=TrainingMemoryEstimate(
+                    estimated_peak_bytes=512 * 1024 * 1024,
+                    planner_required_bytes=1024 * 1024 * 1024,
+                ),
+                placement=ParallelPlanPlacement(
+                    worker_id="gpu4060",
+                    rank=0,
+                    gpu_index=0,
+                    usable_memory_before_bytes=6 * 1024 * 1024 * 1024,
+                    remaining_memory_bytes=5 * 1024 * 1024 * 1024,
+                    utilization_ratio=0.15,
+                ),
+            ),
+            ParallelPlanStage(
+                stage_id="stage1",
+                rank=1,
+                module_ids=("m2", "m3"),
+                module_paths=("skip_fusion2", "output_head"),
+                start_index=6,
+                stop_index=11,
+                estimated_peak_training_memory=TrainingMemoryEstimate(
+                    estimated_peak_bytes=512 * 1024 * 1024,
+                    planner_required_bytes=1024 * 1024 * 1024,
+                ),
+                placement=ParallelPlanPlacement(
+                    worker_id="gpu1060",
+                    rank=1,
+                    gpu_index=0,
+                    usable_memory_before_bytes=3 * 1024 * 1024 * 1024,
+                    remaining_memory_bytes=2 * 1024 * 1024 * 1024,
+                    utilization_ratio=0.33,
+                ),
+            ),
+        ],
+        planning_provenance=ParallelPlanProvenance(
+            partition_source="automatic",
+            selected_candidate_id="candidate-auto-1",
+            selected_worker_count=2,
+            attempted_worker_counts=(2,),
+            total_cross_worker_communication_bytes=4096,
+        ),
+        requirements={"plan_mode": "automatic"},
+    )
+
+
 def test_orchestrates_full_training_lifecycle(tmp_path: Path) -> None:
     events: list[str] = []
     manager, config_path = _build_manager(tmp_path, events)
@@ -684,6 +756,168 @@ def test_orchestrates_full_training_lifecycle(tmp_path: Path) -> None:
         "launcher_monitor",
         "collector_collect",
     ]
+
+
+def test_prepare_live_execution_plan_rejects_resource_drift(tmp_path: Path) -> None:
+    events: list[str] = []
+    manager, _config_path = _build_manager(tmp_path, events)
+    automatic_config_path = tmp_path / "train-auto.yaml"
+    automatic_config_path.write_text(
+        """
+job:
+  name: train-auto
+  backend: ssh
+  communication_backend: nccl
+model:
+  name: partition-stress
+  type: hf_style
+resources:
+  world_size: 4
+  preferred_workers: [gpu4060, gpu1060]
+planning:
+  mode: automatic
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    automatic_config = load_training_config(automatic_config_path)
+    snapshot = manager._artifact_store.create_snapshot(
+        create_training_job(
+            config_path="train-auto.yaml",
+            model="partition-stress",
+            requested_world_size=4,
+            backend_preference=as_backend_name("nccl"),
+            runtime_environment_ref="env:cluster/shardgrid",
+            job_id=as_job_id("job-auto-preflight"),
+        )
+    )
+    plan = _automatic_parallel_plan()
+    execution_plan = manager._build_execution_plan(
+        job=create_training_job(
+            config_path="train-auto.yaml",
+            model="partition-stress",
+            requested_world_size=4,
+            backend_preference=as_backend_name("nccl"),
+            runtime_environment_ref="env:cluster/shardgrid",
+            job_id=as_job_id("job-auto-preflight"),
+        ),
+        training_config=automatic_config,
+        parallel_plan=plan,
+        workers=manager.cluster_config.workers,
+        snapshot=snapshot,
+    )
+    degraded = {
+        "gpu4060": _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+        "gpu1060": replace(
+            _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+            gpu_free_memory=256,
+        ),
+    }
+    manager._probe_worker = lambda worker: _probe_result(degraded[str(worker.worker_id)])
+
+    with pytest.raises(ValueError, match="RESOURCE_CHANGED"):
+        manager._prepare_live_execution_plan(
+            training_config=automatic_config,
+            execution_plan=execution_plan,
+            cluster_state=manager._resource_manager.build_cluster_state(
+                list(degraded.values()),
+                network_state=_network_state(),
+                require_network=True,
+            ),
+            network_state=_network_state(),
+        )
+
+
+def test_prepare_live_execution_plan_assigns_fresh_master_port(tmp_path: Path) -> None:
+    events: list[str] = []
+    manager, _config_path = _build_manager(tmp_path, events)
+    automatic_config_path = tmp_path / "train-auto.yaml"
+    automatic_config_path.write_text(
+        """
+job:
+  name: train-auto
+  backend: ssh
+  communication_backend: nccl
+model:
+  name: partition-stress
+  type: hf_style
+resources:
+  world_size: 4
+  preferred_workers: [gpu4060, gpu1060]
+planning:
+  mode: automatic
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    automatic_config = load_training_config(automatic_config_path)
+    job = create_training_job(
+        config_path=str(automatic_config_path),
+        model="partition-stress",
+        requested_world_size=4,
+        backend_preference=as_backend_name("nccl"),
+        runtime_environment_ref="env:cluster/shardgrid",
+        job_id=as_job_id("job-auto-port"),
+    )
+    snapshot = manager._artifact_store.create_snapshot(job)
+    execution_plan = manager._build_execution_plan(
+        job=job,
+        training_config=automatic_config,
+        parallel_plan=_automatic_parallel_plan(),
+        workers=manager.cluster_config.workers,
+        snapshot=snapshot,
+    )
+    manager._probe_worker = lambda worker: _probe_result(
+        _worker_resource(
+            str(worker.worker_id),
+            str(worker.host),
+            "RTX 4060" if str(worker.worker_id) == "gpu4060" else "GTX 1650",
+        )
+    )
+    manager._probe_network = lambda worker_resources: _network_state()
+    manager._allocate_live_master_port = lambda worker: 29537
+
+    updated, refreshed_cluster, refreshed_network = manager._prepare_live_execution_plan(
+        training_config=automatic_config,
+        execution_plan=execution_plan,
+        cluster_state=manager._resource_manager.build_cluster_state(
+            [
+                _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+                _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+            ],
+            network_state=_network_state(),
+            require_network=True,
+        ),
+        network_state=_network_state(),
+    )
+
+    assert updated.master.port == 29537
+    assert updated.workers[0].launch_command == "python examples/models/train_automatic_plan.py --rank 0"
+    assert refreshed_cluster.network_state == refreshed_network
+
+
+def test_probe_network_link_sets_measurement_timestamp(tmp_path: Path) -> None:
+    events: list[str] = []
+    manager, _config_path = _build_manager(tmp_path, events)
+    source = _worker_resource("gpu4060", "10.87.5.155", "RTX 4060")
+    target = _worker_resource("gpu1060", "10.87.5.15", "GTX 1650")
+
+    class _Runtime:
+        def run(self, argv, timeout=10):
+            command = " ".join(argv) if isinstance(argv, list) else str(argv)
+            if "ip route get" in command:
+                return type("Result", (), {"ok": True, "stdout": "10.87.5.15 dev eth3 src 10.87.5.155", "stderr": ""})()
+            return type("Result", (), {"ok": True, "stdout": "2: eth3: <BROADCAST> mtu 1500 qdisc mq state UP", "stderr": ""})()
+
+    manager._runtime_wrapper = lambda worker: _Runtime()
+    link = manager._probe_network_link(
+        source_resource=source,
+        target_resource=target,
+        source_worker=manager.cluster_config.workers[0],
+    )
+
+    assert link.interface == "eth3"
+    assert link.measured_at is not None
 
 
 def test_collection_failure_persists_diagnostics_and_first_artifact_failure(

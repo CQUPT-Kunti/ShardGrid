@@ -1,0 +1,31 @@
+job:
+  name: train-automatic-hf
+  backend: ssh
+  communication_backend: auto
+
+model:
+  name: partition-stress
+  type: hf_style
+  stage_count: 2
+  max_train_minutes: 15
+  min_loss_decrease_percent: 1.0
+
+resources:
+  world_size: 4
+  preferred_workers:
+    - gpu4060
+    - gpu1060
+    - gpu4060-cqupt
+
+planning:
+  mode: automatic
+
+artifacts:
+  snapshot_name: train-automatic-hf
+  keep_failed_snapshots: true
+  transport: auto
+  checkpoint:
+    consolidation:
+      enabled: false
+      device: auto
+      required: false

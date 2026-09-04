@@ -31,6 +31,7 @@ from shardgrid.common.errors import make_failure_record
 from shardgrid.common.models import BackendName, JobId, WorkerId, as_job_id
 from shardgrid.control.resource_manager import ClusterState, ResourceManager
 from shardgrid.control.status_store import StatusStore
+from shardgrid.distributed.backend import select_backend
 from shardgrid.engines.base import registered_engine_registry
 from shardgrid.engines.models import ParallelPlan
 from shardgrid.engines.selected import SelectedEngine, select_with_fallback
@@ -307,6 +308,35 @@ class JobManager:
             snapshot=snapshot,
             rejected_engine_ids=selected_engine.rejected_engine_ids,
         )
+        if not dry_run:
+            try:
+                execution_plan, cluster_state, network_state = self._prepare_live_execution_plan(
+                    training_config=training_config,
+                    execution_plan=execution_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                )
+            except Exception as exc:
+                failure = make_failure_record(
+                    stage=FailureStage.LAUNCH,
+                    host=str(self.cluster_config.control.hostname),
+                    message=f"live execution preflight failed: {exc}",
+                    recommended_action=(
+                        "repair the selected workers or rerun planning before launch"
+                    ),
+                    secrets=self._secrets,
+                )
+                current = self._failed_status(current, phase="launch", failure=failure)
+                self._status_store.save_path(self._status_store.status_path(job.job_id), current)
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                )
         current = self._persist_status(
             replace(
                 current,
@@ -837,6 +867,7 @@ class JobManager:
                 if interface_mtu == self.cluster_config.network.nccl_mtu
                 else None
             ),
+            measured_at=_now(),
         )
 
     def _runtime_wrapper(self, worker: WorkerConfig) -> WSLRuntimeWrapper:
@@ -967,14 +998,13 @@ class JobManager:
                         if worker.conda_prefix
                         else self.cluster_config.runtime.python_executable
                     ),
-                    launch_command=f"python examples/models/train_pipeline.py --rank {rank}",
-                    environment={
-                        "SHARDGRID_PIPELINE_TASK": "t074",
-                        "SHARDGRID_T074_CHECKPOINT_DIR": str(
-                            Path(snapshot.root_path) / "checkpoint"
-                        ),
-                        "SHARDGRID_T074_STEPS": "2000",
-                    },
+                    launch_command=self._launch_command_for_assignment(parallel_plan, rank),
+                    environment=self._assignment_environment(
+                        training_config=training_config,
+                        parallel_plan=parallel_plan,
+                        snapshot=snapshot,
+                        stage_id=stage_id,
+                    ),
                     status="pending",
                     log_path=f"logs/{worker.worker_id}/rank{rank}-{stage_id}/combined.log",
                 )
@@ -1009,6 +1039,39 @@ class JobManager:
             snapshot_ref=snapshot.root_path,
             labels=labels,
         )
+
+    def _launch_command_for_assignment(self, parallel_plan: ParallelPlan, rank: int) -> str:
+        if parallel_plan.partition_source == "automatic":
+            return f"python examples/models/train_automatic_plan.py --rank {rank}"
+        return f"python examples/models/train_pipeline.py --rank {rank}"
+
+    def _assignment_environment(
+        self,
+        *,
+        training_config: TrainingConfig,
+        parallel_plan: ParallelPlan,
+        snapshot: JobSnapshot,
+        stage_id: str,
+    ) -> dict[str, str]:
+        if parallel_plan.partition_source == "automatic":
+            automatic_microbatches = max(2, parallel_plan.world_size)
+            return {
+                "SHARDGRID_PLAN_MODE": "automatic",
+                "SHARDGRID_PARTITION_SOURCE": "automatic",
+                "SHARDGRID_SELECTED_CANDIDATE_ID": parallel_plan.selected_candidate_id or "",
+                "SHARDGRID_AUTOMATIC_STAGE_ID": stage_id,
+                "SHARDGRID_AUTOMATIC_MODEL_NAME": training_config.model.name,
+                "SHARDGRID_AUTOMATIC_MODEL_TYPE": training_config.model.type,
+                "SHARDGRID_AUTOMATIC_STEPS": "5",
+                "SHARDGRID_AUTOMATIC_LR": "1e-3",
+                "SHARDGRID_AUTOMATIC_MICROBATCHES": str(automatic_microbatches),
+                "SHARDGRID_AUTOMATIC_CHECKPOINT_DIR": "checkpoint",
+            }
+        return {
+            "SHARDGRID_PIPELINE_TASK": "t074",
+            "SHARDGRID_T074_CHECKPOINT_DIR": str(Path(snapshot.root_path) / "checkpoint"),
+            "SHARDGRID_T074_STEPS": "2000",
+        }
 
     def _ordered_workers_for_execution_plan(
         self,
@@ -1099,6 +1162,127 @@ class JobManager:
         if override is not None:
             return override
         return self.cluster_config.network.rendezvous_port
+
+    def _prepare_live_execution_plan(
+        self,
+        *,
+        training_config: TrainingConfig,
+        execution_plan: ExecutionPlan,
+        cluster_state: ClusterState,
+        network_state: NetworkState,
+    ) -> tuple[ExecutionPlan, ClusterState, NetworkState]:
+        if training_config.planning.mode != "automatic":
+            return execution_plan, cluster_state, network_state
+        revalidated = self._revalidate_execution_resources(execution_plan)
+        refreshed_network = self._probe_network(revalidated)
+        refreshed_cluster = self._resource_manager.build_cluster_state(
+            revalidated,
+            network_state=refreshed_network,
+            require_network=True,
+        )
+        if not _covers_workers(
+            refreshed_network,
+            [assignment.worker_id for assignment in execution_plan.workers],
+        ):
+            raise ValueError("RESOURCE_CHANGED: selected workers no longer have full network reachability")
+        rank_zero = next(assignment for assignment in execution_plan.workers if assignment.rank == 0)
+        rank_zero_worker = next(
+            worker for worker in self.cluster_config.workers if worker.worker_id == rank_zero.worker_id
+        )
+        fresh_port = self._allocate_live_master_port(rank_zero_worker)
+        updated_plan = replace(
+            execution_plan,
+            master=MasterMetadata(
+                address=rank_zero.host or execution_plan.master.address,
+                port=fresh_port,
+            ),
+        )
+        return updated_plan, refreshed_cluster, refreshed_network
+
+    def _revalidate_execution_resources(
+        self,
+        execution_plan: ExecutionPlan,
+    ) -> list[WorkerResource]:
+        by_worker = {
+            result.worker_resource.worker_id: result.worker_resource
+            for result in (
+                self._probe_worker(
+                    next(
+                        worker
+                        for worker in self.cluster_config.workers
+                        if worker.worker_id == assignment.worker_id
+                    )
+                )
+                for assignment in execution_plan.workers
+            )
+        }
+        backend = str(execution_plan.backend)
+        for assignment in execution_plan.workers:
+            resource = by_worker[assignment.worker_id]
+            if resource.health is not Health.HEALTHY:
+                raise ValueError(
+                    f"RESOURCE_CHANGED: worker {assignment.worker_id} is no longer healthy"
+                )
+            if assignment.estimated_peak_training_memory is not None:
+                free_bytes = self._bytes_from_mb(resource.gpu_free_memory)
+                if free_bytes is None or free_bytes < assignment.estimated_peak_training_memory:
+                    raise ValueError(
+                        "RESOURCE_CHANGED: worker "
+                        f"{assignment.worker_id} usable memory {free_bytes} is below "
+                        f"required peak {assignment.estimated_peak_training_memory}"
+                    )
+            if backend == "nccl" and not resource.nccl_available:
+                raise ValueError(
+                    f"RESOURCE_CHANGED: worker {assignment.worker_id} no longer reports NCCL"
+                )
+            if backend == "gloo" and not resource.gloo_available:
+                raise ValueError(
+                    f"RESOURCE_CHANGED: worker {assignment.worker_id} no longer reports Gloo"
+                )
+            if not resource.ip:
+                raise ValueError(
+                    f"RESOURCE_CHANGED: worker {assignment.worker_id} is missing network address evidence"
+                )
+        return [by_worker[assignment.worker_id] for assignment in execution_plan.workers]
+
+    def _allocate_live_master_port(self, worker: WorkerConfig) -> int:
+        runtime = self._runtime_wrapper(worker)
+        preferred = self._resolved_rendezvous_port()
+        script = (
+            "import json, socket\n"
+            f"preferred = {preferred}\n"
+            "chosen = None\n"
+            "for port in range(preferred + 1, preferred + 101):\n"
+            "    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "    try:\n"
+            "        sock.bind(('', port))\n"
+            "    except OSError:\n"
+            "        sock.close()\n"
+            "        continue\n"
+            "    chosen = port\n"
+            "    sock.close()\n"
+            "    break\n"
+            "if chosen is None:\n"
+            "    raise SystemExit('no free rendezvous port found')\n"
+            "print(json.dumps({'master_port': chosen}, sort_keys=True))\n"
+        )
+        result = runtime.run_script(script, timeout=15.0)
+        if not result.ok:
+            raise ValueError(
+                "RESOURCE_CHANGED: failed to allocate a fresh master port on "
+                f"{worker.worker_id}: {result.stderr or result.stdout or result.exit_code}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"RESOURCE_CHANGED: invalid master-port probe payload from {worker.worker_id}"
+            ) from exc
+        return int(payload["master_port"])
+
+    def _bytes_from_mb(self, value: int | None) -> int | None:
+        return None if value is None else int(value) * 1024 * 1024
 
     def _stop_failed_job_ranks(self, *, launcher: Launcher, context: LauncherContext) -> None:
         try:
@@ -1430,7 +1614,7 @@ class JobManager:
             "model_type": training_config.model.type,
             "partition_mode": "pipeline_parallel",
             "world_size": execution_plan.world_size,
-            "backend": str(execution_plan.backend),
+            "backend": select_backend(str(execution_plan.backend)),
             "required_shard_count": len(execution_plan.workers),
             "storage_target": snapshot.checkpoint_path,
             "final_metrics": dict(current.final_metrics),
@@ -1438,6 +1622,9 @@ class JobManager:
                 {key: value for key, value in shard.items() if key != "local_path"}
                 for shard in shards
             ],
+            "partition_source": execution_plan.labels.get("partition_source"),
+            "selected_candidate_id": execution_plan.labels.get("selected_candidate_id"),
+            "selected_worker_count": execution_plan.labels.get("selected_worker_count"),
         }
         if step_values:
             manifest["training_step"] = next(iter(step_values))
