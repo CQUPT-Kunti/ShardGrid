@@ -86,6 +86,18 @@ def _process_rss_bytes() -> int | None:
     return None
 
 
+def _contains_tensor(value: object) -> bool:
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_tensor(item) for item in value)
+    return False
+
+
 def create_training_job(
     *,
     config_path: str,
@@ -209,6 +221,7 @@ class JobManager:
         *,
         job_id: JobId | None = None,
         dry_run: bool = False,
+        min_selected_physical_hosts: int | None = None,
     ) -> JobRunResult:
         training_config = load_training_config(training_config_path)
         self._last_planning_evidence = {}
@@ -288,6 +301,7 @@ class JobManager:
                     training_config=training_config,
                     cluster_state=cluster_state,
                     selected_engine=selected_engine,
+                    min_selected_physical_hosts=min_selected_physical_hosts,
                 )
                 planning_evidence = dict(self._last_planning_evidence)
                 selected_engine = SelectedEngine(
@@ -507,7 +521,9 @@ class JobManager:
                     stage=FailureStage.LAUNCH,
                     host=str(self.cluster_config.control.hostname),
                     message="GPU resource reservation conflict before launch",
-                    recommended_action="wait for the running job to finish or choose different workers",
+                    recommended_action=(
+                        "wait for the running job to finish or choose different workers"
+                    ),
                     runtime_environment={
                         "conflicts": json.dumps(conflicts, sort_keys=True),
                     },
@@ -719,6 +735,7 @@ class JobManager:
             network_state,
             current,
             checkpoint_metadata=checkpoint_metadata,
+            launch_metadata=launch_metadata,
         )
         return JobRunResult(
             job=job,
@@ -898,13 +915,13 @@ class JobManager:
             raise RuntimeError(f"target worker {target_resource.worker_id} is missing ip evidence")
         runtime = self._runtime_wrapper(source_worker)
         route_result = runtime.run(["ip", "route", "get", target_resource.ip], timeout=10)
-        if not route_result.ok:
+        route_output = route_result.stdout.strip() or route_result.stderr.strip()
+        interface = parse_route_interface(route_output)
+        if not route_result.ok and not interface:
             raise RuntimeError(
                 f"ip route get {target_resource.ip} failed on {source_worker.worker_id}: "
                 f"{route_result.stderr or route_result.stdout or route_result.exit_code}"
             )
-        route_output = route_result.stdout.strip() or route_result.stderr.strip()
-        interface = parse_route_interface(route_output)
         if not interface:
             raise RuntimeError(
                 f"ip route get {target_resource.ip} did not resolve a device on "
@@ -1103,6 +1120,8 @@ class JobManager:
 
     def _launch_command_for_assignment(self, parallel_plan: ParallelPlan, rank: int) -> str:
         if parallel_plan.partition_source == "automatic":
+            if parallel_plan.requirements.get("generic_dag_runtime") == "true":
+                return f"python examples/models/train_generic_dag.py --rank {rank}"
             return f"python examples/models/train_automatic_plan.py --rank {rank}"
         return f"python examples/models/train_pipeline.py --rank {rank}"
 
@@ -1116,6 +1135,7 @@ class JobManager:
     ) -> dict[str, str]:
         if parallel_plan.partition_source == "automatic":
             parameters = training_config.model.parameters
+            generic_dag_runtime = self._generic_dag_runtime_requested(training_config)
             automatic_microbatches = max(
                 2,
                 parallel_plan.world_size,
@@ -1132,6 +1152,7 @@ class JobManager:
                 "SHARDGRID_AUTOMATIC_LR": str(parameters.get("learning_rate", "1e-3")),
                 "SHARDGRID_AUTOMATIC_MICROBATCHES": str(automatic_microbatches),
                 "SHARDGRID_AUTOMATIC_CHECKPOINT_DIR": "checkpoint",
+                "SHARDGRID_GENERIC_DAG_RUNTIME_REQUESTED": str(generic_dag_runtime).lower(),
             }
         return {
             "SHARDGRID_PIPELINE_TASK": "t074",
@@ -1203,6 +1224,10 @@ class JobManager:
             )
         labels = {
             "partition_source": parallel_plan.partition_source or "manual",
+            "generic_dag_runtime_requested": parallel_plan.requirements.get(
+                "generic_dag_runtime",
+                "false",
+            ),
             "selected_candidate_id": parallel_plan.selected_candidate_id or "NONE",
             "selected_worker_count": (
                 "NONE"
@@ -1250,10 +1275,16 @@ class JobManager:
             refreshed_network,
             [assignment.worker_id for assignment in execution_plan.workers],
         ):
-            raise ValueError("RESOURCE_CHANGED: selected workers no longer have full network reachability")
-        rank_zero = next(assignment for assignment in execution_plan.workers if assignment.rank == 0)
+            raise ValueError(
+                "RESOURCE_CHANGED: selected workers no longer have full network reachability"
+            )
+        rank_zero = next(
+            assignment for assignment in execution_plan.workers if assignment.rank == 0
+        )
         rank_zero_worker = next(
-            worker for worker in self.cluster_config.workers if worker.worker_id == rank_zero.worker_id
+            worker
+            for worker in self.cluster_config.workers
+            if worker.worker_id == rank_zero.worker_id
         )
         fresh_port = self._allocate_live_master_port(rank_zero_worker)
         updated_plan = replace(
@@ -1316,7 +1347,8 @@ class JobManager:
                 )
             if not resource.ip:
                 raise ValueError(
-                    f"RESOURCE_CHANGED: worker {assignment.worker_id} is missing network address evidence"
+                    f"RESOURCE_CHANGED: worker {assignment.worker_id} "
+                    "is missing network address evidence"
                 )
         return [by_worker[assignment.worker_id] for assignment in execution_plan.workers]
 
@@ -1413,10 +1445,12 @@ class JobManager:
         training_config: TrainingConfig,
         cluster_state: ClusterState,
         selected_engine: SelectedEngine,
+        min_selected_physical_hosts: int | None = None,
     ) -> ParallelPlan:
         memory_config = self._planner_memory_config()
         min_worker_count, max_worker_count = self._automatic_worker_count_bounds(
-            cluster_state=cluster_state
+            cluster_state=cluster_state,
+            min_selected_physical_hosts=min_selected_physical_hosts,
         )
         evidence: dict[str, object] = {
             "planner_worker_resources": [
@@ -1432,6 +1466,10 @@ class JobManager:
             "planner_worker_count_bounds": {
                 "min_worker_count": min_worker_count,
                 "max_worker_count": max_worker_count,
+                "min_selected_physical_hosts": min_selected_physical_hosts,
+                "constraint_source": (
+                    "hardware_gate" if min_selected_physical_hosts is not None else "default"
+                ),
             },
             "control_rss_before_planning": _process_rss_bytes(),
         }
@@ -1469,6 +1507,8 @@ class JobManager:
                 profile,
                 select_best_joint_placement_plan([joint]),
             )
+            if self._generic_dag_runtime_requested(training_config):
+                plan.requirements["generic_dag_runtime"] = "true"
             evidence["control_rss_after_plan_created"] = _process_rss_bytes()
             return plan
         finally:
@@ -1485,10 +1525,11 @@ class JobManager:
         self,
         *,
         cluster_state: ClusterState,
+        min_selected_physical_hosts: int | None = None,
     ) -> tuple[int, int]:
         available_worker_count = len(cluster_state.workers)
-        max_worker_count = min(4, available_worker_count)
-        min_worker_count = 2
+        max_worker_count = available_worker_count
+        min_worker_count = 1
         min_override = os.environ.get("SHARDGRID_AUTOMATIC_MIN_WORKERS", "").strip()
         max_override = os.environ.get("SHARDGRID_AUTOMATIC_MAX_WORKERS", "").strip()
         if max_override:
@@ -1498,18 +1539,32 @@ class JobManager:
                 raise ValueError(
                     "invalid SHARDGRID_AUTOMATIC_MAX_WORKERS: must be an integer"
                 ) from exc
-            if requested_max < 2:
+            if requested_max < 1:
                 raise ValueError(
-                    "invalid SHARDGRID_AUTOMATIC_MAX_WORKERS: must be >= 2"
+                    "invalid SHARDGRID_AUTOMATIC_MAX_WORKERS: must be >= 1"
                 )
             if requested_max > available_worker_count:
                 raise ValueError(
                     "invalid SHARDGRID_AUTOMATIC_MAX_WORKERS: exceeds available worker count"
                 )
-            max_worker_count = min(max_worker_count, requested_max)
+            max_worker_count = requested_max
+        if min_selected_physical_hosts is not None:
+            if min_selected_physical_hosts < 1:
+                raise ValueError("min_selected_physical_hosts must be >= 1")
+            available_hosts = {
+                str(entry.resource.machine_id or entry.resource.hostname or entry.worker_id)
+                for entry in cluster_state.workers
+            }
+            if len(available_hosts) < min_selected_physical_hosts:
+                raise ValueError(
+                    "automatic planning hardware gate requires at least "
+                    f"{min_selected_physical_hosts} physical hosts; "
+                    f"only {len(available_hosts)} available"
+                )
+            min_worker_count = max(min_worker_count, min_selected_physical_hosts)
         if not min_override:
             if min_worker_count > max_worker_count:
-                raise ValueError("automatic planning requires at least two available workers")
+                raise ValueError("automatic planning requires at least one available worker")
             return min_worker_count, max_worker_count
         try:
             requested = int(min_override)
@@ -1517,10 +1572,11 @@ class JobManager:
             raise ValueError(
                 "invalid SHARDGRID_AUTOMATIC_MIN_WORKERS: must be an integer"
             ) from exc
-        if requested < 2:
+        if requested < 1:
             raise ValueError(
-                "invalid SHARDGRID_AUTOMATIC_MIN_WORKERS: must be >= 2"
+                "invalid SHARDGRID_AUTOMATIC_MIN_WORKERS: must be >= 1"
             )
+        requested = max(requested, min_worker_count)
         if requested > max_worker_count:
             raise ValueError(
                 "invalid SHARDGRID_AUTOMATIC_MIN_WORKERS: exceeds max worker count"
@@ -1573,9 +1629,23 @@ class JobManager:
                 device="meta",
             )
             return model, (inputs,), {}
+        if training_config.model.type == "generic_dag":
+            from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_sample
+
+            model_name = str(training_config.model.parameters.get("zoo_model", "mini_unet"))
+            model = build_zoo_model(model_name)
+            sample_args, sample_kwargs = make_zoo_sample(model_name)
+            return model, tuple(sample_args), dict(sample_kwargs)
         raise ValueError(
             "automatic planning supports model.type minimal_sequential, hf_style, "
-            "or large_residual_transformer"
+            "large_residual_transformer, or generic_dag"
+        )
+
+    def _generic_dag_runtime_requested(self, training_config: TrainingConfig) -> bool:
+        return (
+            training_config.model.type == "generic_dag"
+            or str(training_config.model.parameters.get("generic_dag_runtime", "false")).lower()
+            == "true"
         )
 
     def _planner_memory_config(self) -> MemoryEstimationConfig:
@@ -1778,6 +1848,7 @@ class JobManager:
     ) -> dict[str, object]:
         shards = self._validated_checkpoint_shards(
             snapshot=snapshot,
+            training_config=training_config,
             execution_plan=execution_plan,
             collection_result=collection_result,
         )
@@ -1815,13 +1886,14 @@ class JobManager:
         if step_values:
             manifest["training_step"] = next(iter(step_values))
         consolidation = training_config.artifacts.checkpoint.consolidation
+        generic_dag_checkpoint = training_config.model.type == "generic_dag"
         optional_artifact: dict[str, object] = {
-            "enabled": consolidation.enabled,
-            "required": consolidation.required,
+            "enabled": consolidation.enabled or generic_dag_checkpoint,
+            "required": consolidation.required or generic_dag_checkpoint,
             "requested_device": consolidation.device,
             "status": "not_requested",
         }
-        if consolidation.enabled:
+        if consolidation.enabled or generic_dag_checkpoint:
             try:
                 resolved_device = self._resolve_consolidation_device(consolidation.device)
                 optional_artifact["resolved_device"] = resolved_device
@@ -1842,7 +1914,7 @@ class JobManager:
             except Exception as exc:
                 optional_artifact["status"] = "failed"
                 optional_artifact["message"] = str(exc)
-                if consolidation.required:
+                if consolidation.required or generic_dag_checkpoint:
                     raise
         manifest["optional_artifacts"] = {"consolidated_model": optional_artifact}
         manifest_path = Path(snapshot.checkpoint_path) / "manifest.json"
@@ -1856,6 +1928,7 @@ class JobManager:
         self,
         *,
         snapshot: JobSnapshot,
+        training_config: TrainingConfig,
         execution_plan: ExecutionPlan,
         collection_result: ArtifactCollectionResult,
     ) -> list[dict[str, object]]:
@@ -1912,6 +1985,11 @@ class JobManager:
                     f"checkpoint shard world_size mismatch for rank {assignment.rank}"
                 )
             local_path = Path(artifact.local_path).resolve()
+            if training_config.model.type == "generic_dag":
+                checkpoint_metadata = {
+                    **self._generic_checkpoint_metadata_from_shard(local_path),
+                    **checkpoint_metadata,
+                }
             shard = {
                 "worker_id": str(assignment.worker_id),
                 "rank": assignment.rank,
@@ -1931,6 +2009,17 @@ class JobManager:
                 shard["checkpoint_metadata"] = checkpoint_metadata
             shards.append(shard)
         return shards
+
+    def _generic_checkpoint_metadata_from_shard(self, path: Path) -> dict[str, object]:
+        import torch
+
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            return {}
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            return dict(metadata)
+        return {}
 
     def _checkpoint_metadata_from_worker(
         self,
@@ -1982,6 +2071,14 @@ class JobManager:
         manifest_ref: str,
         device: str,
     ) -> str | None:
+        if training_config.model.type == "generic_dag":
+            return self._write_generic_dag_model_state(
+                snapshot=snapshot,
+                training_config=training_config,
+                current=current,
+                shards=shards,
+                manifest_ref=manifest_ref,
+            )
         if training_config.model.type != "minimal_sequential":
             return None
 
@@ -2075,6 +2172,70 @@ class JobManager:
         reloaded = torch.load(consolidated_path, map_location="cpu", weights_only=False)
         full_model.load_state_dict(reloaded["model_state_dict"], strict=True)
         return consolidated_ref
+
+    def _write_generic_dag_model_state(
+        self,
+        *,
+        snapshot: JobSnapshot,
+        training_config: TrainingConfig,
+        current: JobStatus,
+        shards: Sequence[dict[str, object]],
+        manifest_ref: str,
+    ) -> str:
+        import torch
+        from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_sample
+
+        from shardgrid.runtime.checkpoint import consolidate_worker_state_shards
+
+        zoo_model = str(training_config.model.parameters.get("zoo_model", "mini_unet"))
+        full_model = build_zoo_model(zoo_model)
+        expected_state = full_model.state_dict()
+        output_ref = "checkpoint/model-state.pt"
+        output_path = Path(snapshot.checkpoint_path) / "model-state.pt"
+        payload = consolidate_worker_state_shards(
+            [Path(str(shard["local_path"])) for shard in shards],
+            output_path,
+            expected_state_keys=tuple(expected_state),
+        )
+        for key, expected in expected_state.items():
+            actual = payload["state_dict"][key]
+            if tuple(actual.shape) != tuple(expected.shape):
+                raise ValueError(f"checkpoint tensor shape mismatch for {key}")
+            if actual.dtype != expected.dtype:
+                raise ValueError(f"checkpoint tensor dtype mismatch for {key}")
+        load_result = full_model.load_state_dict(payload["state_dict"], strict=True)
+        sample_args, sample_kwargs = make_zoo_sample(zoo_model)
+        full_model.eval()
+        with torch.no_grad():
+            output = full_model(*sample_args, **sample_kwargs)
+        training_evidence = payload.get("training_evidence")
+        if not isinstance(training_evidence, dict):
+            training_evidence = {
+                "worker_parameter_changed": {},
+                "any_parameter_changed": False,
+                "all_trainable_workers_parameter_changed": False,
+            }
+        payload.update(
+            {
+                "format": "shardgrid-generic-dag-model-state/v1",
+                "job_id": str(current.job_id),
+                "model_name": training_config.model.name,
+                "model_type": training_config.model.type,
+                "zoo_model": zoo_model,
+                "model_config": training_config.to_dict()["model"],
+                "checkpoint_ref": manifest_ref,
+                "final_metrics": dict(current.final_metrics),
+                "strict_load_missing_keys": list(load_result.missing_keys),
+                "strict_load_unexpected_keys": list(load_result.unexpected_keys),
+                "validation_forward_passed": _contains_tensor(output),
+                "training_evidence": training_evidence,
+                "parameter_changed": bool(training_evidence["any_parameter_changed"]),
+                "final_model_path": str(output_path.resolve()),
+            }
+        )
+        torch.save(payload, output_path)
+        print(f"FINAL_MODEL_PATH={output_path.resolve()}", flush=True)
+        return output_ref
 
     def _complete_status(self, current: JobStatus, *, checkpoint_ref: str) -> JobStatus:
         if not checkpoint_ref or "final_loss" not in current.final_metrics:

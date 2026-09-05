@@ -532,6 +532,9 @@ def make_large_residual_stage_inputs(
     effective_batch_size = config.batch_size if batch_size is None else batch_size
     shape = (effective_batch_size, config.sequence_length, config.hidden_size)
     names = tuple(state_names or _default_boundary_state_names_for_start_path(start_path))
+    ffn_hidden_width = (
+        config.hidden_size if start_path.endswith("memory_pressure") else config.ffn_size
+    )
     if start_path == "token_embedding":
         inputs, _targets = make_large_residual_batch(
             config,
@@ -550,7 +553,7 @@ def make_large_residual_stage_inputs(
         "ffn_hidden": torch.zeros(
             effective_batch_size,
             config.sequence_length,
-            config.ffn_size,
+            ffn_hidden_width,
             device=device,
         ),
     }

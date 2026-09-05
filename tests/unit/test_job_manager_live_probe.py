@@ -263,6 +263,71 @@ def test_default_probe_network_uses_route_specific_interface_and_source_ip(
     assert by_source["gpu1060"].interface == "eth0"
 
 
+def test_default_probe_network_accepts_parseable_route_output_even_with_nonzero_exit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manager = JobManager(_cluster_config(tmp_path))
+
+    class FakeRuntime:
+        def run(self, command, **kwargs) -> ProcessResult:
+            del kwargs
+            if command[:3] == ["ip", "route", "get"]:
+                return ProcessResult(
+                    args=command,
+                    recorded_command=" ".join(command),
+                    shell=False,
+                    cwd=None,
+                    exit_code=1,
+                    stdout="10.0.0.11 dev eth3 src 10.87.5.155 uid 1000\n    cache \n",
+                    stderr="",
+                    timed_out=False,
+                    runtime_environment={},
+                )
+            if command[:4] == ["ip", "link", "show", "dev"]:
+                return ProcessResult(
+                    args=command,
+                    recorded_command=" ".join(command),
+                    shell=False,
+                    cwd=None,
+                    exit_code=0,
+                    stdout="5: eth3: <BROADCAST> mtu 1500 qdisc mq state UP mode DEFAULT\n",
+                    stderr="",
+                    timed_out=False,
+                    runtime_environment={},
+                )
+            raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(manager, "_runtime_wrapper", lambda worker: FakeRuntime())
+
+    link = manager._probe_network_link(
+        source_resource=WorkerResource(
+            worker_id=manager.cluster_config.workers[0].worker_id,
+            hostname=manager.cluster_config.workers[0].host,
+            physical_os=PhysicalOS.WINDOWS,
+            runtime_os=RuntimeOS.WSL2_LINUX,
+            ip="10.0.0.10",
+            network_interface="eth0",
+            health=Health.HEALTHY,
+        ),
+        target_resource=WorkerResource(
+            worker_id=manager.cluster_config.workers[1].worker_id,
+            hostname=manager.cluster_config.workers[1].host,
+            physical_os=PhysicalOS.WINDOWS,
+            runtime_os=RuntimeOS.WSL2_LINUX,
+            ip="10.0.0.11",
+            network_interface="eth3",
+            health=Health.HEALTHY,
+        ),
+        source_worker=manager.cluster_config.workers[0],
+    )
+
+    assert str(link.source_worker_id) == "gpu4060"
+    assert str(link.target_worker_id) == "gpu1060"
+    assert link.interface == "eth3"
+    assert link.source_ip == "10.87.5.155"
+
+
 def test_monitor_until_terminal_does_not_use_wall_clock_deadline(
     tmp_path: Path,
     monkeypatch,

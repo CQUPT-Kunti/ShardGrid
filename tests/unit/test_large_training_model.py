@@ -11,6 +11,7 @@ from examples.models.large_residual_transformer import (
     build_large_residual_transformer_stage,
     large_residual_module_paths,
     make_large_residual_batch,
+    make_large_residual_stage_inputs,
     required_boundary_state_names,
     train_step,
 )
@@ -245,3 +246,28 @@ def test_stage_boundary_backward_keeps_gradients_for_split_19() -> None:
     loss.backward()
 
     assert all(tensor.grad is not None for tensor in boundary)
+
+
+def test_stage_inputs_for_memory_pressure_start_use_hidden_width() -> None:
+    config = _small_config()
+    paths = large_residual_module_paths(config)
+    start = paths[33]
+
+    assert start == "blocks.3.memory_pressure"
+    inputs = make_large_residual_stage_inputs(config, start)
+
+    assert len(inputs) == 3
+    assert inputs[0].shape[-1] == config.hidden_size
+    assert inputs[1].shape[-1] == config.hidden_size
+    assert inputs[2].shape[-1] == config.hidden_size
+
+    stage = build_large_residual_transformer_stage(
+        config,
+        stage_metadata=_stage_meta("stage2", paths[33:]),
+        next_stage_start_path=None,
+        seed=42,
+    )
+    output = stage(*inputs)
+
+    assert isinstance(output, torch.Tensor)
+    assert output.shape == (config.batch_size, config.sequence_length, config.vocab_size)

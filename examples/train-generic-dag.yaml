@@ -1,0 +1,23 @@
+job:
+  name: train-generic-dag
+  backend: ssh
+  communication_backend: nccl
+
+model:
+  name: mini-unet
+  type: generic_dag
+  min_loss_decrease_percent: 1.0
+  parameters:
+    zoo_model: mini_unet
+    training_steps: 20
+    learning_rate: 1e-3
+
+resources: {}
+
+planning:
+  mode: automatic
+
+artifacts:
+  snapshot_name: train-generic-dag
+  keep_failed_snapshots: true
+  transport: auto

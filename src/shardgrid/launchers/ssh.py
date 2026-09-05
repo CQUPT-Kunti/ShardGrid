@@ -3828,6 +3828,7 @@ class SSHLauncher(Launcher):
                 "MASTER_ADDR": context.execution_plan.master.address,
                 "MASTER_PORT": str(context.execution_plan.master.port),
                 "SHARDGRID_JOB_ID": str(context.job.job_id),
+                "SHARDGRID_WORKER_ID": str(assignment.worker_id),
                 "SHARDGRID_REMOTE_SNAPSHOT_ROOT": self._remote_job_root(context),
                 "SHARDGRID_STAGE": assignment.stage or "",
                 "SHARDGRID_LOG_PATH": log_path,

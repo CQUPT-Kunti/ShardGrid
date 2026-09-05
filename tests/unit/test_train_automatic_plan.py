@@ -3,11 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
-
 from examples.models.train_automatic_plan import (
     _automatic_batch_sizes,
     _build_large_stage_module,
 )
+
 from shardgrid.common.config import TrainingConfig
 from shardgrid.common.models import as_engine_name
 from shardgrid.engines.models import ParallelPlan, ParallelPlanStage

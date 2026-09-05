@@ -3,6 +3,9 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import weakref
 from dataclasses import replace
 from pathlib import Path
@@ -711,6 +714,97 @@ def _automatic_parallel_plan() -> ParallelPlan:
     )
 
 
+def test_generic_dag_runtime_request_uses_generic_entrypoint(tmp_path: Path) -> None:
+    events: list[str] = []
+    manager, _config_path = _build_manager(tmp_path, events)
+    generic_config_path = tmp_path / "train-generic-dag.yaml"
+    generic_config_path.write_text(
+        """
+job:
+  name: train-generic-dag
+  backend: ssh
+  communication_backend: nccl
+model:
+  name: mini-unet
+  type: generic_dag
+  parameters:
+    zoo_model: mini_unet
+resources: {}
+planning:
+  mode: automatic
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    training_config = load_training_config(generic_config_path)
+    job = create_training_job(
+        config_path=str(generic_config_path),
+        model="mini-unet",
+        requested_world_size=2,
+        backend_preference=as_backend_name("nccl"),
+        runtime_environment_ref="env:cluster/shardgrid",
+        job_id=as_job_id("job-generic-dag"),
+    )
+    snapshot = manager._artifact_store.create_snapshot(job)
+    parallel_plan = _automatic_parallel_plan()
+    parallel_plan.requirements["generic_dag_runtime"] = "true"
+
+    execution_plan = manager._build_execution_plan(
+        job=job,
+        training_config=training_config,
+        parallel_plan=parallel_plan,
+        workers=manager.cluster_config.workers,
+        snapshot=snapshot,
+    )
+
+    assert execution_plan.labels["generic_dag_runtime_requested"] == "true"
+    assert all(
+        assignment.launch_command
+        == f"python examples/models/train_generic_dag.py --rank {assignment.rank}"
+        for assignment in execution_plan.workers
+    )
+    assert all(
+        assignment.environment["SHARDGRID_GENERIC_DAG_RUNTIME_REQUESTED"] == "true"
+        for assignment in execution_plan.workers
+    )
+
+
+def test_generic_dag_entrypoint_missing_snapshot_fails_closed_with_evidence(
+    tmp_path: Path,
+) -> None:
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+        "SHARDGRID_REMOTE_SNAPSHOT_ROOT": str(tmp_path),
+        "SHARDGRID_WORKER_ID": "worker0",
+        "WORLD_SIZE": "2",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29500",
+    }
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "examples/models/train_generic_dag.py",
+            "--rank",
+            "0",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    payload = json.loads((tmp_path / "diagnostics" / "generic-dag-runtime.json").read_text())
+    assert result.returncode == 78
+    assert "GENERIC_DAG_RUNTIME_EVIDENCE" in result.stdout
+    assert payload["generic_dag_runtime_used"] is True
+    assert payload["legacy_stage_runtime_used"] is False
+    assert payload["failure_category"] == "GENERIC_DAG_RUNTIME_FAILED"
+    assert payload["error_type"] == "FileNotFoundError"
+
+
 def _large_automatic_training_config(tmp_path: Path) -> Path:
     path = tmp_path / "train-large-auto.yaml"
     path.write_text(
@@ -944,7 +1038,9 @@ planning:
     )
 
     assert updated.master.port == 29537
-    assert updated.workers[0].launch_command == "python examples/models/train_automatic_plan.py --rank 0"
+    assert updated.workers[0].launch_command == (
+        "python examples/models/train_automatic_plan.py --rank 0"
+    )
     assert refreshed_cluster.network_state == refreshed_network
 
 
@@ -958,8 +1054,24 @@ def test_probe_network_link_sets_measurement_timestamp(tmp_path: Path) -> None:
         def run(self, argv, timeout=10):
             command = " ".join(argv) if isinstance(argv, list) else str(argv)
             if "ip route get" in command:
-                return type("Result", (), {"ok": True, "stdout": "10.87.5.15 dev eth3 src 10.87.5.155", "stderr": ""})()
-            return type("Result", (), {"ok": True, "stdout": "2: eth3: <BROADCAST> mtu 1500 qdisc mq state UP", "stderr": ""})()
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "ok": True,
+                        "stdout": "10.87.5.15 dev eth3 src 10.87.5.155",
+                        "stderr": "",
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {
+                    "ok": True,
+                    "stdout": "2: eth3: <BROADCAST> mtu 1500 qdisc mq state UP",
+                    "stderr": "",
+                },
+            )()
 
     manager._runtime_wrapper = lambda worker: _Runtime()
     link = manager._probe_network_link(
@@ -1067,6 +1179,50 @@ def test_automatic_worker_count_bounds_honor_test_override(
     assert manager._automatic_worker_count_bounds(cluster_state=cluster_state) == (3, 3)
 
 
+def test_automatic_worker_count_bounds_default_to_all_available_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _config_path = _build_manager(tmp_path, [])
+    monkeypatch.delenv("SHARDGRID_AUTOMATIC_MIN_WORKERS", raising=False)
+    monkeypatch.delenv("SHARDGRID_AUTOMATIC_MAX_WORKERS", raising=False)
+
+    for count in (1, 2, 3, 4, 8, 16):
+        cluster_state = ResourceManager().build_cluster_state(
+            [
+                _worker_resource(f"gpu-{index}", f"10.0.0.{index + 1}", "GPU")
+                for index in range(count)
+            ]
+        )
+
+        assert manager._automatic_worker_count_bounds(cluster_state=cluster_state) == (
+            1,
+            count,
+        )
+
+
+def test_hardware_gate_worker_count_constraint_does_not_change_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _config_path = _build_manager(tmp_path, [])
+    monkeypatch.delenv("SHARDGRID_AUTOMATIC_MIN_WORKERS", raising=False)
+    monkeypatch.delenv("SHARDGRID_AUTOMATIC_MAX_WORKERS", raising=False)
+    cluster_state = ResourceManager().build_cluster_state(
+        [
+            _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+            _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+            _worker_resource("gpu4060-cqupt", "10.87.5.188", "RTX 4060"),
+        ]
+    )
+
+    assert manager._automatic_worker_count_bounds(cluster_state=cluster_state) == (1, 3)
+    assert manager._automatic_worker_count_bounds(
+        cluster_state=cluster_state,
+        min_selected_physical_hosts=2,
+    ) == (2, 3)
+
+
 def test_automatic_worker_count_bounds_honor_max_worker_override(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1082,7 +1238,7 @@ def test_automatic_worker_count_bounds_honor_max_worker_override(
 
     monkeypatch.setenv("SHARDGRID_AUTOMATIC_MAX_WORKERS", "2")
 
-    assert manager._automatic_worker_count_bounds(cluster_state=cluster_state) == (2, 2)
+    assert manager._automatic_worker_count_bounds(cluster_state=cluster_state) == (1, 2)
 
 
 def test_collection_failure_persists_diagnostics_and_first_artifact_failure(

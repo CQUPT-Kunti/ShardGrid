@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 import torch
 from examples.models.partition_stress_model import build_partition_stress_model, make_training_batch
 from torch import nn
@@ -11,7 +12,7 @@ from shardgrid.common.models import as_hostname, as_machine_id, as_worker_id
 from shardgrid.control.resource_manager import ResourceManager
 from shardgrid.planner.memory import MemoryEstimationConfig, build_model_profile
 from shardgrid.planner.partitioning import build_partition_profile
-from shardgrid.planner.placement import search_joint_partition_placement
+from shardgrid.planner.placement import _worker_subsets, search_joint_partition_placement
 from shardgrid.planner.requirements import FeasibilityStatus
 from shardgrid.resources.models import NetworkLink, NetworkState, WorkerResource
 
@@ -124,6 +125,14 @@ def _cluster_state(
         network_state=_network(workers, reachable=reachable),
         now=datetime(2026, 9, 3, 0, 0, tzinfo=UTC),
     )
+
+
+def _eligibility(worker: WorkerResource) -> object:
+    return ResourceManager().build_cluster_state(
+        [worker],
+        network_state=None,
+        require_network=False,
+    ).workers[0]
 
 
 def _chain_profile(depth: int) -> tuple[ChainModel, torch.Tensor, object]:
@@ -404,3 +413,37 @@ def test_duplicate_host_subset_is_rejected() -> None:
 
     assert plan.status == FeasibilityStatus.INFEASIBLE
     assert any("share physical host" in reason for reason in plan.reasons)
+
+
+def test_worker_subset_search_is_bounded_for_large_gpu_counts() -> None:
+    workers = [
+        _eligibility(
+            _worker(
+                f"worker-{index:02d}",
+                machine_id=f"machine-{index:02d}",
+                free_memory_mb=1000 - index,
+            )
+        )
+        for index in range(64)
+    ]
+
+    subsets = _worker_subsets(workers, 32)
+
+    assert 1 <= len(subsets) <= 64
+    assert subsets[0][0].resource.worker_id == "worker-00"
+
+
+def test_worker_subset_search_honors_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    workers = [
+        _eligibility(
+            _worker(
+                f"worker-{index:02d}",
+                machine_id=f"machine-{index:02d}",
+                free_memory_mb=1000 - index,
+            )
+        )
+        for index in range(16)
+    ]
+    monkeypatch.setenv("SHARDGRID_PLACEMENT_CANDIDATE_BUDGET", "3")
+
+    assert len(_worker_subsets(workers, 8)) <= 3

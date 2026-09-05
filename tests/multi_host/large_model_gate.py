@@ -218,6 +218,71 @@ def three_worker_model_candidates(memory: dict[str, int]) -> list[dict[str, obje
     return candidates
 
 
+def _three_worker_packing_candidates(
+    memory: dict[str, int],
+    *,
+    templates: tuple[tuple[int, int, int, tuple[float, ...], int], ...],
+) -> list[dict[str, object]]:
+    usable = sorted(memory.values())
+    if len(usable) < 3:
+        raise RuntimeError("three-worker packing requires three live GPU workers")
+    smallest = usable[0]
+    candidates: list[dict[str, object]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for hidden_size, num_layers, ffn_size, fractions, minimum_rows in templates:
+        for fraction in fractions:
+            rows = _rows_for_fraction(
+                smallest,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                fraction=fraction,
+                minimum_rows=minimum_rows,
+            )
+            key = (hidden_size, num_layers, ffn_size, rows)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "vocab_size": 2048,
+                    "hidden_size": hidden_size,
+                    "num_layers": num_layers,
+                    "num_heads": max(4, hidden_size // 64),
+                    "ffn_size": ffn_size,
+                    "sequence_length": 8,
+                    "batch_size": 1,
+                    "microbatch_count": 1,
+                    "training_steps": 1000,
+                    "learning_rate": "1e-3",
+                    "memory_bank_rows": rows,
+                    "memory_bank_touch_rows": 1,
+                }
+            )
+    return candidates
+
+
+def three_worker_medium_packing_candidates(memory: dict[str, int]) -> list[dict[str, object]]:
+    return _three_worker_packing_candidates(
+        memory,
+        templates=(
+            (256, 4, 1024, (0.18, 0.15, 0.12), 16000),
+            (224, 4, 896, (0.20, 0.16), 12000),
+            (192, 4, 768, (0.22, 0.18), 10000),
+        ),
+    )
+
+
+def three_worker_small_packing_candidates(memory: dict[str, int]) -> list[dict[str, object]]:
+    return _three_worker_packing_candidates(
+        memory,
+        templates=(
+            (160, 4, 640, (0.10, 0.08), 8000),
+            (128, 4, 512, (0.12, 0.09), 6000),
+            (96, 4, 384, (0.12, 0.09), 4000),
+        ),
+    )
+
+
 def medium_model_candidates(memory: dict[str, int]) -> list[dict[str, object]]:
     usable = sorted(memory.values())
     if len(usable) < 2:
@@ -607,6 +672,15 @@ def wait_for_job_training_steps(
                 steps=steps,
             )
             return monitors
+        if last_state in {"failed", "completed", "stopped"}:
+            emit_gate_marker(
+                "WAIT_FOR_JOB_TRAINING_STEPS_TERMINAL",
+                job_id=job_id,
+                state=last_state,
+                steps=steps,
+                process_states=last_process_states,
+            )
+            return []
         time.sleep(2)
     emit_gate_marker(
         "WAIT_FOR_JOB_TRAINING_STEPS_TIMEOUT",

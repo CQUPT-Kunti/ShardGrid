@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from itertools import combinations
 from math import ceil
 from typing import Any, Mapping, Sequence
 
@@ -23,6 +23,7 @@ from shardgrid.planner.requirements import (
 from shardgrid.resources.models import WorkerResource
 
 _BYTES_PER_MB = 1024 * 1024
+_DEFAULT_WORKER_SUBSET_BUDGET = 64
 
 
 @dataclass(frozen=True)
@@ -258,19 +259,65 @@ def _worker_subsets(
     workers: Sequence[WorkerEligibility],
     worker_count: int,
 ) -> tuple[tuple[WorkerEligibility, ...], ...]:
-    subsets = [
-        tuple(sorted(subset, key=lambda entry: str(entry.resource.worker_id)))
-        for subset in combinations(workers, worker_count)
-    ]
+    if worker_count <= 0 or worker_count > len(workers):
+        return ()
+    ordered = tuple(
+        sorted(
+            workers,
+            key=lambda entry: (
+                -(_usable_memory_bytes(entry.resource) or 0),
+                str(entry.resource.worker_id),
+            ),
+        )
+    )
+    budget = _worker_subset_budget()
+    seen: dict[tuple[str, ...], tuple[WorkerEligibility, ...]] = {}
+
+    def add(items: Sequence[WorkerEligibility]) -> None:
+        if len(seen) >= budget or len(items) != worker_count:
+            return
+        subset = tuple(sorted(items, key=lambda entry: str(entry.resource.worker_id)))
+        key = tuple(str(entry.resource.worker_id) for entry in subset)
+        seen.setdefault(key, subset)
+
+    add(ordered[:worker_count])
+    add(ordered[-worker_count:])
+    if worker_count == 1:
+        for worker in ordered:
+            add((worker,))
+    else:
+        for start in range(0, len(ordered) - worker_count + 1):
+            add(ordered[start : start + worker_count])
+        for anchor in range(worker_count):
+            stride = max(1, ceil((len(ordered) - anchor) / worker_count))
+            picked = ordered[anchor::stride][:worker_count]
+            add(picked)
     return tuple(
         sorted(
-            subsets,
+            seen.values(),
             key=lambda subset: (
                 -sum(_usable_memory_bytes(entry.resource) or 0 for entry in subset),
                 tuple(str(entry.resource.worker_id) for entry in subset),
             ),
         )
     )
+
+
+def _worker_subset_budget() -> int:
+    raw = os.environ.get("SHARDGRID_PLACEMENT_CANDIDATE_BUDGET", "").strip()
+    if not raw:
+        return _DEFAULT_WORKER_SUBSET_BUDGET
+    try:
+        budget = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "invalid SHARDGRID_PLACEMENT_CANDIDATE_BUDGET: must be an integer"
+        ) from exc
+    if budget < 1:
+        raise ValueError(
+            "invalid SHARDGRID_PLACEMENT_CANDIDATE_BUDGET: must be >= 1"
+        )
+    return budget
 
 
 def _stage_placements(

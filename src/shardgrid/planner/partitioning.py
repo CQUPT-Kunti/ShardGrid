@@ -15,6 +15,10 @@ from shardgrid.engines.models import (
     TensorMetadata,
     TrainingMemoryEstimate,
 )
+from shardgrid.planner.generic_graph import (
+    FXGraphCaptureAdapter,
+    module_dependencies_from_graph,
+)
 from shardgrid.planner.memory import MemoryEstimationConfig, estimate_stage_memory
 from shardgrid.planner.requirements import (
     ConstraintViolation,
@@ -694,47 +698,9 @@ def _candidate_communication_edges(
 def _symbolic_module_dependencies(
     model: Any,
 ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...], tuple[str, ...]]:
-    from torch.fx import Node, symbolic_trace
-
-    traced = symbolic_trace(model)
-    module_targets = {str(name) for name, _module in traced.named_modules() if name}
-    dependencies: set[tuple[str, str]] = set()
-    custom_reasons: set[str] = set()
-    ordered: list[str] = []
-
-    def source_modules(value: Any) -> set[str]:
-        if isinstance(value, Node):
-            if value.op == "call_module" and str(value.target) in module_targets:
-                return {str(value.target)}
-            nested: set[str] = set()
-            nested.update(source_modules(value.args))
-            nested.update(source_modules(value.kwargs))
-            return nested
-        if isinstance(value, Mapping):
-            result: set[str] = set()
-            for item in value.values():
-                result.update(source_modules(item))
-            return result
-        if isinstance(value, (list, tuple)):
-            result: set[str] = set()
-            for item in value:
-                result.update(source_modules(item))
-            return result
-        return set()
-
-    for node in traced.graph.nodes:
-        if node.op == "call_function" and not _is_allowed_function(node.target):
-            custom_reasons.add(f"unsupported custom op: {_callable_name(node.target)}")
-        if node.op != "call_module":
-            continue
-        current = str(node.target)
-        if current not in ordered:
-            ordered.append(current)
-        for source in sorted(source_modules(node.args) | source_modules(node.kwargs)):
-            if source != current:
-                dependencies.add((source, current))
-
-    return tuple(sorted(dependencies)), tuple(ordered), tuple(sorted(custom_reasons))
+    result = FXGraphCaptureAdapter().capture(model)
+    dependencies, ordered = module_dependencies_from_graph(result.canonical_graph)
+    return dependencies, ordered, result.diagnostics
 
 
 def _export_module_dependencies(
