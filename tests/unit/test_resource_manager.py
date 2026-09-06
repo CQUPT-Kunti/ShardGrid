@@ -185,7 +185,7 @@ def test_failed_network_link_blocks_both_workers() -> None:
 
     assert all(not entry.eligible for entry in cluster.workers)
     assert any(
-        "required network link failed" in " ".join(entry.exclusion_reasons).lower()
+        "no usable network path" in " ".join(entry.exclusion_reasons).lower()
         for entry in cluster.workers
     )
 
@@ -200,7 +200,34 @@ def test_missing_required_link_blocks_workers_without_hiding_them() -> None:
     assert len(cluster.workers) == 2
     assert all(not entry.eligible for entry in cluster.workers)
     assert any(
-        "missing required network link" in " ".join(entry.exclusion_reasons).lower()
+        "no usable network path" in " ".join(entry.exclusion_reasons).lower()
+        for entry in cluster.workers
+    )
+
+
+def test_partial_network_failure_keeps_worker_with_usable_peer_eligible() -> None:
+    manager = ResourceManager()
+    workers = [
+        _worker("worker-a"),
+        _worker("worker-b"),
+        _worker("worker-c"),
+    ]
+    network = _network_state(
+        _link("worker-a", "worker-b"),
+        _link("worker-b", "worker-a"),
+        _link("worker-a", "worker-c"),
+        _link("worker-c", "worker-a"),
+        _link("worker-b", "worker-c", reachable=False, failure_reason="timeout"),
+        _link("worker-c", "worker-b", reachable=False, failure_reason="timeout"),
+    )
+
+    cluster = manager.build_cluster_state(workers, network_state=network, require_network=True)
+
+    assert len(cluster.workers) == 3
+    eligible = {entry.worker_id for entry in cluster.workers if entry.eligible}
+    assert eligible == {"worker-a", "worker-b", "worker-c"}
+    assert all(
+        entry.eligible or "no usable network path" in " ".join(entry.exclusion_reasons).lower()
         for entry in cluster.workers
     )
 

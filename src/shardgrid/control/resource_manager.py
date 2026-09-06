@@ -156,28 +156,30 @@ class ResourceManager:
             return ["network state is missing"]
         if network_stale:
             return ["network state is stale"]
-        reasons: list[str] = []
         worker_id = str(resource.worker_id)
-        for other in workers:
+        others = [
+            other for other in workers if str(other.worker_id) != worker_id
+        ]
+        if not others:
+            return []
+        usable_peers = 0
+        for other in others:
             other_id = str(other.worker_id)
-            if other_id == worker_id:
-                continue
             forward = self._find_link(network_state, worker_id, other_id)
             reverse = self._find_link(network_state, other_id, worker_id)
             if forward is None or reverse is None:
-                reasons.append(f"missing required network link: {worker_id} <-> {other_id}")
                 continue
-            for link in (forward, reverse):
-                if self._is_stale(link.measured_at, self._parse_now(network_state, link)):
-                    reasons.append(f"required network link is stale: {worker_id} <-> {other_id}")
-                    break
-                if not link.tcp_reachable or link.failure_reason:
-                    reasons.append(
-                        f"required network link failed: {worker_id} <-> {other_id}"
-                        + (f" ({link.failure_reason})" if link.failure_reason else "")
-                    )
-                    break
-        return reasons
+            if any(
+                self._is_stale(link.measured_at, self._parse_now(network_state, link))
+                or not link.tcp_reachable
+                or link.failure_reason
+                for link in (forward, reverse)
+            ):
+                continue
+            usable_peers += 1
+        if usable_peers == 0:
+            return ["worker has no usable network path to any other worker"]
+        return []
 
     def _is_network_stale(self, state: NetworkState | None, now: datetime) -> bool:
         if state is None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil
 from typing import Any, Mapping, Sequence
 
@@ -59,6 +59,7 @@ class JointPlacementPlan:
     reasons: tuple[str, ...] = ()
     selected_reason: str | None = None
     fallback_reason: str | None = None
+    candidate_plans: tuple["JointPlacementPlan", ...] = ()
 
 
 def search_joint_partition_placement(
@@ -102,6 +103,7 @@ def search_joint_partition_placement(
     for worker_count in range(min_worker_count, upper + 1):
         attempted_counts.append(worker_count)
         feasible_for_count = False
+        feasible_plans: list[JointPlacementPlan] = []
         for subset in _worker_subsets(eligible_workers, worker_count):
             partition = build_partition_profile(
                 model,
@@ -115,15 +117,12 @@ def search_joint_partition_placement(
                 min_stage_count=worker_count,
                 max_stage_count=worker_count,
             )
-            candidate = next(
-                (
-                    item
-                    for item in partition.candidates
-                    if item.hard_constraint_status is FeasibilityStatus.FEASIBLE
-                ),
-                None,
+            feasible_candidates = tuple(
+                item
+                for item in partition.candidates
+                if item.hard_constraint_status is FeasibilityStatus.FEASIBLE
             )
-            if candidate is None:
+            if not feasible_candidates:
                 reasons = partition.reasons or _candidate_attempt_reasons(partition.candidates)
                 attempts.append(
                     WorkerSubsetAttempt(
@@ -137,60 +136,69 @@ def search_joint_partition_placement(
                 failure_reasons.extend(reasons or ("PARTITION_INFEASIBLE",))
                 continue
 
-            stage_placements = _stage_placements(candidate, subset)
-            assignments = {
-                placement.stage_id: placement.worker_id for placement in stage_placements
-            }
-            structural = validate_placement_feasibility(
-                assignments,
-                workers=[entry.resource for entry in subset],
-                requirements=PlacementRequirements(
-                    stage_ids=tuple(stage.stage_id for stage in candidate.stages),
-                    communication=tuple(
-                        CommunicationRequirement(
-                            edge.source_stage_id,
-                            edge.target_stage_id,
+            for candidate in feasible_candidates:
+                stage_placements = _stage_placements(candidate, subset)
+                assignments = {
+                    placement.stage_id: placement.worker_id for placement in stage_placements
+                }
+                structural = validate_placement_feasibility(
+                    assignments,
+                    workers=[entry.resource for entry in subset],
+                    requirements=PlacementRequirements(
+                        stage_ids=tuple(stage.stage_id for stage in candidate.stages),
+                        communication=tuple(
+                            CommunicationRequirement(
+                                edge.source_stage_id,
+                                edge.target_stage_id,
+                            )
+                            for edge in candidate.communication_edges
                         )
-                        for edge in candidate.communication_edges
                     ),
-                ),
-                worker_requirements=requirements,
-                network_state=cluster_state.network_state,
-            )
-            fit_reasons = _stage_fit_reasons(stage_placements)
-            reasons = tuple(
-                dict.fromkeys(
-                    [violation.reason for violation in structural.violations] + list(fit_reasons)
+                    worker_requirements=requirements,
+                    network_state=cluster_state.network_state,
                 )
-            )
-            if not reasons:
-                feasible_for_count = True
-                return JointPlacementPlan(
-                    status=FeasibilityStatus.FEASIBLE,
-                    selected_worker_count=worker_count,
-                    selected_worker_ids=tuple(
-                        placement.worker_id for placement in stage_placements
-                    ),
-                    partition_candidate=candidate,
-                    stage_placements=stage_placements,
-                    attempted_worker_counts=tuple(attempted_counts),
-                    attempts=tuple(attempts),
-                    reasons=tuple(dict.fromkeys(failure_reasons)),
-                    selected_reason=(
-                        f"first feasible {worker_count}-worker plan"
-                    ),
+                fit_reasons = _stage_fit_reasons(stage_placements)
+                reasons = tuple(
+                    dict.fromkeys(
+                        [violation.reason for violation in structural.violations]
+                        + list(fit_reasons)
+                    )
                 )
+                if not reasons:
+                    feasible_for_count = True
+                    feasible_plans.append(
+                        JointPlacementPlan(
+                            status=FeasibilityStatus.FEASIBLE,
+                            selected_worker_count=worker_count,
+                            selected_worker_ids=tuple(
+                                placement.worker_id for placement in stage_placements
+                            ),
+                            partition_candidate=candidate,
+                            stage_placements=stage_placements,
+                            attempted_worker_counts=tuple(attempted_counts),
+                            attempts=tuple(attempts),
+                            reasons=tuple(dict.fromkeys(failure_reasons)),
+                            selected_reason=f"first feasible {worker_count}-worker plan",
+                        )
+                    )
+                    if len(feasible_plans) >= _probe_candidate_budget():
+                        break
+                    continue
+                attempts.append(
+                    WorkerSubsetAttempt(
+                        worker_count=worker_count,
+                        worker_ids=tuple(str(entry.resource.worker_id) for entry in subset),
+                        candidate_id=candidate.candidate_id,
+                        status=FeasibilityStatus.INFEASIBLE,
+                        reasons=reasons,
+                    )
+                )
+                failure_reasons.extend(reasons)
+            if len(feasible_plans) >= _probe_candidate_budget():
+                break
 
-            attempts.append(
-                WorkerSubsetAttempt(
-                    worker_count=worker_count,
-                    worker_ids=tuple(str(entry.resource.worker_id) for entry in subset),
-                    candidate_id=candidate.candidate_id,
-                    status=FeasibilityStatus.INFEASIBLE,
-                    reasons=reasons,
-                )
-            )
-            failure_reasons.extend(reasons)
+        if feasible_plans:
+            return replace(feasible_plans[0], candidate_plans=tuple(feasible_plans))
 
         if not feasible_for_count:
             failure_reasons.append(f"NO_FEASIBLE_{worker_count}_WORKER_PLAN")
@@ -317,6 +325,21 @@ def _worker_subset_budget() -> int:
         raise ValueError(
             "invalid SHARDGRID_PLACEMENT_CANDIDATE_BUDGET: must be >= 1"
         )
+    return budget
+
+
+def _probe_candidate_budget() -> int:
+    raw = os.environ.get("SHARDGRID_MEMORY_PROBE_CANDIDATES", "").strip()
+    if not raw:
+        return 3
+    try:
+        budget = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "invalid SHARDGRID_MEMORY_PROBE_CANDIDATES: must be an integer"
+        ) from exc
+    if budget < 1:
+        raise ValueError("invalid SHARDGRID_MEMORY_PROBE_CANDIDATES: must be >= 1")
     return budget
 
 

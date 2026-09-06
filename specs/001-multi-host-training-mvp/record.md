@@ -483,3 +483,67 @@
 - cleanup:
   - `/var/tmp/shardgrid/jobs/resource-reservations.json` has `reservations=[]`
   - `gpu4060`, `gpu1060`, and `gpu4060-cqupt` report no GPU compute apps or ShardGrid training PIDs after the gate
+
+## 2026-09-06 Multi-Plan Real Memory Probe Fallback
+
+- removed redundant static admission path status: current source has no `minimum_runtime_reserve_bytes`, `uncertainty_headroom_ratio`, `STATIC_MEMORY_REJECTED`, `memory-admission.json`, `static_required`, or `static_headroom` planner/runtime fields.
+- preserved the existing planner memory estimator and online/runtime probe path; no fixed 512MiB reserve or 15% uncertainty rejection was added.
+- automatic planning now keeps a bounded ordered list of feasible same-worker-count placement candidates for memory probing.
+- non-dry-run automatic jobs run candidate-specific memory probes before formal launch:
+  - candidate snapshot writes its own `original-parallel-plan.json` and `execution-plan.json`.
+  - probe launch command uses `examples/models/train_generic_dag.py --rank <rank> --memory-probe`.
+  - probe success requires forward, backward, optimizer step, and clean process exit; no formal checkpoint is required.
+  - rejected candidates are cleaned up and released before the next candidate is tried.
+  - the first probe-passing candidate becomes the formal ExecutionPlan; if all reject, the job fails during planning as `NO_FEASIBLE_PLAN`.
+- final job diagnostics now write `diagnostics/memory-probe-selection.json` with candidate ids, probe results, original estimated peak bytes, calibrated estimated peak bytes, actual probe peaks, and selected candidate id.
+- formal launch candidate id is verified to match the probe-passed candidate in regression coverage.
+- verification:
+  - `python -m ruff check src/shardgrid/control/job_manager.py src/shardgrid/planner/placement.py src/shardgrid/launchers/ssh.py tests/integration/test_train_orchestration.py` -> PASS
+  - `PYTHONPATH=.:src pytest -q tests/integration/test_train_orchestration.py -k "memory_probe_fallback or memory_probe_all_candidates" --run-integration` -> 2 passed
+  - `PYTHONPATH=.:src pytest -q tests/unit/test_job_manager_live_probe.py tests/unit/test_dag_runtime.py tests/integration/test_train_orchestration.py -k "generic_dag or automatic or probe or prepare_live_execution_plan" --run-integration` -> 18 passed
+- real hardware training was not run in this round.
+
+## 2026-09-06 Dynamic GPU Multi-Model Stress Attempt
+
+- command: `PYTHONPATH=src python scripts/stress_dynamic_gpu_multi_job.py --config examples/workers.yaml --ready-steps 5 --steady-extra-steps 10 --steady-samples 5 --sample-interval 5 --training-steps 100000 --max-attempts 100`
+- fresh discovery: `3` healthy GPUs: `gpu4060@10.87.5.155`, `gpu1060@10.87.5.15`, `gpu4060-cqupt@10.87.5.214`.
+- fixed two execution-gate bugs found during the run:
+  - `examples/models/train_generic_dag.py` now accepts `--memory-probe`, runs one real forward/backward/optimizer step, writes memory-probe evidence, and skips formal checkpoint.
+  - `JobManager` now accepts memory-probe success from monitor evidence instead of waiting for checkpoint completion.
+  - stress script now excludes `-probe-` jobs when waiting for formal job readiness.
+- observed stable active models before failure: `2`.
+  - `MiniUNet-1` / `job-20260906052029-a9e16862` / `gpu4060-cqupt` / `2568` optimizer steps / `parameter_changed=true`.
+  - `MiniDenseNet-1` / `job-20260906052258-c0cde4ed` / `gpu4060` / `2265` optimizer steps / `parameter_changed=true`.
+- failure: `ResidualMLPDAG` candidate `galvatron:stress-residual_mlp_dag-3-0:0:3-3:4` failed memory probe on workers `gpu1060(rank0)` and `gpu4060-cqupt(rank1)` with `rank 0 timed out during rendezvous`.
+- result: `DYNAMIC_GPU_MULTI_MODEL_STRESS=FAIL`; this is a distributed rendezvous/probe isolation failure, not valid saturation.
+- cleanup confirmed: reservations `0`, remote `train_generic_dag.py` PIDs `0`, GPU compute apps `0`.
+
+## 2026-09-06 Memory Probe Live-Preflight + Result Classification Fix
+
+- Memory probe now reuses the formal training live preflight path: each candidate probe attempt calls `_prepare_live_execution_plan` for a fresh resource revalidation, fresh network state, and a fresh rendezvous port. The probe launch environment (`MASTER_ADDR` / `MASTER_PORT`) always comes from the live plan, never the static default `29500`.
+- Candidate identity is verified across preflight (`_candidate_identity_preserved`): partition, placement, worker ownership, and `selected_candidate_id` are unchanged; only launch metadata (rendezvous addr/port) may differ.
+- Probe results are classified instead of a single `REJECT`: `PASS`, `MEMORY_REJECT`, `RESOURCE_CHANGED`, `INFRA_FAILURE`, `RUNTIME_FAILURE`.
+  - `MEMORY_REJECT` requires real evidence: CUDA OOM traceback, measured peak > free-memory baseline, or calibrated infeasibility.
+  - `RENDEZVOUS_TIMEOUT` / SSH / distributed-init / launch failures are `INFRA_FAILURE`; they never become `NO_FEASIBLE_PLAN`.
+  - Only all-candidates `MEMORY_REJECT` produces `NO_FEASIBLE_PLAN` (safe saturation).
+- Probe infra uses a bounded retry (default `SHARDGRID_MEMORY_PROBE_INFRA_RETRIES=2`) with a fresh live preflight/port per retry.
+- `run()` handles the new probe exceptions: `MemoryProbeResourceChanged` triggers bounded replanning; `MemoryProbeInfraFailure` / `MemoryProbeRuntimeFailure` fail the job as infrastructure/runtime (not saturation).
+- Worker probe (`train_generic_dag.py --memory-probe`) writes bounded phase diagnostics (`memory-probe-rank<rank>.json`): `DISTRIBUTED_INIT_BEGIN/END` with `rendezvous_ready`, `PROBE_FORWARD/BACKWARD/OPTIMIZER_BEGIN/END`, `PROBE_COMPLETE`, plus OOM capture and real `actual_peak_allocated/reserved` bytes.
+- Fixed launcher monitor marker mismatch: the generic DAG runner emits `GENERIC_DAG_RUNTIME_EVIDENCE`, but the launcher only parsed `STAGE_PLACEMENT_EVIDENCE`, so `rendezvous_ready` stayed false and slow multi-host probes were killed as "rendezvous timeout". The launcher now also parses the generic DAG event marker and the probe phase marker for phase/rendezvous/training detection.
+- Network probe now performs a real data-path echo test per link (`_probe_data_reachability`, cached) instead of assuming `tcp_reachable=True`. The broken `gpu1060 <-> gpu4060-cqupt` link (raw TCP data transfer times out) is now excluded, and `ResourceManager` network eligibility only excludes fully isolated workers, so valid pairs (machine-c+machine-d, machine-c+machine-e) remain usable.
+- unit/integration verification:
+  - `python -m ruff check src/shardgrid/control/job_manager.py src/shardgrid/control/resource_manager.py src/shardgrid/launchers/ssh.py examples/models/train_generic_dag.py scripts/stress_dynamic_gpu_multi_job.py tests/unit/test_memory_probe_launch.py` -> PASS
+  - `PYTHONPATH=.:src pytest -q tests/unit` -> 446 passed
+  - `PYTHONPATH=.:src pytest -q tests/integration/test_train_orchestration.py tests/integration/test_ssh_prepare.py tests/integration/test_ssh_launch.py tests/integration/test_ssh_monitor.py tests/integration/test_ssh_stop.py tests/integration/test_ssh_cleanup.py --run-integration` -> 83 passed
+  - new unit coverage `tests/unit/test_memory_probe_launch.py`: probe uses live plan fresh port, candidate identity preserved, rendezvous timeout -> `INFRA_FAILURE`, CUDA OOM -> `MEMORY_REJECT`, infra failure does not fallback plan, memory reject fallback, all-reject -> `NO_FEASIBLE_PLAN`, runtime-start-after-rendezvous -> `RUNTIME_FAILURE`, resource changed -> replan signal.
+- real hardware verification:
+  - 2-worker probe gate on machine-c + machine-d (`gpu4060` + `gpu1060`): `rendezvous_ready=true`, `PROBE_COMPLETE`, `master_port=29501` (fresh), width 8192 measured peak `4.05GB > free baseline 3.57GB` -> `MEMORY_REJECT`; width 4096 -> `PASS` and formal 2-worker training completed (`state=completed`, world_size=2, final_loss 6e-06).
+  - 2-worker probe on machine-d + machine-e (`gpu1060` + `gpu4060-cqupt`): rendezvous PASS, forward starts, then transport hang/crash -> `PROBE_RUNTIME_FAILURE`; raw socket test confirms the d<->e data path drops large transfers (environment issue, not ShardGrid).
+- dynamic stress re-run (original parameters):
+  - command: `SHARDGRID_MEMORY_PROBE_TIMEOUT_SECONDS=600 SHARDGRID_NETWORK_DATA_TEST_TIMEOUT=8 PYTHONPATH=src python scripts/stress_dynamic_gpu_multi_job.py --config examples/workers.yaml --ready-steps 5 --steady-extra-steps 10 --steady-samples 5 --sample-interval 5 --training-steps 100000 --max-attempts 100`
+  - result: `DYNAMIC_GPU_MULTI_MODEL_STRESS=PASS`, `MEMORY_PROBE_LIVE_PREFLIGHT=PASS`, `MEMORY_PROBE_RESULT_CLASSIFICATION=PASS`, `MULTI_PLAN_MEMORY_PROBE=PASS`, `OBSERVED_STABLE_MAX_CONCURRENT_MODELS=2`.
+  - jobs: `MiniUNet-1` / `job-20260906092723-0834bd1d` / `gpu4060-cqupt` / 23 steps / probe PASS (peak 4.72GB); `MiniDenseNet-1` / `job-20260906093159-b86331ca` / `gpu4060` / 12 steps / probe PASS (peak 6.06GB).
+  - saturation at 2 concurrent models: attempts 3-5 all `NO_FEASIBLE_PLAN` from real memory rejection (ResidualMLPDAG CUDA OOM, MiniUNet measured peak > baseline, MiniDenseNet planner memory infeasible). No infra failure, no formal OOM, no worker crash, no deadlock.
+  - probe infra summary: `probe_attempts=2`, `rendezvous_successes=2`, `rendezvous_retries=0`, `infra_failures=0`, `stale_default_port_reuse=0`, `fresh_port_per_attempt=[29501, 29501]`.
+  - cleanup: reservations `0`, both jobs stopped, all 3 GPUs healthy.
+- evidence: `artifacts/dynamic-stress-20260906-051941/TEST_RESULTS.txt`.

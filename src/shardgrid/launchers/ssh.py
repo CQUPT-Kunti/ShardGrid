@@ -54,9 +54,35 @@ SSHFactory = Callable[[WorkerConfig], SSHTransport]
 TransportFactory = Callable[[WorkerConfig], ArtifactTransport]
 _PREPARE_OUTPUT_DIRS = ("logs", "diagnostics", "checkpoint")
 _EVENT_MARKER = "STAGE_PLACEMENT_EVIDENCE "
+_GENERIC_DAG_EVENT_MARKER = "GENERIC_DAG_RUNTIME_EVIDENCE "
 _FORWARD_MARKER = "T072_FORWARD_EVIDENCE "
 _BACKWARD_MARKER = "T073_BACKWARD_EVIDENCE "
 _TRAIN_MARKER = "T074_TRAIN_EVIDENCE "
+_GENERIC_DAG_PROBE_MARKER = "GENERIC_DAG_PROBE_EVIDENCE "
+
+_PROBE_RENDEZVOUS_PHASES = frozenset(
+    {
+        "DISTRIBUTED_INIT_END",
+        "PROBE_FORWARD_BEGIN",
+        "PROBE_FORWARD_END",
+        "PROBE_BACKWARD_BEGIN",
+        "PROBE_BACKWARD_END",
+        "PROBE_OPTIMIZER_BEGIN",
+        "PROBE_OPTIMIZER_END",
+        "PROBE_COMPLETE",
+    }
+)
+_PROBE_TRAINING_PHASES = frozenset(
+    {
+        "PROBE_FORWARD_BEGIN",
+        "PROBE_FORWARD_END",
+        "PROBE_BACKWARD_BEGIN",
+        "PROBE_BACKWARD_END",
+        "PROBE_OPTIMIZER_BEGIN",
+        "PROBE_OPTIMIZER_END",
+        "PROBE_COMPLETE",
+    }
+)
 _LAUNCHER_OWNS_LOG_ENV = "SHARDGRID_LAUNCHER_OWNS_LOG_SINK"
 _PLAIN_TRAIN_MARKERS = (
     "TRAIN_STEP_BEGIN",
@@ -2859,9 +2885,15 @@ class SSHLauncher(Launcher):
         baseline = self._monitor_baseline(context, previous_payload)
         log_tail = redact_text(log_result.stdout, self._secrets) or ""
         placement, placement_error = self._parse_marker_payload(log_tail, _EVENT_MARKER)
+        generic_placement, generic_placement_error = self._parse_marker_payload(
+            log_tail, _GENERIC_DAG_EVENT_MARKER
+        )
+        if placement is None and generic_placement is not None:
+            placement = generic_placement
         forward, forward_error = self._parse_marker_payload(log_tail, _FORWARD_MARKER)
         backward, backward_error = self._parse_marker_payload(log_tail, _BACKWARD_MARKER)
         train, train_error = self._parse_marker_payload(log_tail, _TRAIN_MARKER)
+        probe_phase = self._parse_probe_phase(log_tail)
         plain_training_marker = self._last_plain_marker(log_tail, _PLAIN_TRAIN_MARKERS)
         marker_parse_errors = [
             {
@@ -2870,19 +2902,39 @@ class SSHLauncher(Launcher):
                 "stage": assignment.stage,
                 **item,
             }
-            for item in (placement_error, forward_error, backward_error, train_error)
+            for item in (
+                placement_error,
+                generic_placement_error,
+                forward_error,
+                backward_error,
+                train_error,
+            )
             if item is not None
         ]
         training_started = any(item is not None for item in (forward, backward, train)) or (
             plain_training_marker is not None
+        ) or (
+            isinstance(probe_phase, str)
+            and probe_phase in _PROBE_TRAINING_PHASES
         )
         process_state = process_probe.state
         training_started = baseline["training_started"] or training_started
-        rendezvous_ready = baseline["rendezvous_ready"] or placement is not None
+        rendezvous_ready = baseline["rendezvous_ready"] or placement is not None or (
+            isinstance(probe_phase, str)
+            and probe_phase in _PROBE_RENDEZVOUS_PHASES
+        )
         phase = str(baseline["phase"])
-        if rendezvous_ready:
+        if probe_phase == "DISTRIBUTED_INIT_BEGIN":
+            phase = "launch"
+        elif probe_phase in _PROBE_TRAINING_PHASES:
+            phase = "training"
+        elif probe_phase in _PROBE_RENDEZVOUS_PHASES:
             phase = "rendezvous"
-        if training_started:
+        elif probe_phase == "PROBE_FAILED":
+            phase = "training" if training_started else "launch"
+        if rendezvous_ready and phase in {"launch", "probe_launch"}:
+            phase = "rendezvous"
+        if training_started and phase in {"launch", "rendezvous"}:
             phase = "training"
         if train is not None and process_state == "exited":
             phase = "checkpoint"
@@ -2894,10 +2946,16 @@ class SSHLauncher(Launcher):
         checkpoint_roundtrip_ok = bool(
             isinstance(train, dict) and train.get("checkpoint_roundtrip_ok") is True
         )
+        memory_probe_ok = bool(
+            isinstance(train, dict)
+            and train.get("memory_probe_only") is True
+            and train.get("forward_completed") is True
+            and train.get("backward_completed") is True
+            and train.get("optimizer_step_completed") is True
+        )
         terminal_success = (
             train is not None
-            and checkpoint_ref is not None
-            and checkpoint_roundtrip_ok
+            and ((checkpoint_ref is not None and checkpoint_roundtrip_ok) or memory_probe_ok)
             and process_state == "exited"
         )
         terminal_state = (
@@ -3307,6 +3365,18 @@ class SSHLauncher(Launcher):
             pid=record.pid,
             log_path=record.log_path,
         )
+
+    def _parse_probe_phase(self, text: str) -> str | None:
+        for line in reversed(text.splitlines()):
+            if not line.startswith(_GENERIC_DAG_PROBE_MARKER):
+                continue
+            try:
+                payload = json.loads(line[len(_GENERIC_DAG_PROBE_MARKER):])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("phase"):
+                return str(payload["phase"])
+        return None
 
     def _parse_marker_payload(
         self,

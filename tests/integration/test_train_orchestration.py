@@ -46,7 +46,11 @@ from shardgrid.common.models import (
     as_job_id,
     as_worker_id,
 )
-from shardgrid.control.job_manager import JobManager, create_training_job
+from shardgrid.control.job_manager import (
+    JobManager,
+    MemoryProbeResult,
+    create_training_job,
+)
 from shardgrid.control.resource_manager import ResourceManager
 from shardgrid.control.status_store import StatusStore
 from shardgrid.engines.models import (
@@ -769,6 +773,160 @@ planning:
     )
 
 
+def test_memory_probe_fallback_selects_probe_passing_candidate(tmp_path: Path) -> None:
+    events: list[str] = []
+    manager, config_path = _build_manager(tmp_path, events)
+    training_config = load_training_config(config_path)
+    job = create_training_job(
+        config_path=str(config_path),
+        model="partition-stress",
+        requested_world_size=2,
+        backend_preference=as_backend_name("nccl"),
+        runtime_environment_ref="env:cluster/shardgrid",
+        job_id=as_job_id("job-probe-fallback"),
+    )
+    plan_a = _automatic_parallel_plan()
+    plan_b = replace(
+        _automatic_parallel_plan(),
+        parallel_plan_id="auto-plan-2",
+        selected_candidate_id="candidate-auto-2",
+    )
+    plan_a.requirements["generic_dag_runtime"] = "true"
+    plan_b.requirements["generic_dag_runtime"] = "true"
+    calls: list[tuple[str | None, str | None, tuple[str, ...]]] = []
+
+    def memory_probe(plan: ParallelPlan, execution: ExecutionPlan) -> MemoryProbeResult:
+        calls.append(
+            (
+                plan.selected_candidate_id,
+                execution.labels.get("selected_candidate_id"),
+                tuple(assignment.launch_command for assignment in execution.workers),
+            )
+        )
+        if plan.selected_candidate_id == "candidate-auto-1":
+            return MemoryProbeResult("REJECT", plan.selected_candidate_id, "probe oom")
+        return MemoryProbeResult(
+            "PASS",
+            plan.selected_candidate_id,
+            "probe passed",
+            actual_peak_allocated_bytes=123,
+            actual_peak_reserved_bytes=456,
+        )
+
+    manager._memory_probe = memory_probe
+    cluster_state = manager._resource_manager.build_cluster_state(
+        [
+            _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+            _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+        ],
+        network_state=_network_state(),
+        require_network=True,
+    )
+
+    selected, selection = manager._select_memory_probe_candidate(
+        job=job,
+        training_config=training_config,
+        candidate_plans=(plan_a, plan_b),
+        selected_workers=manager.cluster_config.workers,
+        cluster_state=cluster_state,
+        network_state=_network_state(),
+        rejected_engine_ids=(),
+    )
+
+    assert selected.selected_candidate_id == "candidate-auto-2"
+    assert [call[0] for call in calls] == ["candidate-auto-1", "candidate-auto-2"]
+    assert all(call[0] == call[1] for call in calls)
+    assert all("--memory-probe" in command for call in calls for command in call[2])
+    assert [item["result"] for item in selection["candidates"]] == [
+        "MEMORY_REJECT",
+        "PASS",
+    ]
+    assert selection["selected_candidate_id"] == "candidate-auto-2"
+    assert selection["candidates"][1]["actual_peak_allocated_bytes"] == 123
+    assert "original_estimated_peak_bytes" in selection["candidates"][1]
+    assert "calibrated_estimated_peak_bytes" in selection["candidates"][1]
+    formal_snapshot = manager._artifact_store.create_snapshot(job)
+    formal_execution = manager._build_execution_plan(
+        job=job,
+        training_config=training_config,
+        parallel_plan=selected,
+        workers=manager.cluster_config.workers,
+        snapshot=formal_snapshot,
+    )
+    assert formal_execution.labels["selected_candidate_id"] == "candidate-auto-2"
+    selection_path = manager._write_memory_probe_selection_artifact(
+        snapshot=formal_snapshot,
+        selection=selection,
+    )
+    selection_payload = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert selection_payload["selected_candidate_id"] == "candidate-auto-2"
+    assert "original_estimated_peak_bytes" in selection_payload["candidates"][1]
+    assert "calibrated_estimated_peak_bytes" in selection_payload["candidates"][1]
+    assert all(
+        "static" not in key
+        for candidate in selection_payload["candidates"]
+        for key in candidate
+    )
+    assert manager._status_store.active_reservations() == []
+
+
+def test_memory_probe_all_candidates_rejected_has_no_formal_launch(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    manager, config_path = _build_manager(tmp_path, events)
+    training_config = load_training_config(config_path)
+    job = create_training_job(
+        config_path=str(config_path),
+        model="partition-stress",
+        requested_world_size=2,
+        backend_preference=as_backend_name("nccl"),
+        runtime_environment_ref="env:cluster/shardgrid",
+        job_id=as_job_id("job-probe-none"),
+    )
+    plan_a = _automatic_parallel_plan()
+    plan_b = replace(
+        _automatic_parallel_plan(),
+        parallel_plan_id="auto-plan-2",
+        selected_candidate_id="candidate-auto-2",
+    )
+    calls: list[str | None] = []
+
+    def memory_probe(plan: ParallelPlan, execution: ExecutionPlan) -> MemoryProbeResult:
+        calls.append(execution.labels.get("selected_candidate_id"))
+        return MemoryProbeResult("REJECT", plan.selected_candidate_id, "probe oom")
+
+    manager._memory_probe = memory_probe
+
+    with pytest.raises(ValueError) as exc:
+        manager._select_memory_probe_candidate(
+            job=job,
+            training_config=training_config,
+            candidate_plans=(plan_a, plan_b),
+            selected_workers=manager.cluster_config.workers,
+            cluster_state=manager._resource_manager.build_cluster_state(
+                [
+                    _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+                    _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+                ],
+                network_state=_network_state(),
+                require_network=True,
+            ),
+            network_state=_network_state(),
+            rejected_engine_ids=(),
+        )
+
+    payload = json.loads(str(exc.value))
+    assert payload["final_result"] == "NO_FEASIBLE_PLAN"
+    assert [item["result"] for item in payload["candidates"]] == [
+        "MEMORY_REJECT",
+        "MEMORY_REJECT",
+    ]
+    assert calls == ["candidate-auto-1", "candidate-auto-2"]
+    assert "launcher_launch" not in events
+    assert manager._status_store.active_reservations() == []
+
+
 def test_generic_dag_entrypoint_missing_snapshot_fails_closed_with_evidence(
     tmp_path: Path,
 ) -> None:
@@ -1326,6 +1484,113 @@ def test_probe_failure_stops_before_network(tmp_path: Path) -> None:
     assert result.status.failure is not None
     assert result.status.failure.stage is FailureStage.PROBE
     assert events == ["probe:gpu4060", "probe:gpu1060"]
+
+
+def test_automatic_planning_skips_unreachable_probe_worker(tmp_path: Path) -> None:
+    events: list[str] = []
+    config_path = tmp_path / "train-auto.yaml"
+    config_path.write_text(
+        """
+job:
+  name: train-auto
+  backend: ssh
+  communication_backend: nccl
+model:
+  name: tiny-sequential
+  type: minimal_sequential
+resources: {}
+planning:
+  mode: automatic
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    config = _cluster_config(tmp_path)
+    workers = {
+        "gpu4060": replace(
+            _worker_resource("gpu4060", "10.87.5.155", "RTX 4060"),
+            health=Health.UNREACHABLE,
+            last_probe_at="2026-09-05T00:00:00+00:00",
+        ),
+        "gpu1060": replace(
+            _worker_resource("gpu1060", "10.87.5.15", "GTX 1650"),
+            last_probe_at="2026-09-05T00:00:00+00:00",
+        ),
+    }
+
+    def probe_worker(worker):
+        events.append(f"probe:{worker.worker_id}")
+        if str(worker.worker_id) == "gpu4060":
+            return WorkerProbeResult(
+                worker_resource=workers["gpu4060"],
+                worker_runtime=WorkerRuntime(
+                    worker_id=workers["gpu4060"].worker_id,
+                    runtime_os=RuntimeOS.WSL2_LINUX,
+                    runtime_version="Ubuntu-22.04",
+                    health=Health.UNREACHABLE,
+                ),
+                windows_host=WindowsHostInfo(
+                    os_version="Windows 11",
+                    openssh_available=False,
+                    wsl_available=False,
+                    nvidia_driver_visible=False,
+                    driver_name=None,
+                ),
+                failures=(
+                    ProbeFailure(
+                        layer="remote_access",
+                        check="ssh",
+                        message="unreachable",
+                    ),
+                ),
+                health=Health.UNREACHABLE,
+                probe_status="live",
+            )
+        return _probe_result(workers[str(worker.worker_id)])
+
+    def probe_network(worker_resources):
+        events.append("network:" + ",".join(str(worker.worker_id) for worker in worker_resources))
+        assert [str(worker.worker_id) for worker in worker_resources] == ["gpu1060"]
+        return NetworkState(
+            network_id="single",
+            workers=["gpu1060"],
+            links=[],
+            created_at="2026-09-05T00:00:00+00:00",
+        )
+
+    manager = JobManager(
+        config,
+        probe_worker=probe_worker,
+        probe_network=probe_network,
+        select_engine=lambda *args, **kwargs: FakeSelectedEngine(events),
+        source_root=Path(__file__).resolve().parents[2],
+    )
+    manager._build_automatic_parallel_plan = lambda **kwargs: ParallelPlan(
+        parallel_plan_id="auto-single-worker",
+        engine=as_engine_name("galvatron"),
+        model_name="tiny-sequential",
+        world_size=1,
+        stages=["stage0"],
+        partition_source="automatic",
+        stage_metadata=[
+            ParallelPlanStage(
+                stage_id="stage0",
+                rank=0,
+                module_ids=("m0",),
+                module_paths=("input_proj",),
+                start_index=0,
+                stop_index=1,
+                placement=ParallelPlanPlacement(worker_id="gpu1060", rank=0, gpu_index=0),
+            )
+        ],
+    )
+
+    result = manager.run(config_path, job_id=as_job_id("job-auto-skip"), dry_run=True)
+
+    assert result.status.state is JobState.SNAPSHOTTING
+    assert result.execution_plan is not None
+    assert [str(worker.worker_id) for worker in result.execution_plan.workers] == ["gpu1060"]
+    assert events[:3] == ["probe:gpu4060", "probe:gpu1060", "network:gpu1060"]
 
 
 def test_network_failure_stops_before_plan(tmp_path: Path) -> None:

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from shardgrid.common.models import as_worker_id
+from shardgrid.common.models import WorkerId, as_worker_id
 from shardgrid.network.probe import LinkProbeResult
 from shardgrid.resources.models import NetworkLink, NetworkState
 
@@ -105,11 +105,12 @@ def build_network_state(
     links: Sequence[NetworkLink],
     *,
     network_id: str,
+    workers: Sequence[WorkerId | str] = (),
     diagnostics_path: str | None = None,
 ) -> NetworkState:
     worker_ids = {
         str(link.source_worker_id) for link in links
-    } | {str(link.target_worker_id) for link in links}
+    } | {str(link.target_worker_id) for link in links} | {str(worker) for worker in workers}
     selected_interfaces = {
         str(link.source_worker_id): link.interface
         for link in links

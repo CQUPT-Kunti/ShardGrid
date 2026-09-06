@@ -111,6 +111,34 @@ def test_generic_dag_runner_trains_two_local_ranks(tmp_path: Path) -> None:
         assert shard["metadata"]["checked_parameter_count"] > 0
 
 
+def test_generic_dag_runner_rejects_missing_original_plan(tmp_path: Path) -> None:
+    root = tmp_path / "rank0"
+    _write_generic_dag_snapshot(root)
+    (root / "plan" / "original-parallel-plan.json").unlink()
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path.cwd() / "src"),
+        "RANK": "0",
+        "SHARDGRID_REMOTE_SNAPSHOT_ROOT": str(root),
+    }
+
+    result = subprocess.run(
+        [sys.executable, "examples/models/train_generic_dag.py", "--rank", "0"],
+        cwd=Path.cwd(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 78
+    assert "EXECUTION_PLAN_MISSING" in result.stdout
+    diagnostics = json.loads((root / "diagnostics" / "generic-dag-runtime.json").read_text())
+    assert diagnostics["failure_category"] == "EXECUTION_PLAN_MISSING"
+
+
 def _transport_worker(rank: int, init_file: str, queue: mp.Queue) -> None:
     dist.init_process_group(
         backend="gloo",
@@ -218,12 +246,85 @@ def _write_generic_dag_snapshot(root: Path) -> None:
         ],
         "labels": {"selected_candidate_id": "generic-dag-smoke"},
     }
+    original_plan = {
+        "parallel_plan_id": "generic-dag-smoke",
+        "engine": "pytorch_pipeline",
+        "model_name": "generic-dag-smoke",
+        "world_size": 2,
+        "stages": ["stage0", "stage1"],
+        "partition_source": "automatic",
+        "selected_candidate_id": "generic-dag-smoke",
+        "stage_metadata": [
+            {
+                "stage_id": "stage0",
+                "rank": 0,
+                "module_ids": [
+                    "enc1.conv",
+                    "enc1.norm",
+                    "down",
+                    "enc2.conv",
+                    "enc2.norm",
+                    "bottleneck.conv",
+                    "bottleneck.norm",
+                ],
+                "module_paths": [
+                    "enc1.conv",
+                    "enc1.norm",
+                    "down",
+                    "enc2.conv",
+                    "enc2.norm",
+                    "bottleneck.conv",
+                    "bottleneck.norm",
+                ],
+                "start_index": 0,
+                "stop_index": 7,
+                "placement": {
+                    "worker_id": "worker0",
+                    "rank": 0,
+                    "gpu_index": 0,
+                },
+            },
+            {
+                "stage_id": "stage1",
+                "rank": 1,
+                "module_ids": [
+                    "up2",
+                    "dec2.conv",
+                    "dec2.norm",
+                    "up1",
+                    "dec1.conv",
+                    "dec1.norm",
+                    "out",
+                ],
+                "module_paths": [
+                    "up2",
+                    "dec2.conv",
+                    "dec2.norm",
+                    "up1",
+                    "dec1.conv",
+                    "dec1.norm",
+                    "out",
+                ],
+                "start_index": 7,
+                "stop_index": 14,
+                "placement": {
+                    "worker_id": "worker1",
+                    "rank": 1,
+                    "gpu_index": 0,
+                },
+            },
+        ],
+    }
     (root / "config" / "training-config.json").write_text(
         json.dumps(training_config),
         encoding="utf-8",
     )
     (root / "plan" / "execution-plan.json").write_text(
         json.dumps(execution_plan),
+        encoding="utf-8",
+    )
+    (root / "plan" / "original-parallel-plan.json").write_text(
+        json.dumps(original_plan),
         encoding="utf-8",
     )
 

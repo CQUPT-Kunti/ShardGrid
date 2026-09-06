@@ -231,11 +231,13 @@ def build_zoo_model(name: str, **kwargs: Any) -> nn.Module:
         raise ValueError(f"unknown generic partition zoo model {name!r}") from exc
 
 
-def make_zoo_sample(name: str) -> tuple[tuple[Any, ...], dict[str, Any]]:
+def make_zoo_sample(name: str, **kwargs: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
     if name in {"mini_resnet", "mini_unet", "mini_inception", "mini_vit"}:
         return (torch.randn(1, 3, 32, 32),), {}
     if name == "mini_encoder_decoder":
         return (torch.randint(0, 32, (1, 8)), torch.randint(0, 32, (1, 6))), {}
     if name == "multi_input":
         return (torch.randn(1, 3, 32, 32), torch.randn(1, 5)), {}
+    if name in {"mini_densenet", "residual_mlp_dag"}:
+        return (torch.randn(1, int(kwargs.get("width", 16))),), {}
     return (torch.randn(1, 16),), {}

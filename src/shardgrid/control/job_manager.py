@@ -5,7 +5,9 @@ from __future__ import annotations
 import gc
 import json
 import os
+import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,6 +72,7 @@ ProbeNetworkFunc = Callable[[list[WorkerResource]], NetworkState]
 SelectEngineFunc = Callable[..., SelectedEngine]
 LauncherFactory = Callable[[str], Launcher]
 SourceRoot = str | Path
+MemoryProbeFunc = Callable[[ParallelPlan, ExecutionPlan], "MemoryProbeResult"]
 
 
 def _now() -> str:
@@ -96,6 +99,33 @@ def _contains_tensor(value: object) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_tensor(item) for item in value)
     return False
+
+
+def _probe_log_has_oom(text: str | None) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "cuda out of memory",
+            "cuda error: out of memory",
+            "cuda oom",
+            "out of memory",
+        )
+    )
+
+
+def _parse_probe_data_payload(text: str | None) -> dict[str, object] | None:
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 def create_training_job(
@@ -184,6 +214,91 @@ class JobRunResult:
     launcher_result: LauncherResult | None = None
 
 
+PROBE_PASS = "PASS"
+PROBE_MEMORY_REJECT = "MEMORY_REJECT"
+PROBE_RESOURCE_CHANGED = "RESOURCE_CHANGED"
+PROBE_INFRA_FAILURE = "INFRA_FAILURE"
+PROBE_RUNTIME_FAILURE = "RUNTIME_FAILURE"
+
+PROBE_TRANSIENT_INFRA_SUBTYPES = {
+    "RENDEZVOUS_TIMEOUT",
+    "PORT_COLLISION",
+    "SSH_TRANSIENT_FAILURE",
+}
+
+PROBE_PHASE_MARKER = "GENERIC_DAG_PROBE_EVIDENCE "
+
+
+@dataclass(frozen=True)
+class MemoryProbeResult:
+    status: str
+    candidate_id: str | None
+    subtype: str | None = None
+    message: str = ""
+    actual_peak_allocated_bytes: int | None = None
+    actual_peak_reserved_bytes: int | None = None
+    rendezvous_ready: bool | None = None
+    phase: str | None = None
+    events: tuple[dict[str, object], ...] = ()
+    master_addr: str | None = None
+    master_port: int | None = None
+    oom_evidence: bool = False
+    attempt: int = 1
+
+    def __post_init__(self) -> None:
+        status = self.status
+        if status == "REJECT":
+            object.__setattr__(self, "status", PROBE_MEMORY_REJECT)
+            status = PROBE_MEMORY_REJECT
+        if status not in {
+            PROBE_PASS,
+            PROBE_MEMORY_REJECT,
+            PROBE_RESOURCE_CHANGED,
+            PROBE_INFRA_FAILURE,
+            PROBE_RUNTIME_FAILURE,
+        }:
+            raise ValueError(f"invalid memory probe status: {self.status}")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "candidate_id": self.candidate_id,
+            "subtype": self.subtype,
+            "message": self.message,
+            "actual_peak_allocated_bytes": self.actual_peak_allocated_bytes,
+            "actual_peak_reserved_bytes": self.actual_peak_reserved_bytes,
+            "rendezvous_ready": self.rendezvous_ready,
+            "phase": self.phase,
+            "events": list(self.events),
+            "master_addr": self.master_addr,
+            "master_port": self.master_port,
+            "oom_evidence": self.oom_evidence,
+            "attempt": self.attempt,
+        }
+
+
+class MemoryProbeSelectionError(ValueError):
+    def __init__(self, result: MemoryProbeResult) -> None:
+        super().__init__(result.message)
+        self.result = result
+
+
+class MemoryProbeNoFeasiblePlan(MemoryProbeSelectionError):
+    """Every bounded candidate was a real memory reject; this is safe saturation."""
+
+
+class MemoryProbeInfraFailure(MemoryProbeSelectionError):
+    """Rendezvous / SSH / distributed infrastructure failed; not a capacity signal."""
+
+
+class MemoryProbeResourceChanged(MemoryProbeSelectionError):
+    """Live resource revalidation no longer matches the candidate plan."""
+
+
+class MemoryProbeRuntimeFailure(MemoryProbeSelectionError):
+    """Probe reached a runtime error that is not a memory signal."""
+
+
 class JobManager:
     def __init__(
         self,
@@ -197,6 +312,7 @@ class JobManager:
         artifact_collector: ArtifactCollector | None = None,
         resource_manager: ResourceManager | None = None,
         status_store: StatusStore | None = None,
+        memory_probe: MemoryProbeFunc | None = None,
         source_root: SourceRoot = ".",
         secrets: Sequence[str] = (),
     ) -> None:
@@ -211,9 +327,12 @@ class JobManager:
         self._artifact_collector = artifact_collector
         self._resource_manager = resource_manager or ResourceManager()
         self._status_store = status_store or StatusStore(cluster_config.jobs_root)
+        self._memory_probe = memory_probe
         self._source_root = Path(source_root).resolve()
         self._secrets = tuple(secret for secret in secrets if secret)
         self._last_planning_evidence: dict[str, object] = {}
+        self._last_parallel_plan_candidates: tuple[ParallelPlan, ...] = ()
+        self._data_test_cache: dict[tuple[str, str], tuple[float, bool, str | None]] = {}
 
     def run(
         self,
@@ -225,6 +344,7 @@ class JobManager:
     ) -> JobRunResult:
         training_config = load_training_config(training_config_path)
         self._last_planning_evidence = {}
+        self._last_parallel_plan_candidates = ()
         job = create_training_job(
             config_path=str(training_config_path),
             model=training_config.model.name,
@@ -246,12 +366,44 @@ class JobManager:
             (result for result in probe_results if result.health is not Health.HEALTHY),
             None,
         )
-        if failed_probe is not None:
+        if failed_probe is not None and not self._automatic_planning_enabled(training_config):
             failure = self._probe_failure(selected_workers, failed_probe)
             current = self._failed_status(current, phase="probe", failure=failure)
             self._status_store.save_path(self._status_store.status_path(job.job_id), current)
             raise_or_return = self._failed_run_result(job, current)
             return raise_or_return
+        if self._automatic_planning_enabled(training_config):
+            healthy_worker_ids = {
+                result.worker_resource.worker_id
+                for result in probe_results
+                if result.health is Health.HEALTHY
+            }
+            selected_workers = [
+                worker for worker in selected_workers if worker.worker_id in healthy_worker_ids
+            ]
+            probe_results = [
+                result
+                for result in probe_results
+                if result.worker_resource.worker_id in healthy_worker_ids
+            ]
+            if not probe_results:
+                failure = (
+                    self._probe_failure(
+                        self._select_candidate_workers(training_config),
+                        failed_probe,
+                    )
+                    if failed_probe is not None
+                    else make_failure_record(
+                        stage=FailureStage.PROBE,
+                        host=str(self.cluster_config.control.hostname),
+                        message="no enabled workers are available for automatic planning",
+                        recommended_action="enable at least one worker and retry",
+                        secrets=self._secrets,
+                    )
+                )
+                current = self._failed_status(current, phase="probe", failure=failure)
+                self._status_store.save_path(self._status_store.status_path(job.job_id), current)
+                return self._failed_run_result(job, current)
 
         worker_resources = self._apply_active_resource_reservations(
             [result.worker_resource for result in probe_results],
@@ -288,43 +440,226 @@ class JobManager:
             phase="plan",
         )
         planning_evidence: dict[str, object] | None = None
-        try:
-            selected_engine = self._select_engine(
-                self._selected_engine_id(),
-                job,
-                cluster_state,
-                network_state,
-                registry=registered_engine_registry(),
-            )
-            if self._automatic_planning_enabled(training_config):
-                automatic_plan = self._build_automatic_parallel_plan(
-                    training_config=training_config,
-                    cluster_state=cluster_state,
-                    selected_engine=selected_engine,
-                    min_selected_physical_hosts=min_selected_physical_hosts,
+        probe_selection: dict[str, object] | None = None
+        max_planning_attempts = 1 + int(
+            os.environ.get("SHARDGRID_MEMORY_PROBE_REPLAN_ATTEMPTS", "1")
+        )
+        planning_attempt = 0
+        while True:
+            planning_attempt += 1
+            try:
+                selected_engine = self._select_engine(
+                    self._selected_engine_id(),
+                    job,
+                    cluster_state,
+                    network_state,
+                    registry=registered_engine_registry(),
                 )
-                planning_evidence = dict(self._last_planning_evidence)
-                selected_engine = SelectedEngine(
-                    job_id=getattr(selected_engine, "job_id", job.job_id),
-                    engine=selected_engine.engine,
-                    candidate=selected_engine.candidate,
-                    parallel_plan=automatic_plan,
-                    original_plan_path=automatic_plan.engine_plan_path,
-                    rejected_engine_ids=tuple(
-                        getattr(selected_engine, "rejected_engine_ids", ())
-                    ),
+                if self._automatic_planning_enabled(training_config):
+                    automatic_plan = self._build_automatic_parallel_plan(
+                        training_config=training_config,
+                        cluster_state=cluster_state,
+                        selected_engine=selected_engine,
+                        min_selected_physical_hosts=min_selected_physical_hosts,
+                    )
+                    planning_evidence = dict(self._last_planning_evidence)
+                    selected_engine = SelectedEngine(
+                        job_id=getattr(selected_engine, "job_id", job.job_id),
+                        engine=selected_engine.engine,
+                        candidate=selected_engine.candidate,
+                        parallel_plan=automatic_plan,
+                        original_plan_path=automatic_plan.engine_plan_path,
+                        rejected_engine_ids=tuple(
+                            getattr(selected_engine, "rejected_engine_ids", ())
+                        ),
+                    )
+            except Exception as exc:
+                failure = make_failure_record(
+                    stage=FailureStage.PLAN,
+                    host=str(self.cluster_config.control.hostname),
+                    message=f"engine planning failed: {exc}",
+                    recommended_action="repair engine selection or plan inputs, then retry",
+                    secrets=self._secrets,
                 )
-        except Exception as exc:
-            failure = make_failure_record(
-                stage=FailureStage.PLAN,
-                host=str(self.cluster_config.control.hostname),
-                message=f"engine planning failed: {exc}",
-                recommended_action="repair engine selection or plan inputs, then retry",
-                secrets=self._secrets,
-            )
-            current = self._failed_status(current, phase="plan", failure=failure)
-            self._status_store.save_path(self._status_store.status_path(job.job_id), current)
-            return self._failed_run_result(job, current)
+                current = self._failed_status(current, phase="plan", failure=failure)
+                self._status_store.save_path(self._status_store.status_path(job.job_id), current)
+                return self._failed_run_result(job, current)
+
+            if self._automatic_planning_enabled(training_config) and not dry_run:
+                try:
+                    selected_plan, probe_selection = self._select_memory_probe_candidate(
+                        job=job,
+                        training_config=training_config,
+                        candidate_plans=self._last_parallel_plan_candidates
+                        or (selected_engine.parallel_plan,),
+                        selected_workers=selected_workers,
+                        cluster_state=cluster_state,
+                        network_state=network_state,
+                        rejected_engine_ids=selected_engine.rejected_engine_ids,
+                    )
+                    planning_evidence = dict(planning_evidence or {})
+                    planning_evidence["memory_probe_selection"] = probe_selection
+                    selected_engine = SelectedEngine(
+                        job_id=getattr(selected_engine, "job_id", job.job_id),
+                        engine=selected_engine.engine,
+                        candidate=selected_engine.candidate,
+                        parallel_plan=selected_plan,
+                        original_plan_path=selected_plan.engine_plan_path,
+                        rejected_engine_ids=tuple(
+                            getattr(selected_engine, "rejected_engine_ids", ())
+                        ),
+                    )
+                    break
+                except MemoryProbeNoFeasiblePlan as exc:
+                    failure = make_failure_record(
+                        stage=FailureStage.PLAN,
+                        host=str(self.cluster_config.control.hostname),
+                        message=(
+                            "NO_FEASIBLE_PLAN: memory probe rejected all candidates: "
+                            f"{exc.result.message}"
+                        ),
+                        recommended_action=(
+                            "free GPU memory or reduce the model/batch size, then retry"
+                        ),
+                        runtime_environment={
+                            "probe_result": json.dumps(
+                                exc.result.to_dict(), sort_keys=True
+                            ),
+                        },
+                        secrets=self._secrets,
+                    )
+                    current = self._failed_status(current, phase="plan", failure=failure)
+                    self._status_store.save_path(
+                        self._status_store.status_path(job.job_id), current
+                    )
+                    return self._failed_run_result(job, current)
+                except MemoryProbeResourceChanged as exc:
+                    if planning_attempt >= max_planning_attempts:
+                        failure = make_failure_record(
+                            stage=FailureStage.LAUNCH,
+                            host=str(self.cluster_config.control.hostname),
+                            message=(
+                                "RESOURCE_CHANGED: probe resource revalidation failed "
+                                f"after replanning: {exc.result.message}"
+                            ),
+                            recommended_action=(
+                                "wait for active jobs to release GPU memory or add workers"
+                            ),
+                            runtime_environment={
+                                "probe_result": json.dumps(
+                                    exc.result.to_dict(), sort_keys=True
+                                ),
+                            },
+                            secrets=self._secrets,
+                        )
+                        current = self._failed_status(
+                            current, phase="memory_probe", failure=failure
+                        )
+                        self._status_store.save_path(
+                            self._status_store.status_path(job.job_id), current
+                        )
+                        return self._failed_run_result(job, current)
+                    refreshed = self._refresh_planning_state(
+                        training_config=training_config,
+                        selected_workers=selected_workers,
+                        current_job_id=job.job_id,
+                    )
+                    if refreshed is None:
+                        failure = make_failure_record(
+                            stage=FailureStage.LAUNCH,
+                            host=str(self.cluster_config.control.hostname),
+                            message=(
+                                "RESOURCE_CHANGED: no healthy workers remain for "
+                                "replanning after probe resource revalidation"
+                            ),
+                            recommended_action="add or repair workers, then retry",
+                            secrets=self._secrets,
+                        )
+                        current = self._failed_status(
+                            current, phase="memory_probe", failure=failure
+                        )
+                        self._status_store.save_path(
+                            self._status_store.status_path(job.job_id), current
+                        )
+                        return self._failed_run_result(job, current)
+                    (
+                        selected_workers,
+                        _probe_results,
+                        _worker_resources,
+                        cluster_state,
+                        network_state,
+                    ) = refreshed
+                    continue
+                except MemoryProbeInfraFailure as exc:
+                    failure = make_failure_record(
+                        stage=FailureStage.RENDEZVOUS,
+                        host=str(self.cluster_config.control.hostname),
+                        message=(
+                            "PROBE_INFRA_FAILURE: "
+                            f"{exc.result.message}"
+                        ),
+                        recommended_action=(
+                            "inspect probe rendezvous/SSH/network diagnostics and retry; "
+                            "this is not a GPU memory capacity signal"
+                        ),
+                        runtime_environment={
+                            "probe_result": json.dumps(
+                                exc.result.to_dict(), sort_keys=True
+                            ),
+                        },
+                        retryable=True,
+                        secrets=self._secrets,
+                    )
+                    current = self._failed_status(
+                        current, phase="probe_infra", failure=failure
+                    )
+                    self._status_store.save_path(
+                        self._status_store.status_path(job.job_id), current
+                    )
+                    return self._failed_run_result(job, current)
+                except MemoryProbeRuntimeFailure as exc:
+                    failure = make_failure_record(
+                        stage=FailureStage.TRAIN,
+                        host=str(self.cluster_config.control.hostname),
+                        message=(
+                            "PROBE_RUNTIME_FAILURE: "
+                            f"{exc.result.message}"
+                        ),
+                        recommended_action=(
+                            "inspect probe phase diagnostics and rank logs; "
+                            "this is not a GPU memory capacity signal"
+                        ),
+                        runtime_environment={
+                            "probe_result": json.dumps(
+                                exc.result.to_dict(), sort_keys=True
+                            ),
+                        },
+                        secrets=self._secrets,
+                    )
+                    current = self._failed_status(
+                        current, phase="memory_probe", failure=failure
+                    )
+                    self._status_store.save_path(
+                        self._status_store.status_path(job.job_id), current
+                    )
+                    return self._failed_run_result(job, current)
+                except Exception as exc:
+                    failure = make_failure_record(
+                        stage=FailureStage.PLAN,
+                        host=str(self.cluster_config.control.hostname),
+                        message=f"memory probe selection failed: {exc}",
+                        recommended_action=(
+                            "inspect probe diagnostics and retry planning"
+                        ),
+                        secrets=self._secrets,
+                    )
+                    current = self._failed_status(current, phase="plan", failure=failure)
+                    self._status_store.save_path(
+                        self._status_store.status_path(job.job_id), current
+                    )
+                    return self._failed_run_result(job, current)
+            else:
+                break
 
         snapshot = self._artifact_store.create_snapshot(
             replace(
@@ -386,6 +721,14 @@ class JobManager:
             selected_engine,
             planning_evidence=planning_evidence,
         )
+        probe_selection = (planning_evidence or {}).get("memory_probe_selection")
+        if isinstance(probe_selection, dict):
+            launch_metadata["memory_probe_selection_ref"] = str(
+                self._write_memory_probe_selection_artifact(
+                    snapshot=snapshot,
+                    selection=probe_selection,
+                )
+            )
 
         self._write_snapshot_metadata(
             snapshot=snapshot,
@@ -897,12 +1240,17 @@ class JobManager:
                 source_resource=source,
                 target_resource=target,
                 source_worker=worker_configs[str(source.worker_id)],
+                target_worker=worker_configs.get(str(target.worker_id)),
             )
             for source in workers
             for target in workers
             if source.worker_id != target.worker_id
         ]
-        return build_network_state(links, network_id=f"job-{_now()}")
+        return build_network_state(
+            links,
+            network_id=f"job-{_now()}",
+            workers=[worker.worker_id for worker in workers],
+        )
 
     def _probe_network_link(
         self,
@@ -910,6 +1258,7 @@ class JobManager:
         source_resource: WorkerResource,
         target_resource: WorkerResource,
         source_worker: WorkerConfig,
+        target_worker: WorkerConfig | None = None,
     ) -> NetworkLink:
         if not target_resource.ip:
             raise RuntimeError(f"target worker {target_resource.worker_id} is missing ip evidence")
@@ -931,13 +1280,23 @@ class JobManager:
         link_result = runtime.run(["ip", "link", "show", "dev", interface], timeout=10)
         link_output = link_result.stdout.strip() if link_result.ok else None
         interface_mtu = parse_interface_mtu(link_output)
+        data_ok, data_note = self._probe_data_reachability(
+            source_runtime=runtime,
+            target_runtime=(
+                None if target_worker is None else self._runtime_wrapper(target_worker)
+            ),
+            source_ip=source_ip,
+            source_worker_id=str(source_resource.worker_id),
+            target_worker_id=str(target_resource.worker_id),
+        )
         return NetworkLink(
             source_worker_id=source_resource.worker_id,
             target_worker_id=target_resource.worker_id,
             source_ip=source_ip,
             target_ip=target_resource.ip,
             interface=interface,
-            tcp_reachable=True,
+            tcp_reachable=data_ok,
+            failure_reason=None if data_ok else data_note,
             interface_mtu=interface_mtu,
             expected_mtu=self.cluster_config.network.nccl_mtu,
             mtu_status=(
@@ -947,6 +1306,138 @@ class JobManager:
             ),
             measured_at=_now(),
         )
+
+    def _probe_data_reachability(
+        self,
+        *,
+        source_runtime: object,
+        target_runtime: object | None,
+        source_ip: str,
+        source_worker_id: str,
+        target_worker_id: str,
+    ) -> tuple[bool, str | None]:
+        """Validate that the source worker can sustain a real TCP data transfer
+        to the target worker. A bare TCP accept (what older probes recorded as
+        ``tcp_reachable``) does not prove a data path that NCCL/Gloo training
+        traffic can survive, so we echo a moderate payload across the pair.
+
+        The server and client both run in the foreground (one SSH session per
+        worker) so no background process is left behind; the control node runs
+        them concurrently with a randomly chosen port. The server is the
+        authority: if it does not receive the full payload, the link is marked
+        unreliable regardless of what the client's socket buffer reported.
+
+        Degrades gracefully: if the test machinery cannot run (e.g. an older
+        mocked runtime in unit tests), the link keeps the previous optimistic
+        reachability assumption instead of failing the whole network probe.
+        """
+        if target_runtime is None or not source_ip:
+            return True, None
+        cache_key = (source_worker_id, target_worker_id)
+        cache_ttl = float(
+            os.environ.get("SHARDGRID_NETWORK_DATA_TEST_CACHE_SECONDS", "600")
+        )
+        cached = self._data_test_cache.get(cache_key)
+        if cached is not None:
+            if time.monotonic() - cached[0] < cache_ttl:
+                return cached[1], cached[2]
+        payload_mb = int(os.environ.get("SHARDGRID_NETWORK_DATA_TEST_MB", "16"))
+        timeout = float(os.environ.get("SHARDGRID_NETWORK_DATA_TEST_TIMEOUT", "8"))
+        if payload_mb <= 0:
+            return True, None
+        socket_timeout = int(max(timeout, 8))
+        port = random.randint(20000, 60000)
+        server_script = (
+            "import json, socket\n"
+            f"port = {port}\n"
+            f"target_mb = {payload_mb}\n"
+            f"accept_timeout = {socket_timeout + 5}\n"
+            "s = socket.socket()\n"
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "try:\n"
+            "    s.bind(('0.0.0.0', port))\n"
+            "except OSError as exc:\n"
+            "    print(json.dumps({'ok': False, 'error': str(exc)}))\n"
+            "    raise SystemExit\n"
+            "s.listen(1)\n"
+            "s.settimeout(accept_timeout)\n"
+            "try:\n"
+            "    c, _ = s.accept()\n"
+            "    total = 0\n"
+            "    while total < target_mb << 20:\n"
+            "        chunk = c.recv(1 << 20)\n"
+            "        if not chunk:\n"
+            "            break\n"
+            "        total += len(chunk)\n"
+            "    c.close()\n"
+            "    print(json.dumps({'ok': total >= target_mb << 20, 'bytes': total}))\n"
+            "except Exception as exc:\n"
+            "    print(json.dumps({'ok': False, 'error': str(exc)}))\n"
+            "s.close()\n"
+        )
+        client_script = (
+            "import json, socket, time\n"
+            f"host = {source_ip!r}\n"
+            f"port = {port}\n"
+            f"target_mb = {payload_mb}\n"
+            f"socket_timeout = {socket_timeout}\n"
+            "try:\n"
+            "    s = socket.socket()\n"
+            "    s.settimeout(socket_timeout)\n"
+            "    connected = False\n"
+            "    for attempt in range(12):\n"
+            "        try:\n"
+            "            s.connect((host, port))\n"
+            "            connected = True\n"
+            "            break\n"
+            "        except (ConnectionRefusedError, OSError):\n"
+            "            s.close()\n"
+            "            s = socket.socket()\n"
+            "            s.settimeout(socket_timeout)\n"
+            "            time.sleep(0.4)\n"
+            "    if not connected:\n"
+            "        raise OSError('server not reachable')\n"
+            "    payload = b'x' * (1 << 20)\n"
+            "    sent = 0\n"
+            "    while sent < target_mb << 20:\n"
+            "        s.sendall(payload)\n"
+            "        sent += len(payload)\n"
+            "    s.close()\n"
+            "    print(json.dumps({'ok': True, 'bytes': sent}))\n"
+            "except Exception as exc:\n"
+            "    print(json.dumps({'ok': False, 'error': str(exc)}))\n"
+        )
+        script_timeout = socket_timeout + 10
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                server_future = pool.submit(
+                    getattr(source_runtime, "run_script"),
+                    server_script,
+                    timeout=script_timeout,
+                )
+                client_future = pool.submit(
+                    getattr(target_runtime, "run_script"),
+                    client_script,
+                    timeout=script_timeout,
+                )
+                server_result = server_future.result(timeout=script_timeout + 5)
+                client_result = client_future.result(timeout=script_timeout + 5)
+        except Exception:
+            return True, None
+        server_payload = _parse_probe_data_payload(server_result.stdout)
+        client_payload = _parse_probe_data_payload(client_result.stdout)
+        if isinstance(server_payload, dict) and server_payload.get("ok") is True:
+            result: tuple[bool, str | None] = (True, None)
+            self._data_test_cache[cache_key] = (time.monotonic(), *result)
+            return result
+        note = (
+            (server_payload or {}).get("error")
+            or (client_payload or {}).get("error")
+            or "data transfer did not complete"
+        )
+        result = (False, f"DATA_PATH_UNRELIABLE: {note}")
+        self._data_test_cache[cache_key] = (time.monotonic(), *result)
+        return result
 
     def _runtime_wrapper(self, worker: WorkerConfig) -> WSLRuntimeWrapper:
         transport = SSHTransport(
@@ -985,6 +1476,63 @@ class JobManager:
         if self._automatic_planning_enabled(training_config):
             return configured_workers
         return configured_workers[: training_config.resources.world_size]
+
+    def _refresh_planning_state(
+        self,
+        *,
+        training_config: TrainingConfig,
+        selected_workers: list[WorkerConfig],
+        current_job_id: JobId,
+    ) -> tuple[
+        list[WorkerConfig],
+        list[WorkerProbeResult],
+        list[WorkerResource],
+        ClusterState,
+        NetworkState,
+    ] | None:
+        try:
+            probe_results = [
+                self._probe_worker(worker) for worker in selected_workers
+            ]
+        except Exception:
+            return None
+        healthy_ids = {
+            result.worker_resource.worker_id
+            for result in probe_results
+            if result.health is Health.HEALTHY
+        }
+        fresh_workers = [
+            worker for worker in selected_workers if worker.worker_id in healthy_ids
+        ]
+        if not fresh_workers:
+            return None
+        fresh_results = [
+            result
+            for result in probe_results
+            if result.worker_resource.worker_id in healthy_ids
+        ]
+        worker_resources = self._apply_active_resource_reservations(
+            [result.worker_resource for result in fresh_results],
+            current_job_id=current_job_id,
+        )
+        cluster_state = self._resource_manager.build_cluster_state(
+            worker_resources,
+            network_state=None,
+            require_network=False,
+        )
+        network_state = self._probe_network(worker_resources)
+        cluster_state = self._resource_manager.build_cluster_state(
+            worker_resources,
+            network_state=network_state,
+            require_network=True,
+        )
+        return (
+            fresh_workers,
+            fresh_results,
+            worker_resources,
+            cluster_state,
+            network_state,
+        )
 
     def _probe_failure(
         self,
@@ -1121,6 +1669,11 @@ class JobManager:
     def _launch_command_for_assignment(self, parallel_plan: ParallelPlan, rank: int) -> str:
         if parallel_plan.partition_source == "automatic":
             if parallel_plan.requirements.get("generic_dag_runtime") == "true":
+                if parallel_plan.requirements.get("memory_probe") == "true":
+                    return (
+                        f"python examples/models/train_generic_dag.py --rank {rank} "
+                        "--memory-probe"
+                    )
                 return f"python examples/models/train_generic_dag.py --rank {rank}"
             return f"python examples/models/train_automatic_plan.py --rank {rank}"
         return f"python examples/models/train_pipeline.py --rank {rank}"
@@ -1436,6 +1989,747 @@ class JobManager:
             secrets=self._secrets,
         )
 
+    def _select_memory_probe_candidate(
+        self,
+        *,
+        job: TrainingJob,
+        training_config: TrainingConfig,
+        candidate_plans: Sequence[ParallelPlan],
+        selected_workers: list[WorkerConfig],
+        cluster_state: ClusterState,
+        network_state: NetworkState,
+        rejected_engine_ids: Sequence[str],
+    ) -> tuple[ParallelPlan, dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for index, candidate in enumerate(candidate_plans):
+            probe_plan = replace(
+                candidate,
+                requirements={**candidate.requirements, "memory_probe": "true"},
+            )
+            probe_job = create_training_job(
+                config_path=job.config_path,
+                model=job.model,
+                requested_world_size=probe_plan.world_size,
+                backend_preference=job.backend_preference,
+                runtime_environment_ref=job.runtime_environment_ref,
+                job_id=as_job_id(f"{job.job_id}-probe-{index}"),
+            )
+            probe_snapshot = self._artifact_store.create_snapshot(probe_job)
+            create_code_snapshot(
+                probe_snapshot,
+                source_root=self._source_root,
+                secrets=self._secrets,
+            )
+            current = self._status_store.create_initial_status(probe_job)
+            result = self._run_probe_candidate_with_live_preflight(
+                training_config=training_config,
+                probe_job=probe_job,
+                probe_snapshot=probe_snapshot,
+                probe_plan=probe_plan,
+                candidate=candidate,
+                selected_workers=selected_workers,
+                cluster_state=cluster_state,
+                network_state=network_state,
+                rejected_engine_ids=rejected_engine_ids,
+                current=current,
+            )
+            records.append(
+                {
+                    "candidate_id": probe_plan.selected_candidate_id,
+                    "parallel_plan_id": probe_plan.parallel_plan_id,
+                    "probe_job_id": str(probe_job.job_id),
+                    "probe_snapshot": probe_snapshot.root_path,
+                    **self._memory_probe_estimates(probe_plan),
+                    "result": result.status,
+                    "subtype": result.subtype,
+                    "message": result.message,
+                    "rendezvous_ready": result.rendezvous_ready,
+                    "phase": result.phase,
+                    "master_addr": result.master_addr,
+                    "master_port": result.master_port,
+                    "attempt": result.attempt,
+                    "oom_evidence": result.oom_evidence,
+                    "actual_peak_allocated_bytes": result.actual_peak_allocated_bytes,
+                    "actual_peak_reserved_bytes": result.actual_peak_reserved_bytes,
+                }
+            )
+            if result.status == PROBE_PASS:
+                selection = {
+                    "job_id": str(job.job_id),
+                    "candidate_count": len(candidate_plans),
+                    "candidates": records,
+                    "selected_candidate_id": candidate.selected_candidate_id,
+                    "final_result": "PASS",
+                    "probe_infra_summary": self._probe_infra_summary(records),
+                }
+                return candidate, selection
+            if result.status == PROBE_RESOURCE_CHANGED:
+                raise MemoryProbeResourceChanged(result)
+            if result.status == PROBE_INFRA_FAILURE:
+                raise MemoryProbeInfraFailure(result)
+            if result.status == PROBE_RUNTIME_FAILURE:
+                raise MemoryProbeRuntimeFailure(result)
+        raise MemoryProbeNoFeasiblePlan(
+            MemoryProbeResult(
+                status=PROBE_MEMORY_REJECT,
+                candidate_id=None,
+                subtype="ALL_CANDIDATES_REJECTED",
+                message=json.dumps(
+                    {
+                        "candidate_count": len(candidate_plans),
+                        "candidates": records,
+                        "final_result": "NO_FEASIBLE_PLAN",
+                    },
+                    sort_keys=True,
+                ),
+            )
+        )
+
+    def _run_probe_candidate_with_live_preflight(
+        self,
+        *,
+        training_config: TrainingConfig,
+        probe_job: TrainingJob,
+        probe_snapshot: JobSnapshot,
+        probe_plan: ParallelPlan,
+        candidate: ParallelPlan,
+        selected_workers: list[WorkerConfig],
+        cluster_state: ClusterState,
+        network_state: NetworkState,
+        rejected_engine_ids: Sequence[str],
+        current: JobStatus,
+    ) -> MemoryProbeResult:
+        max_retries = 1 + int(
+            os.environ.get("SHARDGRID_MEMORY_PROBE_INFRA_RETRIES", "2")
+        )
+        last_result: MemoryProbeResult | None = None
+        for attempt in range(1, max_retries + 1):
+            probe_execution = self._build_execution_plan(
+                job=probe_job,
+                training_config=training_config,
+                parallel_plan=probe_plan,
+                workers=selected_workers,
+                snapshot=probe_snapshot,
+                rejected_engine_ids=rejected_engine_ids,
+            )
+            try:
+                live_plan, live_cluster, live_network = self._prepare_live_execution_plan(
+                    training_config=training_config,
+                    execution_plan=probe_execution,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if "RESOURCE_CHANGED" in message:
+                    return MemoryProbeResult(
+                        status=PROBE_RESOURCE_CHANGED,
+                        candidate_id=probe_plan.selected_candidate_id,
+                        subtype="RESOURCE_CHANGED",
+                        message=message,
+                        attempt=attempt,
+                    )
+                last_result = MemoryProbeResult(
+                    status=PROBE_INFRA_FAILURE,
+                    candidate_id=probe_plan.selected_candidate_id,
+                    subtype="LIVE_PREFLIGHT_FAILURE",
+                    message=message,
+                    attempt=attempt,
+                )
+                if attempt < max_retries:
+                    continue
+                return last_result
+            identity_mismatch = self._candidate_identity_preserved(candidate, live_plan)
+            if identity_mismatch is not None:
+                raise MemoryProbeRuntimeFailure(
+                    MemoryProbeResult(
+                        status=PROBE_RUNTIME_FAILURE,
+                        candidate_id=probe_plan.selected_candidate_id,
+                        subtype="CANDIDATE_IDENTITY_CHANGED",
+                        message=(
+                            "probe candidate identity changed after live preflight: "
+                            f"{identity_mismatch}"
+                        ),
+                        attempt=attempt,
+                    )
+                )
+            current = self._persist_status(
+                replace(
+                    current,
+                    workers=[assignment.worker_id for assignment in live_plan.workers],
+                    assignments=list(live_plan.workers),
+                    runtime_environment_refs=self._runtime_refs(live_plan),
+                    backend=live_plan.backend,
+                ),
+                snapshot=probe_snapshot,
+                state=JobState.SNAPSHOTTING,
+                phase="memory_probe",
+            )
+            self._write_snapshot_metadata(
+                snapshot=probe_snapshot,
+                job=probe_job,
+                training_config=training_config,
+                parallel_plan=probe_plan,
+                execution_plan=live_plan,
+                network_state=live_network,
+                job_status=current,
+                launch_metadata={
+                    "memory_probe": True,
+                    "candidate_id": probe_plan.selected_candidate_id,
+                    "master_addr": live_plan.master.address,
+                    "master_port": live_plan.master.port,
+                    "preflight_attempt": attempt,
+                },
+                dry_run=True,
+            )
+            result = self._run_memory_probe(
+                training_config=training_config,
+                probe_job=probe_job,
+                probe_snapshot=probe_snapshot,
+                probe_plan=probe_plan,
+                probe_execution=live_plan,
+                cluster_state=live_cluster,
+                current=current,
+                attempt=attempt,
+                free_memory_baseline=self._probe_free_memory_baseline(
+                    live_cluster,
+                    live_plan,
+                ),
+            )
+            if result.master_port is None:
+                result = replace(
+                    result,
+                    master_addr=live_plan.master.address,
+                    master_port=live_plan.master.port,
+                )
+            last_result = result
+            if (
+                result.status == PROBE_INFRA_FAILURE
+                and result.subtype in PROBE_TRANSIENT_INFRA_SUBTYPES
+                and attempt < max_retries
+            ):
+                self._release_probe_attempt(probe_job)
+                continue
+            return result
+        return last_result or MemoryProbeResult(
+            status=PROBE_INFRA_FAILURE,
+            candidate_id=probe_plan.selected_candidate_id,
+            subtype="INFRA_RETRY_EXHAUSTED",
+            message="probe infra retry budget exhausted",
+            attempt=max_retries,
+        )
+
+    def _release_probe_attempt(self, probe_job: TrainingJob) -> None:
+        try:
+            self._status_store.release_resources(probe_job.job_id)
+        except Exception:
+            pass
+
+    def _probe_free_memory_baseline(
+        self,
+        cluster_state: ClusterState,
+        execution_plan: ExecutionPlan,
+    ) -> dict[str, int]:
+        by_worker = {
+            str(worker.worker_id): worker.resource.gpu_free_memory
+            for worker in cluster_state.workers
+        }
+        baseline: dict[str, int] = {}
+        for assignment in execution_plan.workers:
+            free_mb = by_worker.get(str(assignment.worker_id))
+            if free_mb is not None:
+                baseline[str(assignment.worker_id)] = int(free_mb) * 1024 * 1024
+        return baseline
+
+    def _candidate_identity_preserved(
+        self,
+        candidate: ParallelPlan,
+        live_plan: ExecutionPlan,
+    ) -> str | None:
+        if candidate.selected_candidate_id != live_plan.labels.get(
+            "selected_candidate_id"
+        ):
+            return (
+                f"candidate_id changed: {candidate.selected_candidate_id} -> "
+                f"{live_plan.labels.get('selected_candidate_id')}"
+            )
+        expected = {
+            stage.rank: (
+                str(stage.placement.worker_id),
+                stage.stage_id,
+                stage.placement.gpu_index,
+            )
+            for stage in candidate.stage_metadata
+            if stage.placement is not None
+        }
+        for assignment in live_plan.workers:
+            item = expected.get(assignment.rank)
+            if item is None:
+                continue
+            worker_id, stage_id, gpu_index = item
+            if str(assignment.worker_id) != worker_id:
+                return (
+                    f"rank {assignment.rank} worker changed "
+                    f"{worker_id} -> {assignment.worker_id}"
+                )
+            if (assignment.stage or "") != stage_id:
+                return f"rank {assignment.rank} stage changed"
+            if assignment.gpu_index != gpu_index:
+                return f"rank {assignment.rank} gpu_index changed"
+        return None
+
+    def _probe_infra_summary(self, records: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "probe_attempts": len(records),
+            "rendezvous_successes": sum(
+                1 for record in records if record.get("rendezvous_ready") is True
+            ),
+            "rendezvous_retries": sum(
+                1 for record in records if int(record.get("attempt", 1)) > 1
+            ),
+            "infra_failures": sum(
+                1
+                for record in records
+                if record.get("result") == PROBE_INFRA_FAILURE
+            ),
+            "stale_default_port_reuse": sum(
+                1
+                for record in records
+                if record.get("master_port") == self._resolved_rendezvous_port()
+            ),
+            "fresh_port_per_attempt": [
+                record.get("master_port") for record in records
+            ],
+        }
+
+    def _run_memory_probe(
+        self,
+        *,
+        training_config: TrainingConfig,
+        probe_job: TrainingJob,
+        probe_snapshot: JobSnapshot,
+        probe_plan: ParallelPlan,
+        probe_execution: ExecutionPlan,
+        cluster_state: ClusterState,
+        current: JobStatus,
+        attempt: int = 1,
+        free_memory_baseline: dict[str, int] | None = None,
+    ) -> MemoryProbeResult:
+        if self._memory_probe is not None:
+            return self._memory_probe(probe_plan, probe_execution)
+        if probe_plan.requirements.get("generic_dag_runtime") != "true":
+            return MemoryProbeResult(
+                status=PROBE_PASS,
+                candidate_id=probe_plan.selected_candidate_id,
+                message="memory probe skipped for non-generic automatic runner",
+            )
+        launcher = self._launcher_factory(training_config.job.backend)
+        context = LauncherContext(
+            job=probe_job,
+            execution_plan=probe_execution,
+            cluster_state=cluster_state,
+            snapshot=probe_snapshot,
+            job_status=current,
+            runtime_environment_refs=self._runtime_refs(probe_execution),
+        )
+        try:
+            for operation in (launcher.prepare, launcher.distribute):
+                result = operation(context)
+                if not result.ok:
+                    message = result.message or (
+                        result.failure.message
+                        if result.failure is not None
+                        else "memory probe distribution failed"
+                    )
+                    return MemoryProbeResult(
+                        status=PROBE_INFRA_FAILURE,
+                        candidate_id=probe_plan.selected_candidate_id,
+                        subtype="DISTRIBUTE_FAILURE",
+                        message=message,
+                        attempt=attempt,
+                    )
+                context = replace(
+                    context,
+                    job_status=self._load_status(probe_snapshot, context.job_status or current),
+                )
+            conflicts = self._status_store.reserve_resources(
+                probe_job.job_id,
+                probe_execution.workers,
+            )
+            if conflicts:
+                return MemoryProbeResult(
+                    status=PROBE_RESOURCE_CHANGED,
+                    candidate_id=probe_plan.selected_candidate_id,
+                    subtype="RESERVATION_CONFLICT",
+                    message="memory probe resources are already reserved",
+                    attempt=attempt,
+                )
+            result = launcher.launch(context)
+            if not result.ok:
+                return self._classify_launch_failure(
+                    probe_plan,
+                    result,
+                    attempt=attempt,
+                )
+            context = replace(
+                context,
+                job_status=self._load_status(probe_snapshot, context.job_status or current),
+            )
+            deadline = time.time() + float(
+                os.environ.get("SHARDGRID_MEMORY_PROBE_TIMEOUT_SECONDS", "180")
+            )
+            while time.time() < deadline:
+                monitor = launcher.monitor(context)
+                current_status = self._load_status(probe_snapshot, context.job_status or current)
+                context = replace(context, job_status=current_status)
+                if self._memory_probe_completed(probe_snapshot, probe_execution.world_size):
+                    peak = self._read_probe_peak(probe_snapshot)
+                    memory_result = self._classify_measured_peak(
+                        probe_plan,
+                        peak,
+                        free_memory_baseline,
+                    )
+                    if memory_result is not None:
+                        return memory_result
+                    return MemoryProbeResult(
+                        status=PROBE_PASS,
+                        candidate_id=probe_plan.selected_candidate_id,
+                        message="memory probe passed",
+                        actual_peak_allocated_bytes=peak.get(
+                            "actual_peak_allocated_bytes"
+                        ),
+                        actual_peak_reserved_bytes=peak.get(
+                            "actual_peak_reserved_bytes"
+                        ),
+                        rendezvous_ready=True,
+                        phase="PROBE_COMPLETE",
+                        attempt=attempt,
+                        master_addr=probe_execution.master.address,
+                        master_port=probe_execution.master.port,
+                    )
+                if current_status.state is JobState.FAILED or monitor.status in {
+                    LauncherResultStatus.FAILED,
+                    LauncherResultStatus.BLOCKED,
+                    LauncherResultStatus.UNSUPPORTED,
+                }:
+                    failure = current_status.failure or monitor.failure
+                    return self._classify_probe_result(
+                        probe_snapshot=probe_snapshot,
+                        world_size=probe_execution.world_size,
+                        probe_plan=probe_plan,
+                        message=(
+                            failure.message
+                            if failure is not None
+                            else monitor.message
+                            or "memory probe candidate failed"
+                        ),
+                        attempt=attempt,
+                        master=probe_execution.master,
+                        timed_out=False,
+                    )
+                time.sleep(2)
+            return self._classify_probe_result(
+                probe_snapshot=probe_snapshot,
+                world_size=probe_execution.world_size,
+                probe_plan=probe_plan,
+                message="memory probe timed out",
+                attempt=attempt,
+                master=probe_execution.master,
+                timed_out=True,
+            )
+        finally:
+            self._release_probe_attempt(probe_job)
+            try:
+                launcher.stop(context)
+            except Exception:
+                pass
+            try:
+                launcher.cleanup(context)
+            except Exception:
+                pass
+
+    def _classify_launch_failure(
+        self,
+        probe_plan: ParallelPlan,
+        result: LauncherResult,
+        *,
+        attempt: int,
+    ) -> MemoryProbeResult:
+        message = result.message or (
+            result.failure.message
+            if result.failure is not None
+            else "memory probe launch failed"
+        )
+        if _probe_log_has_oom(message):
+            return MemoryProbeResult(
+                status=PROBE_MEMORY_REJECT,
+                candidate_id=probe_plan.selected_candidate_id,
+                subtype="CUDA_OOM",
+                message=message,
+                oom_evidence=True,
+                attempt=attempt,
+            )
+        if result.status is LauncherResultStatus.BLOCKED:
+            return MemoryProbeResult(
+                status=PROBE_INFRA_FAILURE,
+                candidate_id=probe_plan.selected_candidate_id,
+                subtype="SSH_FAILURE",
+                message=message,
+                attempt=attempt,
+            )
+        return MemoryProbeResult(
+            status=PROBE_INFRA_FAILURE,
+            candidate_id=probe_plan.selected_candidate_id,
+            subtype="LAUNCH_FAILURE",
+            message=message,
+            attempt=attempt,
+        )
+
+    def _classify_measured_peak(
+        self,
+        probe_plan: ParallelPlan,
+        peak: dict[str, int | None],
+        free_memory_baseline: dict[str, int] | None,
+    ) -> MemoryProbeResult | None:
+        peak_reserved = peak.get("actual_peak_reserved_bytes")
+        if peak_reserved is None:
+            return None
+        baseline_values = list((free_memory_baseline or {}).values())
+        if baseline_values:
+            baseline_min = min(baseline_values)
+            if int(peak_reserved) > baseline_min:
+                return MemoryProbeResult(
+                    status=PROBE_MEMORY_REJECT,
+                    candidate_id=probe_plan.selected_candidate_id,
+                    subtype="MEASURED_PEAK_UNSAFE",
+                    message=(
+                        f"measured peak {int(peak_reserved)} exceeds free memory "
+                        f"baseline {baseline_min}"
+                    ),
+                    actual_peak_allocated_bytes=peak.get(
+                        "actual_peak_allocated_bytes"
+                    ),
+                    actual_peak_reserved_bytes=peak_reserved,
+                    rendezvous_ready=True,
+                    phase="PROBE_COMPLETE",
+                    oom_evidence=False,
+                )
+        return None
+
+    def _classify_probe_result(
+        self,
+        *,
+        probe_snapshot: JobSnapshot,
+        world_size: int,
+        probe_plan: ParallelPlan,
+        message: str,
+        attempt: int,
+        master: MasterMetadata,
+        timed_out: bool,
+    ) -> MemoryProbeResult:
+        evidence = self._read_probe_rank_evidence(probe_snapshot, world_size)
+        rendezvous_ready: bool | None = None
+        if evidence:
+            rendezvous_ready = all(
+                bool(item.get("rendezvous_ready")) for item in evidence
+            )
+        training_started = any(
+            bool(item.get("training_started")) for item in evidence
+        )
+        phase = self._latest_probe_phase(evidence)
+        log_tail = "\n".join(
+            str(item.get("log_tail") or "") for item in evidence
+        )
+        if _probe_log_has_oom(log_tail):
+            return MemoryProbeResult(
+                status=PROBE_MEMORY_REJECT,
+                candidate_id=probe_plan.selected_candidate_id,
+                subtype="CUDA_OOM",
+                message="CUDA out of memory during memory probe",
+                oom_evidence=True,
+                rendezvous_ready=rendezvous_ready,
+                phase=phase,
+                attempt=attempt,
+                master_addr=master.address,
+                master_port=master.port,
+            )
+        timeout_stage = next(
+            (
+                str(item.get("timeout_stage")).upper()
+                for item in evidence
+                if item.get("timeout_stage")
+            ),
+            None,
+        )
+        if (timed_out or timeout_stage == "RENDEZVOUS") and rendezvous_ready is False:
+            return MemoryProbeResult(
+                status=PROBE_INFRA_FAILURE,
+                candidate_id=probe_plan.selected_candidate_id,
+                subtype="RENDEZVOUS_TIMEOUT",
+                message="probe ranks never completed distributed rendezvous",
+                rendezvous_ready=False,
+                phase=phase,
+                attempt=attempt,
+                master_addr=master.address,
+                master_port=master.port,
+            )
+        if rendezvous_ready is True and not training_started:
+            return MemoryProbeResult(
+                status=PROBE_RUNTIME_FAILURE,
+                candidate_id=probe_plan.selected_candidate_id,
+                subtype="RUNTIME_START_FAILURE",
+                message="rendezvous completed but forward never started",
+                rendezvous_ready=True,
+                phase=phase,
+                attempt=attempt,
+                master_addr=master.address,
+                master_port=master.port,
+            )
+        return MemoryProbeResult(
+            status=PROBE_RUNTIME_FAILURE,
+            candidate_id=probe_plan.selected_candidate_id,
+            subtype="RUNTIME_TIMEOUT" if timed_out else "PROCESS_EXIT",
+            message=message,
+            rendezvous_ready=rendezvous_ready,
+            phase=phase,
+            attempt=attempt,
+            master_addr=master.address,
+            master_port=master.port,
+        )
+
+    def _read_probe_rank_evidence(
+        self,
+        snapshot: JobSnapshot,
+        world_size: int,
+    ) -> list[dict[str, object]]:
+        by_rank: dict[int, dict[str, object]] = {}
+        for path in sorted(Path(snapshot.diagnostics_path).glob("monitor-*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict) or payload.get("rank") is None:
+                continue
+            by_rank[int(payload["rank"])] = payload
+        return [by_rank[rank] for rank in sorted(by_rank)][: max(world_size, 0)]
+
+    def _latest_probe_phase(
+        self,
+        evidence: list[dict[str, object]],
+    ) -> str | None:
+        for item in reversed(evidence):
+            for line in reversed(
+                str(item.get("log_tail") or "").splitlines()
+            ):
+                if PROBE_PHASE_MARKER not in line:
+                    continue
+                try:
+                    payload = json.loads(
+                        line.split(PROBE_PHASE_MARKER, 1)[1]
+                    )
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict) and payload.get("phase"):
+                    return str(payload["phase"])
+        return None
+
+    def _memory_probe_completed(self, snapshot: JobSnapshot, world_size: int) -> bool:
+        payloads = []
+        diagnostics = Path(snapshot.diagnostics_path)
+        for path in sorted(diagnostics.glob("memory-probe-rank*.json")):
+            payloads.append(json.loads(path.read_text(encoding="utf-8")))
+        if len(payloads) < world_size:
+            for path in sorted(diagnostics.glob("monitor-*.json")):
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                train = payload.get("train")
+                if isinstance(train, dict):
+                    payloads.append(train)
+        if len(payloads) < world_size:
+            return False
+        return all(
+            payload.get("memory_probe_only") is True
+            and payload.get("forward_completed") is True
+            and payload.get("backward_completed") is True
+            and payload.get("optimizer_step_completed") is True
+            for payload in payloads
+        )
+
+    def _memory_probe_estimates(self, plan: ParallelPlan) -> dict[str, int]:
+        estimates = [stage.estimated_peak_training_memory for stage in plan.stage_metadata]
+        return {
+            "original_estimated_peak_bytes": sum(
+                estimate.estimated_peak_bytes or 0 for estimate in estimates
+            ),
+            "calibrated_estimated_peak_bytes": sum(
+                estimate.planner_required_bytes or estimate.estimated_peak_bytes or 0
+                for estimate in estimates
+            ),
+        }
+
+    def _read_probe_peak(self, snapshot: JobSnapshot) -> dict[str, int | None]:
+        peaks: list[dict[str, int | None]] = []
+        for path in Path(snapshot.diagnostics_path).glob("memory-probe-rank*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            peaks.append(
+                {
+                    "actual_peak_allocated_bytes": payload.get(
+                        "actual_peak_allocated_bytes"
+                    ),
+                    "actual_peak_reserved_bytes": payload.get("actual_peak_reserved_bytes"),
+                }
+            )
+        if not peaks:
+            for path in sorted(Path(snapshot.diagnostics_path).glob("monitor-*.json")):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                train = payload.get("train") if isinstance(payload, dict) else None
+                if not isinstance(train, dict):
+                    continue
+                peaks.append(
+                    {
+                        "actual_peak_allocated_bytes": train.get(
+                            "actual_peak_allocated_bytes"
+                        ),
+                        "actual_peak_reserved_bytes": train.get(
+                            "actual_peak_reserved_bytes"
+                        ),
+                    }
+                )
+        return {
+            "actual_peak_allocated_bytes": max(
+                (
+                    int(item["actual_peak_allocated_bytes"])
+                    for item in peaks
+                    if item["actual_peak_allocated_bytes"] is not None
+                ),
+                default=None,
+            ),
+            "actual_peak_reserved_bytes": max(
+                (
+                    int(item["actual_peak_reserved_bytes"])
+                    for item in peaks
+                    if item["actual_peak_reserved_bytes"] is not None
+                ),
+                default=None,
+            ),
+        }
+
+    def _write_memory_probe_selection_artifact(
+        self,
+        *,
+        snapshot: JobSnapshot,
+        selection: dict[str, object],
+    ) -> Path:
+        path = Path(snapshot.diagnostics_path) / "memory-probe-selection.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(selection, indent=2, sort_keys=True), encoding="utf-8")
+        return path
+
     def _automatic_planning_enabled(self, training_config: TrainingConfig) -> bool:
         return training_config.planning.mode == "automatic"
 
@@ -1503,12 +2797,29 @@ class JobManager:
             if joint.status is not FeasibilityStatus.FEASIBLE:
                 reasons = ", ".join(joint.reasons) if joint.reasons else "PLANNING_INFEASIBLE"
                 raise ValueError(f"automatic planner failed: {reasons}")
-            plan = build_automatic_parallel_plan(
-                profile,
-                select_best_joint_placement_plan([joint]),
+            joint_candidates = joint.candidate_plans or (joint,)
+            selected_joint = select_best_joint_placement_plan(joint_candidates)
+            ordered_joints = (selected_joint,) + tuple(
+                item
+                for item in joint_candidates
+                if item.partition_candidate is not None
+                and selected_joint.partition_candidate is not None
+                and item.partition_candidate.candidate_id
+                != selected_joint.partition_candidate.candidate_id
+            )
+            plans = tuple(
+                build_automatic_parallel_plan(profile, candidate)
+                for candidate in ordered_joints
             )
             if self._generic_dag_runtime_requested(training_config):
-                plan.requirements["generic_dag_runtime"] = "true"
+                for plan in plans:
+                    plan.requirements["generic_dag_runtime"] = "true"
+            plan = plans[0]
+            self._last_parallel_plan_candidates = plans
+            evidence["candidate_plan_count"] = len(plans)
+            evidence["candidate_plan_ids"] = [
+                item.selected_candidate_id for item in plans
+            ]
             evidence["control_rss_after_plan_created"] = _process_rss_bytes()
             return plan
         finally:
@@ -1633,8 +2944,9 @@ class JobManager:
             from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_sample
 
             model_name = str(training_config.model.parameters.get("zoo_model", "mini_unet"))
-            model = build_zoo_model(model_name)
-            sample_args, sample_kwargs = make_zoo_sample(model_name)
+            model_kwargs = self._generic_dag_model_kwargs(training_config)
+            model = build_zoo_model(model_name, **model_kwargs)
+            sample_args, sample_kwargs = make_zoo_sample(model_name, **model_kwargs)
             return model, tuple(sample_args), dict(sample_kwargs)
         raise ValueError(
             "automatic planning supports model.type minimal_sequential, hf_style, "
@@ -1647,6 +2959,20 @@ class JobManager:
             or str(training_config.model.parameters.get("generic_dag_runtime", "false")).lower()
             == "true"
         )
+
+    def _generic_dag_model_kwargs(self, training_config: TrainingConfig) -> dict[str, object]:
+        reserved = {
+            "zoo_model",
+            "training_steps",
+            "learning_rate",
+            "logical_partitions",
+            "generic_dag_runtime",
+        }
+        return {
+            str(key): value
+            for key, value in training_config.model.parameters.items()
+            if str(key) not in reserved
+        }
 
     def _planner_memory_config(self) -> MemoryEstimationConfig:
         return MemoryEstimationConfig(
@@ -1871,7 +3197,7 @@ class JobManager:
             "model_type": training_config.model.type,
             "partition_mode": "pipeline_parallel",
             "world_size": execution_plan.world_size,
-            "backend": select_backend(str(execution_plan.backend)),
+            "backend": select_backend(str(training_config.job.communication_backend)),
             "required_shard_count": len(execution_plan.workers),
             "storage_target": snapshot.checkpoint_path,
             "final_metrics": dict(current.final_metrics),
@@ -2188,7 +3514,8 @@ class JobManager:
         from shardgrid.runtime.checkpoint import consolidate_worker_state_shards
 
         zoo_model = str(training_config.model.parameters.get("zoo_model", "mini_unet"))
-        full_model = build_zoo_model(zoo_model)
+        model_kwargs = self._generic_dag_model_kwargs(training_config)
+        full_model = build_zoo_model(zoo_model, **model_kwargs)
         expected_state = full_model.state_dict()
         output_ref = "checkpoint/model-state.pt"
         output_path = Path(snapshot.checkpoint_path) / "model-state.pt"
@@ -2204,7 +3531,7 @@ class JobManager:
             if actual.dtype != expected.dtype:
                 raise ValueError(f"checkpoint tensor dtype mismatch for {key}")
         load_result = full_model.load_state_dict(payload["state_dict"], strict=True)
-        sample_args, sample_kwargs = make_zoo_sample(zoo_model)
+        sample_args, sample_kwargs = make_zoo_sample(zoo_model, **model_kwargs)
         full_model.eval()
         with torch.no_grad():
             output = full_model(*sample_args, **sample_kwargs)

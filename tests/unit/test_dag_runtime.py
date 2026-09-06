@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import pytest
 import torch
+from examples.models import train_generic_dag
 from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_sample
 from torch import nn
 
+from shardgrid.engines.models import ParallelPlan, ParallelPlanPlacement, ParallelPlanStage
 from shardgrid.planner.generic_graph import (
     FXGraphCaptureAdapter,
     GenericGraphIR,
     GraphEdgeSpec,
     GraphNodeSpec,
 )
+from shardgrid.planner.models import ExecutionPlan, MasterMetadata, WorkerAssignment
 from shardgrid.planner.planning_contract import (
     LogicalPartitionPlan,
     LogicalPartitionSpec,
@@ -48,6 +51,57 @@ def test_worker_ownership_allows_non_contiguous_partitions_on_same_gpu() -> None
         for edge in runtime_plan.edges
     )
     assert any(edge.edge_kind is EdgeKind.REMOTE for edge in runtime_plan.edges)
+
+
+def test_runtime_uses_exact_selected_plan_without_rank_index_swap() -> None:
+    graph, _logical, _placement = _runtime_fixture()
+    plan = ParallelPlan(
+        parallel_plan_id="plan-swapped",
+        engine="pytorch_pipeline",
+        world_size=2,
+        stages=["stage0", "stage1"],
+        selected_candidate_id="candidate-swapped",
+        stage_metadata=[
+            _stage("stage0", 1, ("partition0",), "worker1", 0),
+            _stage(
+                "stage1",
+                0,
+                ("partition1", "partition2", "partition3", "partition4"),
+                "worker0",
+                0,
+            ),
+        ],
+    )
+    execution = ExecutionPlan(
+        job_id="job-swapped",
+        engine="pytorch_pipeline",
+        backend="gloo",
+        world_size=2,
+        master=MasterMetadata("127.0.0.1", 29500),
+        workers=[
+            WorkerAssignment("worker0", rank=0, stage="stage1", gpu_index=0),
+            WorkerAssignment("worker1", rank=1, stage="stage0", gpu_index=0),
+        ],
+        labels={"selected_candidate_id": "candidate-swapped"},
+    )
+
+    logical, placement = train_generic_dag._selected_logical_and_placement(
+        graph,
+        plan,
+        execution,
+    )
+    runtime_plan = compile_runtime_plan(graph, logical, placement)
+
+    worker0 = next(
+        worker for worker in runtime_plan.ownership.workers if worker.worker_id == "worker0"
+    )
+    worker1 = next(
+        worker for worker in runtime_plan.ownership.workers if worker.worker_id == "worker1"
+    )
+    assert worker0.owned_partitions == ("stage1",)
+    assert worker0.local_parameter_ids == ("p1", "p2", "p3", "p4")
+    assert worker1.owned_partitions == ("stage0",)
+    assert worker1.local_parameter_ids == ("p0",)
 
 
 def test_value_store_releases_values_after_last_consumer() -> None:
@@ -272,6 +326,28 @@ def _runtime_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, PlacementP
         ),
     )
     return graph, logical, placement
+
+
+def _stage(
+    stage_id: str,
+    rank: int,
+    module_paths: tuple[str, ...],
+    worker_id: str,
+    gpu_index: int,
+) -> ParallelPlanStage:
+    return ParallelPlanStage(
+        stage_id=stage_id,
+        rank=rank,
+        module_ids=module_paths,
+        module_paths=module_paths,
+        start_index=rank,
+        stop_index=rank + 1,
+        placement=ParallelPlanPlacement(
+            worker_id=worker_id,
+            rank=rank,
+            gpu_index=gpu_index,
+        ),
+    )
 
 
 def _unique_parameters(modules: tuple[nn.Module, ...]) -> list[nn.Parameter]:

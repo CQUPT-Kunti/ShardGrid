@@ -263,6 +263,27 @@ def test_default_probe_network_uses_route_specific_interface_and_source_ip(
     assert by_source["gpu1060"].interface == "eth0"
 
 
+def test_default_probe_network_covers_single_worker_plan(tmp_path: Path) -> None:
+    manager = JobManager(_cluster_config(tmp_path))
+    worker = manager.cluster_config.workers[0]
+
+    state = manager._default_probe_network(
+        [
+            WorkerResource(
+                worker_id=worker.worker_id,
+                hostname=worker.host,
+                physical_os=PhysicalOS.WINDOWS,
+                runtime_os=RuntimeOS.WSL2_LINUX,
+                ip="10.0.0.10",
+                health=Health.HEALTHY,
+            )
+        ]
+    )
+
+    assert state.workers == [worker.worker_id]
+    assert state.links == []
+
+
 def test_default_probe_network_accepts_parseable_route_output_even_with_nonzero_exit(
     tmp_path: Path,
     monkeypatch,
