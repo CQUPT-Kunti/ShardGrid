@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from shardgrid.cli.app import main
+from shardgrid.cli.commands import run as run_command
 from shardgrid.cli.commands import train as train_command
 from shardgrid.cli.context import format_cli_error
 from shardgrid.common.enums import FailureStage, JobState
@@ -12,11 +13,6 @@ from shardgrid.common.errors import make_failure_record
 from shardgrid.common.models import as_backend_name, as_job_id
 from shardgrid.control.job_manager import JobRunResult
 from shardgrid.jobs.models import JobSnapshot, JobStatus, TrainingJob
-
-RUN_NOT_IMPLEMENTED = pytest.mark.xfail(
-    reason="T028 contract baseline: shardgrid run is specified but not implemented until T029",
-    strict=True,
-)
 
 
 def _cluster_config(root: Path) -> Path:
@@ -111,7 +107,6 @@ def _result(root: Path, state: JobState = JobState.COMPLETED) -> JobRunResult:
     return JobRunResult(job=job, status=status, snapshot=snapshot)
 
 
-@RUN_NOT_IMPLEMENTED
 def test_run_preserves_entrypoint_argv_after_shardgrid_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -124,24 +119,21 @@ def test_run_preserves_entrypoint_argv_after_shardgrid_flags(
 
         def run_entrypoint(
             self,
-            entrypoint: str,
-            entrypoint_args: tuple[str, ...],
-            *,
-            dry_run: bool = False,
-            json_output: bool = False,
+            entrypoint: run_command.TrainingEntrypoint,
         ) -> JobRunResult:
             captured.update(
                 {
-                    "entrypoint": entrypoint,
-                    "entrypoint_args": entrypoint_args,
-                    "dry_run": dry_run,
-                    "json_output": json_output,
+                    "entrypoint": str(entrypoint.entrypoint),
+                    "entrypoint_args": entrypoint.argv,
+                    "dry_run": entrypoint.dry_run,
+                    "json_output": entrypoint.json_output,
+                    "cluster_config_path": entrypoint.cluster_config_path,
                 }
             )
             return _result(tmp_path)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("shardgrid.cli.commands.run.JobManager", FakeManager)
+    monkeypatch.setattr(run_command, "JobManager", FakeManager)
 
     exit_code = main(
         [
@@ -163,9 +155,9 @@ def test_run_preserves_entrypoint_argv_after_shardgrid_flags(
     assert captured["entrypoint_args"] == ("--config", "model.yaml", "--epochs", "2")
     assert captured["dry_run"] is True
     assert captured["json_output"] is True
+    assert captured["cluster_config_path"] == tmp_path / "workers.yaml"
 
 
-@RUN_NOT_IMPLEMENTED
 def test_run_requires_entrypoint_and_returns_usage_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -180,7 +172,6 @@ def test_run_requires_entrypoint_and_returns_usage_error(
     assert "entrypoint" in error.lower()
 
 
-@RUN_NOT_IMPLEMENTED
 def test_run_returns_nonzero_and_displays_failure_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -190,12 +181,12 @@ def test_run_returns_nonzero_and_displays_failure_contract(
         def __init__(self, config) -> None:
             del config
 
-        def run_entrypoint(self, *args: object, **kwargs: object) -> JobRunResult:
-            del args, kwargs
+        def run_entrypoint(self, entrypoint: run_command.TrainingEntrypoint) -> JobRunResult:
+            assert str(entrypoint.entrypoint) == "train.py"
             return _result(tmp_path, JobState.FAILED)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("shardgrid.cli.commands.run.JobManager", FakeManager)
+    monkeypatch.setattr(run_command, "JobManager", FakeManager)
 
     exit_code = main(["--config", str(_cluster_config(tmp_path)), "run", "train.py"])
 
