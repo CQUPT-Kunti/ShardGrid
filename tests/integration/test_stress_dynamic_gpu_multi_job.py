@@ -371,3 +371,199 @@ def test_steady_state_increasing_steps_is_not_stalled(stress_module) -> None:
     ]
 
     assert stress_module.steady_state_progress_check(samples, jobs) is None
+
+
+def test_saturation_requires_complete_family_coverage(stress_module) -> None:
+    evidence = {
+        "non_gpu_bottlenecks": [],
+        "all_families_failed_last_round": False,
+        "all_smallest_band_attempted": True,
+        "remaining_plausible_candidates": 0,
+    }
+
+    result = stress_module.classify_saturation_evidence(evidence)
+
+    assert result["reached"] is False
+    assert result["code"] == "SATURATION_NOT_PROVEN"
+    assert result["reason"] == "FAMILY_COVERAGE_INCOMPLETE"
+
+
+def test_saturation_requires_smallest_band_attempt(stress_module) -> None:
+    evidence = {
+        "non_gpu_bottlenecks": [],
+        "all_families_failed_last_round": True,
+        "all_smallest_band_attempted": False,
+        "remaining_plausible_candidates": 0,
+    }
+
+    result = stress_module.classify_saturation_evidence(evidence)
+
+    assert result["reached"] is False
+    assert result["code"] == "SEARCH_BUDGET_LIMIT"
+    assert result["reason"] == "SMALLEST_BAND_NOT_ATTEMPTED"
+
+
+def test_saturation_requires_no_remaining_candidates(stress_module) -> None:
+    evidence = {
+        "non_gpu_bottlenecks": [],
+        "all_families_failed_last_round": True,
+        "all_smallest_band_attempted": True,
+        "remaining_plausible_candidates": 2,
+    }
+
+    result = stress_module.classify_saturation_evidence(evidence)
+
+    assert result["reached"] is False
+    assert result["code"] == "SEARCH_BUDGET_LIMIT"
+    assert result["reason"] == "REMAINING_PLAUSIBLE_CANDIDATES"
+
+
+def test_saturation_blocked_by_non_gpu_bottleneck(stress_module) -> None:
+    evidence = {
+        "non_gpu_bottlenecks": ["probe_infra_failure"],
+        "all_families_failed_last_round": True,
+        "all_smallest_band_attempted": True,
+        "remaining_plausible_candidates": 0,
+    }
+
+    result = stress_module.classify_saturation_evidence(evidence)
+
+    assert result["reached"] is False
+    assert result["code"] == "SATURATION_NOT_PROVEN"
+    assert result["reason"] == "NON_GPU_BOTTLENECK_FIRST"
+
+
+def test_saturation_declared_only_with_complete_evidence(stress_module) -> None:
+    evidence = {
+        "non_gpu_bottlenecks": [],
+        "all_families_failed_last_round": True,
+        "all_smallest_band_attempted": True,
+        "remaining_plausible_candidates": 0,
+    }
+
+    result = stress_module.classify_saturation_evidence(evidence)
+
+    assert result["reached"] is True
+    assert result["code"] == "GPU_MEMORY_SATURATION"
+    assert result["reason"] == "EVIDENCE_COMPLETE"
+
+
+def test_saturation_evidence_includes_machine_readable_fields(stress_module) -> None:
+    report = {
+        "attempts": [
+            {"attempt": 1, "model": "MiniUNet", "result": "NO_FEASIBLE_PLAN"},
+        ],
+        "probe_infra_summary": {"infra_failures": 0},
+        "saturation": {},
+        "cleanup": {"stopped": {}},
+    }
+    failed_round = {"MiniUNet": {"result": "NO_FEASIBLE_PLAN"}}
+    args = type("Args", (), {"max_attempts": 10})()
+
+    import types
+
+    fake_discover = lambda config_path: {"eligible_gpus": [{"worker_id": "gpu0", "gpu_total_memory_bytes": 1 << 30, "gpu_free_memory_bytes": 1 << 30, "used_memory_bytes": 0}]}
+    stress_module.discover = fake_discover
+
+    evidence = stress_module.build_saturation_evidence(
+        args=args,
+        report=report,
+        failed_round=failed_round,
+        active_jobs=[],
+        cluster_path=Path("/tmp/nonexistent"),
+        jobs_root=Path("/tmp/nonexistent-jobs"),
+    )
+
+    assert "fresh_gpu_state" in evidence
+    assert "fresh_free_memory_mb" in evidence
+    assert "family_coverage" in evidence
+    assert "attempted_bands_per_family" in evidence
+    assert "probe_reject_reasons" in evidence
+    assert "candidate_search" in evidence
+    assert "non_gpu_bottlenecks" in evidence
+    assert "active_job_count" in evidence
+    assert "remaining_plausible_candidates" in evidence
+    assert "checkpoint_evidence" in evidence
+    assert "cleanup_evidence" in evidence
+
+
+def test_checkpoint_evidence_records_merge_not_just_file_presence(
+    stress_module,
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    job_root = tmp_path / "job-a"
+    (job_root / "checkpoint").mkdir(parents=True)
+    torch.save({"layer.weight": torch.zeros(2, 2)}, job_root / "checkpoint" / "model-state.pt")
+    (job_root / "checkpoint" / "model-state-metadata.json").write_text(
+        '{"format": "shardgrid-generic-model-state/v1", "parameter_changed": true}',
+        encoding="utf-8",
+    )
+    jobs = [{"job_id": "job-a", "instance": "MiniUNet-1", "model": "mini_unet"}]
+
+    evidence = stress_module.checkpoint_sampling_evidence(tmp_path, jobs)
+
+    assert evidence["sampled_job_count"] == 1
+    sample = evidence["samples"][0]
+    assert sample["model_state_present"] is True
+    assert sample["state_dict_is_mapping"] is True
+    assert sample["state_dict_key_count"] == 1
+    assert sample["merge_evidence"] == "STATE_DICT_PLAIN_MAPPING"
+    assert sample["checkpoint_metadata_format"] == "shardgrid-generic-model-state/v1"
+
+
+def test_checkpoint_evidence_records_load_failure(stress_module, tmp_path: Path) -> None:
+    job_root = tmp_path / "job-bad"
+    (job_root / "checkpoint").mkdir(parents=True)
+    (job_root / "checkpoint" / "model-state.pt").write_text("not a torch file", encoding="utf-8")
+    jobs = [{"job_id": "job-bad", "instance": "MiniDenseNet-1", "model": "mini_densenet"}]
+
+    evidence = stress_module.checkpoint_sampling_evidence(tmp_path, jobs)
+
+    sample = evidence["samples"][0]
+    assert sample["model_state_present"] is True
+    assert sample["merge_evidence"].startswith("LOAD_FAILED")
+
+
+def test_checkpoint_strict_load_and_validation_forward_evidence(
+    stress_module,
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    from examples.models.generic_partition_zoo.models import (
+        build_zoo_model,
+        make_zoo_sample,
+    )
+
+    parameters = {"base_channels": 64}
+    model = build_zoo_model("mini_unet", **parameters).eval()
+    sample_args, sample_kwargs = make_zoo_sample("mini_unet", **parameters)
+    with torch.no_grad():
+        model(*sample_args, **(sample_kwargs or {}))
+
+    evidence = stress_module._checkpoint_strict_load(
+        {
+            "zoo_model": "mini_unet",
+            "model_parameters": parameters,
+        },
+        model.state_dict(),
+    )
+
+    assert evidence["strict_load_evidence"] == "PASS"
+    assert evidence["missing_keys"] == []
+    assert evidence["unexpected_keys"] == []
+    assert evidence["validation_forward_evidence"] == "PASS"
+
+
+def test_checkpoint_strict_load_reports_not_attempted_without_model(
+    stress_module,
+) -> None:
+    evidence = stress_module._checkpoint_strict_load(
+        {"zoo_model": None, "model_parameters": {}},
+        {},
+    )
+
+    assert evidence["strict_load_evidence"] == "NOT_ATTEMPTED_NO_MODEL"
+    assert evidence["validation_forward_evidence"] == "NOT_ATTEMPTED_NO_MODEL"
