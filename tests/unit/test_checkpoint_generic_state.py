@@ -15,6 +15,7 @@ from shardgrid.control.job_manager import JobManager
 from shardgrid.planner.generic_graph import CanonicalGraphIR, capture_generic_graph
 from shardgrid.runtime.checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
+    CheckpointContractError,
     consolidate_worker_state_shards,
     save_worker_state_shard,
 )
@@ -89,8 +90,11 @@ def _save_shards(
     graph: CanonicalGraphIR,
     runtime_plan: RuntimePlan,
     state_dict: dict[str, torch.Tensor],
+    *,
+    rank_by_worker: dict[str, int] | None = None,
 ) -> list[Path]:
     paths = []
+    rank_by_worker = rank_by_worker or {}
     for worker in runtime_plan.ownership.workers:
         path = tmp_path / f"{worker.worker_id}.pt"
         save_worker_state_shard(
@@ -103,6 +107,7 @@ def _save_shards(
             job_id="job-test",
             plan_id="plan-test",
             training_step=7,
+            rank=rank_by_worker.get(worker.worker_id),
         )
         paths.append(path)
     return paths
@@ -128,7 +133,13 @@ def test_checkpoint_shards_preserve_original_parameter_state_dict_keys(tmp_path)
         worker1_parameters=parameter_ids[2:],
     )
 
-    shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
+    shard_paths = _save_shards(
+        tmp_path,
+        graph,
+        runtime_plan,
+        case.module.state_dict(),
+        rank_by_worker={"worker0": 0, "worker1": 1},
+    )
     consolidated = consolidate_worker_state_shards(
         shard_paths,
         tmp_path / "model-state.pt",
@@ -136,13 +147,30 @@ def test_checkpoint_shards_preserve_original_parameter_state_dict_keys(tmp_path)
     )
 
     assert set(consolidated["state_dict"]) == set(case.module.state_dict())
+    assert consolidated["schema_version"] == CHECKPOINT_SCHEMA_VERSION
+    assert consolidated["graph_fingerprint"] == graph.graph_fingerprint
+    assert consolidated["plan_id"] == "plan-test"
+    assert consolidated["training_step"] == 7
+    assert [shard["rank"] for shard in consolidated["shards"]] == [0, 1]
     for shard_path in shard_paths:
         shard = torch.load(shard_path, map_location="cpu", weights_only=False)
         assert shard["schema_version"] == CHECKPOINT_SCHEMA_VERSION
+        assert shard["job_id"] == "job-test"
+        assert shard["graph_fingerprint"] == graph.graph_fingerprint
+        assert shard["plan_id"] == "plan-test"
+        assert shard["training_step"] == 7
+        assert shard["worker_id"] in {"worker0", "worker1"}
+        assert shard["gpu_index"] == 0
+        assert tuple(shard["owned_partition_ids"]) in {("stage0",), ("stage1",)}
         assert all(
             entry["state_dict_key"] in case.module.state_dict()
             for entry in shard["parameters"]
         )
+        for entry in shard["parameters"]:
+            tensor = case.module.state_dict()[entry["state_dict_key"]]
+            assert entry["canonical_id"].startswith("p")
+            assert entry["shape"] == tuple(tensor.shape)
+            assert entry["dtype"] == str(tensor.dtype).replace("torch.", "")
 
 
 def test_checkpoint_shards_preserve_original_buffer_state_dict_keys(tmp_path) -> None:
@@ -170,6 +198,11 @@ def test_checkpoint_shards_preserve_original_buffer_state_dict_keys(tmp_path) ->
         "bn.running_var",
         "bn.num_batches_tracked",
     ]
+    for entry in shard["buffers"]:
+        tensor = model.state_dict()[entry["state_dict_key"]]
+        assert entry["canonical_id"].startswith("b")
+        assert entry["shape"] == tuple(tensor.shape)
+        assert entry["dtype"] == str(tensor.dtype).replace("torch.", "")
 
 
 def test_checkpoint_merge_rejects_duplicate_canonical_state_ids(tmp_path) -> None:
@@ -183,8 +216,29 @@ def test_checkpoint_merge_rejects_duplicate_canonical_state_ids(tmp_path) -> Non
 
     shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
 
-    with pytest.raises(ValueError, match="duplicate checkpoint state id 'p0000'"):
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*duplicate checkpoint state id 'p0000'",
+    ):
         consolidate_worker_state_shards(shard_paths, tmp_path / "model-state.pt")
+    assert not (tmp_path / "model-state.pt").exists()
+
+
+def test_checkpoint_merge_rejects_duplicate_original_state_dict_key(tmp_path) -> None:
+    case = _ordinary_case("sequential")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    runtime_plan = _runtime_plan(graph, worker0_parameters=("p0000", "p0001"))
+    shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
+    shard = torch.load(shard_paths[0], map_location="cpu", weights_only=False)
+    shard["parameters"][1]["state_dict_key"] = shard["parameters"][0]["state_dict_key"]
+    torch.save(shard, shard_paths[0])
+
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*duplicate checkpoint state key",
+    ):
+        consolidate_worker_state_shards(shard_paths, tmp_path / "model-state.pt")
+    assert not (tmp_path / "model-state.pt").exists()
 
 
 def test_checkpoint_merge_rejects_missing_expected_state_keys(tmp_path) -> None:
@@ -198,12 +252,45 @@ def test_checkpoint_merge_rejects_missing_expected_state_keys(tmp_path) -> None:
 
     shard_paths = _save_shards(tmp_path, graph, runtime_plan, model.state_dict())
 
-    with pytest.raises(ValueError, match="bn.num_batches_tracked"):
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*bn.num_batches_tracked",
+    ):
         consolidate_worker_state_shards(
             shard_paths,
             tmp_path / "model-state.pt",
             expected_state_keys=tuple(model.state_dict()),
         )
+    assert not (tmp_path / "model-state.pt").exists()
+
+
+def test_checkpoint_merge_rejects_shape_and_dtype_mismatches(tmp_path) -> None:
+    case = _ordinary_case("sequential")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    runtime_plan = _runtime_plan(graph, worker0_parameters=("p0000", "p0001"))
+    shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
+    shape_bad = tmp_path / "shape-bad.pt"
+    dtype_bad = tmp_path / "dtype-bad.pt"
+    shard = torch.load(shard_paths[0], map_location="cpu", weights_only=False)
+    shape_shard = {**shard, "parameters": list(shard["parameters"])}
+    shape_shard["parameters"][0] = {**shape_shard["parameters"][0], "shape": (999,)}
+    dtype_shard = {**shard, "parameters": list(shard["parameters"])}
+    dtype_shard["parameters"][0] = {**dtype_shard["parameters"][0], "dtype": "float16"}
+    torch.save(shape_shard, shape_bad)
+    torch.save(dtype_shard, dtype_bad)
+
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*shape mismatch",
+    ):
+        consolidate_worker_state_shards([shape_bad], tmp_path / "shape-state.pt")
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*dtype mismatch",
+    ):
+        consolidate_worker_state_shards([dtype_bad], tmp_path / "dtype-state.pt")
+    assert not (tmp_path / "shape-state.pt").exists()
+    assert not (tmp_path / "dtype-state.pt").exists()
 
 
 def test_consolidated_checkpoint_supports_strict_reload_for_plain_pytorch_model(
@@ -229,6 +316,10 @@ def test_consolidated_checkpoint_supports_strict_reload_for_plain_pytorch_model(
 
     assert load_result.missing_keys == []
     assert load_result.unexpected_keys == []
+    loaded = torch.load(tmp_path / "model-state.pt", map_location="cpu", weights_only=False)
+    file_load_result = target.module.load_state_dict(loaded["state_dict"], strict=True)
+    assert file_load_result.missing_keys == []
+    assert file_load_result.unexpected_keys == []
 
 
 def test_tied_parameter_checkpoint_currently_keeps_only_canonical_state_key(
@@ -241,12 +332,17 @@ def test_tied_parameter_checkpoint_currently_keeps_only_canonical_state_key(
     shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
 
     assert set(case.module.state_dict()) == {"embedding.weight", "decoder.weight"}
-    with pytest.raises(ValueError, match="decoder.weight"):
+    assert len(_parameter_ids(graph)) == 1
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*decoder.weight",
+    ):
         consolidate_worker_state_shards(
             shard_paths,
             tmp_path / "model-state.pt",
             expected_state_keys=tuple(case.module.state_dict()),
         )
+    assert not (tmp_path / "model-state.pt").exists()
 
 
 def test_job_manager_consolidated_model_finalization_is_model_specific() -> None:

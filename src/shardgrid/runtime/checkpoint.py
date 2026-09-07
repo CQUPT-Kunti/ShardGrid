@@ -23,6 +23,10 @@ class CheckpointShardResult:
     buffer_count: int
 
 
+class CheckpointContractError(ValueError):
+    stage = "checkpoint"
+
+
 def save_worker_state_shard(
     path: Path,
     *,
@@ -34,6 +38,7 @@ def save_worker_state_shard(
     job_id: str,
     plan_id: str,
     training_step: int,
+    rank: int | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> CheckpointShardResult:
     owner = next(
@@ -50,6 +55,7 @@ def save_worker_state_shard(
         "plan_id": plan_id,
         "training_step": training_step,
         "worker_id": worker_id,
+        "rank": rank,
         "gpu_index": gpu_index,
         "owned_partition_ids": owner.owned_partitions,
         "metadata": dict(metadata or {}),
@@ -80,7 +86,7 @@ def consolidate_worker_state_shards(
     for shard_path in shard_paths:
         shard = torch.load(shard_path, map_location="cpu", weights_only=False)
         if shard.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-            raise ValueError(f"{shard_path} has unsupported checkpoint schema")
+            raise _checkpoint_failure(f"{shard_path} has unsupported checkpoint schema")
         metadata = {
             "job_id": shard.get("job_id"),
             "graph_fingerprint": shard.get("graph_fingerprint"),
@@ -90,26 +96,38 @@ def consolidate_worker_state_shards(
         if expected_metadata is None:
             expected_metadata = metadata
         elif metadata != expected_metadata:
-            raise ValueError(f"{shard_path} checkpoint metadata disagrees")
+            raise _checkpoint_failure(f"{shard_path} checkpoint metadata disagrees")
         shards.append(
             {
                 "path": str(shard_path),
                 "worker_id": shard["worker_id"],
+                "rank": shard.get("rank"),
                 "gpu_index": shard["gpu_index"],
                 "owned_partition_ids": tuple(shard["owned_partition_ids"]),
                 "metadata": dict(shard.get("metadata") or {}),
             }
         )
+        seen_keys: set[str] = set(state_dict)
         for section in ("parameters", "buffers"):
             for item in shard[section]:
                 item_id = item["canonical_id"]
                 if item_id in seen_ids:
-                    raise ValueError(f"duplicate checkpoint state id {item_id!r}")
+                    raise _checkpoint_failure(
+                        f"duplicate checkpoint state id {item_id!r}"
+                    )
+                key = item["state_dict_key"]
+                if key in seen_keys:
+                    raise _checkpoint_failure(f"duplicate checkpoint state key {key!r}")
                 seen_ids.add(item_id)
-                state_dict[item["state_dict_key"]] = item["tensor"]
+                seen_keys.add(key)
+                tensor = item["tensor"]
+                _validate_entry_tensor(shard_path, item, tensor)
+                state_dict[key] = tensor
     missing = set(expected_state_keys or ()) - set(state_dict)
     if missing:
-        raise ValueError(f"consolidated checkpoint missing keys: {sorted(missing)!r}")
+        raise _checkpoint_failure(
+            f"consolidated checkpoint missing keys: {sorted(missing)!r}"
+        )
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         **(expected_metadata or {}),
@@ -142,6 +160,19 @@ def _entries(
             }
         )
     return entries
+
+
+def _validate_entry_tensor(path: Path, item: Mapping[str, Any], tensor: Any) -> None:
+    actual_shape = tuple(tensor.shape)
+    if tuple(item["shape"]) != actual_shape:
+        raise _checkpoint_failure(
+            f"{path} checkpoint shape mismatch for {item['state_dict_key']!r}"
+        )
+    actual_dtype = str(tensor.dtype).replace("torch.", "")
+    if item["dtype"] != actual_dtype:
+        raise _checkpoint_failure(
+            f"{path} checkpoint dtype mismatch for {item['state_dict_key']!r}"
+        )
 
 
 def _training_evidence(shards: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -180,3 +211,7 @@ def _buffer_keys(graph: CanonicalGraphIR) -> dict[str, str]:
 def _fsync_file(path: Path) -> None:
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
+
+
+def _checkpoint_failure(message: str) -> CheckpointContractError:
+    return CheckpointContractError(f"CHECKPOINT_CONTRACT_FAILURE: {message}")
