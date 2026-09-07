@@ -807,7 +807,93 @@ def first_loss(monitors: list[dict[str, Any]]) -> float | None:
     return None
 
 
+def classify_job_failure(job: dict[str, Any]) -> dict[str, Any]:
+    """Classify a stress job failure from structured evidence.
+
+    Primary classifier is the structured failure ``code`` (and ``stage``)
+    recorded by JobManager/SSHLauncher; message substrings are only a
+    compatibility fallback for records produced before the taxonomy existed.
+    """
+    status = job.get("status") or {}
+    failure = status.get("failure") or {}
+    code = failure.get("code")
+    stage = failure.get("stage")
+    producer = failure.get("producer")
+    retryable = failure.get("retryable")
+    log_refs = failure.get("log_refs") or []
+    artifact_refs = failure.get("artifact_refs") or []
+    message = failure.get("message") or ""
+    evidence = {
+        "code": code,
+        "stage": stage,
+        "producer": producer,
+        "retryable": retryable,
+        "log_refs": list(log_refs),
+        "artifact_refs": list(artifact_refs),
+    }
+    if code is not None:
+        classification = _classify_by_code(code)
+        return {**evidence, "classified": classification, "classifier": "code"}
+    legacy = _classify_legacy_message(job)
+    if legacy != "other":
+        return {**evidence, "classified": legacy, "classifier": "message"}
+    if stage is not None:
+        classification = _classify_by_stage(stage)
+        if classification is not None:
+            return {**evidence, "classified": classification, "classifier": "stage"}
+    return {**evidence, "classified": legacy, "classifier": "message"}
+
+
+def _classify_by_code(code: str) -> str:
+    infra_codes = {
+        "NETWORK_FAILURE",
+        "RENDEZVOUS_FAILURE",
+        "PROCESS_LAUNCH_FAILURE",
+        "INFRA_FAILURE",
+    }
+    if code == "FORMAL_TRAINING_OOM":
+        return "safety_failure"
+    if code in infra_codes:
+        return "infra_failure"
+    if code == "RUNTIME_FAILURE":
+        return "runtime_failure"
+    if code == "MEMORY_REJECT":
+        return "memory_reject"
+    if code == "SEARCH_BUDGET_LIMIT":
+        return "search_budget_limit"
+    if code == "CPU_PROCESS_SATURATION":
+        return "cpu_saturation"
+    if code == "GPU_MEMORY_SATURATION":
+        return "gpu_memory_saturation"
+    if code == "TEST_LIMIT_REACHED":
+        return "test_limit_reached"
+    if code == "SATURATION_NOT_PROVEN":
+        return "saturation_not_proven"
+    return "other"
+
+
+def _classify_by_stage(stage: str) -> str | None:
+    if stage == "RENDEZVOUS":
+        return "infra_failure"
+    if stage == "LAUNCH":
+        return "infra_failure"
+    if stage == "NETWORK":
+        return "infra_failure"
+    if stage == "TRAIN":
+        return "runtime_failure"
+    if stage == "PROBE":
+        return "memory_reject"
+    return None
+
+
 def is_safety_failure(job: dict[str, Any]) -> bool:
+    classification = classify_job_failure(job)
+    if classification["classifier"] in {"code", "stage"}:
+        return classification["classified"] == "safety_failure"
+    return _legacy_safety_by_message(job)
+
+
+def _legacy_safety_by_message(job: dict[str, Any]) -> bool:
     status = job.get("status") or {}
     failure = status.get("failure") or {}
     message = failure.get("message") or ""
@@ -826,6 +912,13 @@ def is_safety_failure(job: dict[str, Any]) -> bool:
 
 
 def is_infra_failure(job: dict[str, Any]) -> bool:
+    classification = classify_job_failure(job)
+    if classification["classifier"] in {"code", "stage"}:
+        return classification["classified"] == "infra_failure"
+    return _legacy_infra_by_message(job)
+
+
+def _legacy_infra_by_message(job: dict[str, Any]) -> bool:
     status = job.get("status") or {}
     failure = status.get("failure") or {}
     message = failure.get("message") or ""
@@ -843,6 +936,14 @@ def is_infra_failure(job: dict[str, Any]) -> bool:
             "launcher cleanup failed",
         )
     )
+
+
+def _classify_legacy_message(job: dict[str, Any]) -> str:
+    if _legacy_infra_by_message(job):
+        return "infra_failure"
+    if _legacy_safety_by_message(job):
+        return "safety_failure"
+    return "other"
 
 
 def active_job_step_counts(
