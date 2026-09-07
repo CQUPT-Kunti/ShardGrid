@@ -49,6 +49,14 @@ class CaptureResult:
     failure: CaptureFailure | None = None
 
 
+@dataclass(frozen=True)
+class CapturedEntrypointWorkload:
+    context: CapturedTrainingContext
+    model: object
+    sample_args: tuple[object, ...]
+    sample_kwargs: dict[str, object]
+
+
 @dataclass
 class _CaptureState:
     entrypoint_path: Path
@@ -80,6 +88,61 @@ def capture_entrypoint(
     environment: Mapping[str, str] | None = None,
     dry_run: bool = True,
 ) -> CapturedTrainingContext | CaptureResult:
+    result = _capture_entrypoint_state(
+        entrypoint,
+        argv=argv,
+        cwd=cwd,
+        environment=environment,
+        dry_run=dry_run,
+    )
+    if isinstance(result, CaptureResult):
+        return result
+    return _build_context(result)
+
+
+def capture_entrypoint_workload(
+    entrypoint: str | Path,
+    *,
+    argv: tuple[str, ...] = (),
+    cwd: str | Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    dry_run: bool = True,
+) -> CapturedEntrypointWorkload | CaptureResult:
+    result = _capture_entrypoint_state(
+        entrypoint,
+        argv=argv,
+        cwd=cwd,
+        environment=environment,
+        dry_run=dry_run,
+    )
+    if isinstance(result, CaptureResult):
+        return result
+    if result.model is None:
+        return CaptureResult(
+            ok=False,
+            failure=CaptureFailure(
+                stage="capture",
+                code="NO_MODEL_CALL_CAPTURED",
+                message="entrypoint completed without an observable torch.nn.Module call",
+                artifact_log_ref="diagnostics/capture.json",
+            ),
+        )
+    return CapturedEntrypointWorkload(
+        context=_build_context(result),
+        model=result.model,
+        sample_args=result.args,
+        sample_kwargs=dict(result.kwargs),
+    )
+
+
+def _capture_entrypoint_state(
+    entrypoint: str | Path,
+    *,
+    argv: tuple[str, ...],
+    cwd: str | Path | None,
+    environment: Mapping[str, str] | None,
+    dry_run: bool,
+) -> _CaptureState | CaptureResult:
     root = Path.cwd() if cwd is None else Path(cwd)
     path = Path(entrypoint)
     if not path.is_absolute():
@@ -95,10 +158,10 @@ def capture_entrypoint(
             with _torch_capture_hooks(state, dry_run=dry_run):
                 runpy.run_path(str(path), run_name="__main__")
     except _CaptureComplete:
-        return _build_context(state)
+        return state
     except BaseException as exc:
         if state.model is not None:
-            return _build_context(state)
+            return state
         return CaptureResult(
             ok=False,
             failure=CaptureFailure(

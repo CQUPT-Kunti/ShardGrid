@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from shardgrid.artifacts.collector import (
@@ -22,18 +22,39 @@ from shardgrid.artifacts.collector import (
     WorkerArtifactSource,
 )
 from shardgrid.artifacts.metadata import write_snapshot_metadata
-from shardgrid.artifacts.snapshot import create_code_snapshot
+from shardgrid.artifacts.snapshot import (
+    create_code_snapshot,
+    load_capture_context,
+    write_capture_context,
+)
 from shardgrid.artifacts.store import ArtifactStore
 from shardgrid.artifacts.transport import build_transport_config, select_artifact_transport
+from shardgrid.bootstrap.runner import (
+    CapturedEntrypointWorkload,
+    CaptureResult,
+    capture_entrypoint_workload,
+)
 from shardgrid.common.config import (
     ClusterConfig,
+    TrainingArtifactsConfig,
     TrainingConfig,
+    TrainingJobConfig,
+    TrainingModelConfig,
+    TrainingPlanningConfig,
+    TrainingResourcesConfig,
     WorkerConfig,
     load_training_config,
 )
 from shardgrid.common.enums import BackendStatus, FailureStage, Health, JobState, PhysicalOS
 from shardgrid.common.errors import make_failure_record
-from shardgrid.common.models import BackendName, JobId, WorkerId, as_engine_name, as_job_id
+from shardgrid.common.models import (
+    BackendName,
+    JobId,
+    WorkerId,
+    as_backend_name,
+    as_engine_name,
+    as_job_id,
+)
 from shardgrid.control.resource_manager import ClusterState, ResourceManager
 from shardgrid.control.status_store import StatusStore
 from shardgrid.distributed.backend import select_backend
@@ -229,6 +250,7 @@ class PlannerWorkload:
     sample_kwargs: Mapping[str, object] = field(default_factory=dict)
     model_name: str = "captured_model"
     source: str = "captured_context"
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
 
 PROBE_PASS = "PASS"
@@ -1107,6 +1129,175 @@ class JobManager:
             network_state=network_state,
             collection_result=collection_result,
             launcher_result=monitor_result,
+        )
+
+    def run_entrypoint(
+        self,
+        entrypoint: Any,
+        *,
+        job_id: JobId | None = None,
+    ) -> JobRunResult:
+        self._last_planning_evidence = {}
+        self._last_parallel_plan_candidates = ()
+        training_config = self._entrypoint_training_config(entrypoint)
+        job = create_training_job(
+            config_path=str(getattr(entrypoint, "cluster_config_path", None) or ""),
+            model="captured-entrypoint",
+            requested_world_size=training_config.resources.world_size,
+            backend_preference=training_config.job.communication_backend,
+            runtime_environment_ref="env:cluster/shardgrid",
+            job_id=job_id,
+        )
+        current = self._status_store.create_initial_status(job)
+        snapshot = self._artifact_store.create_snapshot(
+            replace(
+                job,
+                snapshot_path=str(self._artifact_store.snapshot_paths(job.job_id).root),
+            )
+        )
+        current = self._persist_status(
+            current,
+            snapshot=snapshot,
+            state=JobState.PLANNING,
+            phase="capture",
+        )
+
+        capture = capture_entrypoint_workload(
+            getattr(entrypoint, "entrypoint"),
+            argv=tuple(getattr(entrypoint, "argv", ())),
+            cwd=getattr(entrypoint, "cwd", None),
+            environment=getattr(entrypoint, "environment", {}),
+            dry_run=True,
+        )
+        write_capture_context(
+            snapshot,
+            capture if isinstance(capture, CaptureResult) else capture.context,
+        )
+        capture_metadata = load_capture_context(snapshot)
+        if isinstance(capture, CaptureResult):
+            failure = self._capture_failure(capture)
+            current = self._failed_status(current, phase="capture", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+
+        create_code_snapshot(snapshot, source_root=self._source_root, secrets=self._secrets)
+        selected_workers = self._select_candidate_workers(training_config)
+        probe_results = [self._probe_worker(worker) for worker in selected_workers]
+        healthy_worker_ids = {
+            result.worker_resource.worker_id
+            for result in probe_results
+            if result.health is Health.HEALTHY
+        }
+        selected_workers = [
+            worker for worker in selected_workers if worker.worker_id in healthy_worker_ids
+        ]
+        worker_resources = [
+            result.worker_resource
+            for result in probe_results
+            if result.worker_resource.worker_id in healthy_worker_ids
+        ]
+        if not worker_resources:
+            failure = make_failure_record(
+                stage=FailureStage.PROBE,
+                host=str(self.cluster_config.control.hostname),
+                message="no healthy workers are available for captured entrypoint planning",
+                recommended_action="repair worker runtime readiness and retry shardgrid run",
+                secrets=self._secrets,
+            )
+            current = self._failed_status(current, phase="probe", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+
+        reserved_worker_resources = self._apply_active_resource_reservations(
+            worker_resources,
+            current_job_id=job.job_id,
+        )
+        cluster_state = self._resource_manager.build_cluster_state(
+            reserved_worker_resources,
+            network_state=None,
+            require_network=False,
+        )
+        try:
+            network_state = self._probe_network(worker_resources)
+            cluster_state = self._resource_manager.build_cluster_state(
+                reserved_worker_resources,
+                network_state=network_state,
+                require_network=True,
+            )
+            selected_engine = self._select_engine(
+                self._selected_engine_id(),
+                job,
+                cluster_state,
+                network_state,
+                registry=registered_engine_registry(),
+            )
+            captured_workload = self._captured_entrypoint_planner_workload(
+                capture,
+                capture_metadata,
+            )
+            parallel_plan = self._build_automatic_parallel_plan(
+                training_config=training_config,
+                cluster_state=cluster_state,
+                selected_engine=selected_engine,
+                captured_workload=captured_workload,
+            )
+            execution_plan = self._build_execution_plan(
+                job=job,
+                training_config=training_config,
+                parallel_plan=parallel_plan,
+                workers=selected_workers,
+                snapshot=snapshot,
+                rejected_engine_ids=getattr(selected_engine, "rejected_engine_ids", ()),
+            )
+        except Exception as exc:
+            failure = make_failure_record(
+                stage=FailureStage.PLAN,
+                host=str(self.cluster_config.control.hostname),
+                message=f"captured entrypoint planning failed: {exc}",
+                recommended_action=(
+                    "inspect plan/capture-context.json and planner diagnostics, then retry"
+                ),
+                runtime_environment={"artifact_log": "plan/capture-context.json"},
+                secrets=self._secrets,
+            )
+            current = self._failed_status(current, phase="plan", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+
+        current = self._persist_status(
+            replace(
+                current,
+                workers=[assignment.worker_id for assignment in execution_plan.workers],
+                assignments=list(execution_plan.workers),
+                runtime_environment_refs=self._runtime_refs(execution_plan),
+                backend=execution_plan.backend,
+            ),
+            snapshot=snapshot,
+            state=JobState.SNAPSHOTTING,
+            phase="plan",
+        )
+        planning_evidence = dict(self._last_planning_evidence)
+        planning_evidence["capture_context_ref"] = "plan/capture-context.json"
+        self._write_snapshot_metadata(
+            snapshot=snapshot,
+            job=job,
+            training_config=training_config,
+            parallel_plan=parallel_plan,
+            execution_plan=execution_plan,
+            network_state=network_state,
+            job_status=current,
+            launch_metadata={"capture_context_ref": "plan/capture-context.json"},
+            dry_run=True,
+        )
+        self._last_planning_evidence = planning_evidence
+        return JobRunResult(
+            job=job,
+            status=current,
+            snapshot=snapshot,
+            execution_plan=execution_plan,
+            parallel_plan=parallel_plan,
+            cluster_state=cluster_state,
+            network_state=network_state,
         )
 
     def _monitor_until_terminal(
@@ -2811,6 +3002,92 @@ class JobManager:
     def _automatic_planning_enabled(self, training_config: TrainingConfig) -> bool:
         return training_config.planning.mode == "automatic"
 
+    def _entrypoint_training_config(self, entrypoint: Any) -> TrainingConfig:
+        enabled_workers = [worker for worker in self.cluster_config.workers if worker.enabled]
+        world_size = max(1, len(enabled_workers))
+        communication_backend = self.cluster_config.backend_preference.communication_backend
+        if str(communication_backend) == "auto":
+            communication_backend = as_backend_name("nccl")
+        entrypoint_path = Path(getattr(entrypoint, "entrypoint")).name
+        return TrainingConfig(
+            job=TrainingJobConfig(
+                name=entrypoint_path or "captured-entrypoint",
+                backend=self.cluster_config.backend_preference.launcher,
+                communication_backend=communication_backend,
+            ),
+            model=TrainingModelConfig(
+                name="captured-entrypoint",
+                type="captured_entrypoint",
+                parameters={"entrypoint": entrypoint_path},
+            ),
+            resources=TrainingResourcesConfig(
+                world_size=world_size,
+                preferred_workers=[worker.worker_id for worker in enabled_workers],
+            ),
+            artifacts=TrainingArtifactsConfig(snapshot_name="captured-entrypoint"),
+            planning=TrainingPlanningConfig(mode="automatic"),
+        )
+
+    def _capture_failure(self, result: CaptureResult) -> FailureRecord:
+        failure = result.failure
+        message = (
+            "entrypoint capture failed without structured diagnostics"
+            if failure is None
+            else f"entrypoint capture failed: {failure.message}"
+        )
+        artifact_log = (
+            "plan/capture-context.json"
+            if failure is None or failure.artifact_log_ref is None
+            else failure.artifact_log_ref
+        )
+        return make_failure_record(
+            stage=FailureStage.BOOTSTRAP,
+            host=str(self.cluster_config.control.hostname),
+            message=message,
+            recommended_action="inspect plan/capture-context.json and retry shardgrid run",
+            runtime_environment={"artifact_log": artifact_log},
+            secrets=self._secrets,
+        )
+
+    def _captured_entrypoint_planner_workload(
+        self,
+        capture: CapturedEntrypointWorkload,
+        capture_metadata: Mapping[str, object],
+    ) -> PlannerWorkload:
+        model_identity = capture.context.model_identity
+        model_name = model_identity.get("class_name") or "captured-entrypoint"
+        return PlannerWorkload(
+            model=capture.model,
+            sample_args=capture.sample_args,
+            sample_kwargs=capture.sample_kwargs,
+            model_name=model_name,
+            source="capture_context_artifact",
+            metadata={
+                "capture_context_ref": "plan/capture-context.json",
+                "capture_backend": str(capture_metadata.get("capture_backend", "")),
+                "capture_backend_version": str(
+                    capture_metadata.get("capture_backend_version", "")
+                ),
+                "model_identity": dict(model_identity),
+                "tensor_metadata_keys": sorted(
+                    str(key)
+                    for key in (
+                        capture_metadata.get("tensor_metadata", {})
+                        if isinstance(capture_metadata.get("tensor_metadata"), dict)
+                        else {}
+                    )
+                ),
+                "state_key_count": len(
+                    capture_metadata.get("state_dict_key_to_canonical_state_id", {})
+                    if isinstance(
+                        capture_metadata.get("state_dict_key_to_canonical_state_id"),
+                        dict,
+                    )
+                    else {}
+                ),
+            },
+        )
+
     def _build_automatic_parallel_plan(
         self,
         *,
@@ -2860,6 +3137,8 @@ class JobManager:
             sample_args = workload.sample_args
             sample_kwargs = dict(workload.sample_kwargs)
             evidence["planner_workload_source"] = workload.source
+            if workload.metadata:
+                evidence["planner_workload_metadata"] = dict(workload.metadata)
             profile = build_model_profile(
                 model,
                 engine_id=self._selected_engine_name(selected_engine),
