@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+from examples.models import train_generic_dag
 from examples.models.train_automatic_plan import (
     _automatic_batch_sizes,
     _build_large_stage_module,
@@ -162,3 +163,10 @@ def test_large_runtime_stage_build_prunes_unused_boundary_state() -> None:
     assert module.__class__.__name__ == "LargeResidualTransformerStage"
     assert len(sample_inputs) == 2
     assert isinstance(sample_outputs, torch.Tensor)
+
+
+def test_generic_dag_runtime_remains_example_regression_asset() -> None:
+    assert "example/regression" in (train_generic_dag.__doc__ or "")
+    assert train_generic_dag.EVENT_MARKER == "GENERIC_DAG_RUNTIME_EVIDENCE "
+    assert train_generic_dag.build_zoo_model is not None
+    assert train_generic_dag.make_zoo_sample is not None
