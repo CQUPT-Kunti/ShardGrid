@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -19,13 +21,16 @@ from shardgrid.planner.planning_contract import (
     GPUResourceSpec,
     LogicalPartitionPlan,
     LogicalPartitionSpec,
+    PlacementSpec,
     PlanningConstraints,
     ResourceSnapshot,
     RuntimeCapabilities,
     build_logical_partition_plan,
+    final_plan_fingerprint_inputs,
     generate_logical_partition_candidates,
     generate_placement_candidates,
     plan,
+    validate_final_plan,
 )
 
 
@@ -404,6 +409,127 @@ def test_logical_partition_state_coverage_does_not_depend_on_module_order() -> N
     assert set(second.parameter_ids) == {"p0000", "p0001"}
 
 
+def test_validate_final_plan_accepts_legal_plan_and_stable_fingerprint_inputs() -> None:
+    graph, logical, placement = _valid_final_plan()
+
+    result = validate_final_plan(graph, logical, placement)
+    fingerprint_inputs = final_plan_fingerprint_inputs(graph, logical, placement)
+
+    assert result.valid
+    assert result.diagnostics == ()
+    assert fingerprint_inputs == final_plan_fingerprint_inputs(graph, logical, placement)
+    assert json.dumps(fingerprint_inputs, sort_keys=True)
+
+
+def test_validate_final_plan_rejects_graph_logical_and_placement_mismatch() -> None:
+    graph, logical, placement = _valid_final_plan()
+
+    logical_result = validate_final_plan(
+        graph,
+        replace(logical, graph_fingerprint="different-logical"),
+        placement,
+    )
+    placement_result = validate_final_plan(
+        graph,
+        logical,
+        replace(placement, graph_fingerprint="different-placement"),
+    )
+
+    assert logical_result.diagnostics[0] == "PLAN_VALIDATION_FAILURE"
+    assert "graph_logical_fingerprint_mismatch" in logical_result.diagnostics
+    assert placement_result.diagnostics[0] == "PLAN_VALIDATION_FAILURE"
+    assert "graph_placement_fingerprint_mismatch" in placement_result.diagnostics
+
+
+def test_validate_final_plan_rejects_missing_duplicate_and_unknown_placement() -> None:
+    graph, logical, placement = _valid_final_plan()
+    first = placement.placements[0]
+    missing = replace(placement, placements=placement.placements[:1])
+    duplicate = replace(placement, placements=placement.placements + (first,))
+    unknown = replace(
+        placement,
+        placements=placement.placements
+        + (PlacementSpec("PX", first.gpu_id, first.worker_id, first.gpu_index),),
+    )
+
+    assert "missing_placement_partition" in validate_final_plan(
+        graph,
+        logical,
+        missing,
+    ).diagnostics
+    assert "duplicate_placement_partition" in validate_final_plan(
+        graph,
+        logical,
+        duplicate,
+    ).diagnostics
+    assert "unknown_placement_partition" in validate_final_plan(
+        graph,
+        logical,
+        unknown,
+    ).diagnostics
+
+
+def test_validate_final_plan_rejects_node_state_and_boundary_invariants() -> None:
+    graph, logical, placement = _valid_final_plan()
+    first, second = logical.partitions
+    duplicate_node = replace(
+        logical,
+        partitions=(replace(first, node_ids=first.node_ids + second.node_ids[:1]), second),
+    )
+    missing_state = replace(
+        logical,
+        partitions=(
+            replace(first, owned_state_ids=()),
+            replace(second, read_only_state_ids=()),
+        ),
+    )
+    missing_boundary = replace(
+        logical,
+        partitions=(replace(first, output_value_ids=()), second),
+    )
+
+    assert "duplicate_partition_node" in validate_final_plan(
+        graph,
+        duplicate_node,
+        placement,
+    ).diagnostics
+    assert "missing_state_owner" in validate_final_plan(
+        graph,
+        missing_state,
+        placement,
+    ).diagnostics
+    assert "missing_boundary_value" in validate_final_plan(
+        graph,
+        missing_boundary,
+        placement,
+    ).diagnostics
+
+
+def test_resource_failure_is_not_plan_validation_failure() -> None:
+    result = plan(
+        _weighted_graph([10] * 4),
+        ResourceSnapshot(()),
+        PlanningConstraints(),
+        RuntimeCapabilities(),
+    )
+
+    assert "NO_AVAILABLE_GPUS" in result.diagnostics
+    assert "PLAN_VALIDATION_FAILURE" not in result.diagnostics
+
+
+def _valid_final_plan():
+    graph = _shared_state_graph()
+    logical = build_logical_partition_plan(graph, max_partitions=2)
+    placement = generate_placement_candidates(
+        graph,
+        logical,
+        _resources(2),
+        PlanningConstraints(),
+        RuntimeCapabilities(),
+    )[0]
+    return graph, logical, placement
+
+
 def _weighted_graph(weights: list[int]):
     nodes = tuple(
         GraphNodeSpec(
@@ -411,6 +537,7 @@ def _weighted_graph(weights: list[int]):
             op_kind="call_module",
             target="linear",
             module_path=f"m{index}",
+            input_value_ids=() if index == 0 else (f"v{index - 1:04d}",),
             output_value_ids=(f"v{index:04d}",),
             parameter_ids=(f"p{index:04d}",),
             estimated_peak_memory_contribution=weight,

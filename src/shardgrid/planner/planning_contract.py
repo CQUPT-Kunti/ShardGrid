@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from collections import Counter
+from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 from shardgrid.planner.generic_graph import CanonicalGraphIR
@@ -182,6 +184,13 @@ class PlanCandidate:
     score: int
 
 
+@dataclass(frozen=True)
+class PlanValidationResult:
+    valid: bool
+    diagnostics: tuple[str, ...] = ()
+    fingerprint_inputs: Mapping[str, Any] | None = None
+
+
 def plan(
     graph: CanonicalGraphIR,
     resources: ResourceSnapshot,
@@ -203,6 +212,7 @@ def plan(
         resources,
         constraints,
     )
+    validation_failures: list[str] = []
     evaluated_placements = 0
     evaluated_plans = 0
     for logical in partition_candidates:
@@ -215,6 +225,10 @@ def plan(
         )
         evaluated_placements += len(placements)
         for placement in placements:
+            validation = validate_final_plan(graph, logical, placement)
+            if not validation.valid:
+                validation_failures.extend(validation.diagnostics[1:])
+                continue
             cost = _estimate_cost(graph, logical, placement)
             candidate = PlanCandidate(
                 logical_partition_plan=logical,
@@ -234,6 +248,22 @@ def plan(
         if evaluated_plans >= constraints.max_total_plan_candidates:
             break
     if not top:
+        if validation_failures:
+            return PlanningResult(
+                partition_candidates[0] if partition_candidates else None,
+                None,
+                {},
+                diagnostics=(
+                    "PLAN_VALIDATION_FAILURE",
+                    *tuple(sorted(set(validation_failures))),
+                ),
+                search_diagnostics={
+                    "partition_candidates": len(partition_candidates),
+                    "placement_candidates": evaluated_placements,
+                    "evaluated_plans": evaluated_plans,
+                    "search_budget": constraints.max_total_plan_candidates,
+                },
+            )
         return PlanningResult(
             partition_candidates[0] if partition_candidates else None,
             None,
@@ -259,6 +289,163 @@ def plan(
             "search_budget": constraints.max_total_plan_candidates,
         },
     )
+
+
+def validate_final_plan(
+    graph: CanonicalGraphIR,
+    logical: LogicalPartitionPlan,
+    placement: PlacementPlan,
+) -> PlanValidationResult:
+    diagnostics: list[str] = []
+    if graph.graph_fingerprint != logical.graph_fingerprint:
+        diagnostics.append("graph_logical_fingerprint_mismatch")
+    if graph.graph_fingerprint != placement.graph_fingerprint:
+        diagnostics.append("graph_placement_fingerprint_mismatch")
+
+    diagnostics.extend(_logical_node_violations(graph, logical))
+    diagnostics.extend(_logical_state_violations(graph, logical))
+    diagnostics.extend(_logical_boundary_violations(graph, logical))
+    diagnostics.extend(_placement_reference_violations(logical, placement))
+
+    fingerprint_inputs = final_plan_fingerprint_inputs(graph, logical, placement)
+    try:
+        json.dumps(fingerprint_inputs, sort_keys=True)
+    except TypeError:
+        diagnostics.append("plan_fingerprint_inputs_not_serializable")
+
+    if diagnostics:
+        return PlanValidationResult(
+            False,
+            diagnostics=("PLAN_VALIDATION_FAILURE", *tuple(sorted(set(diagnostics)))),
+            fingerprint_inputs=fingerprint_inputs,
+        )
+    return PlanValidationResult(True, fingerprint_inputs=fingerprint_inputs)
+
+
+def final_plan_fingerprint_inputs(
+    graph: CanonicalGraphIR,
+    logical: LogicalPartitionPlan,
+    placement: PlacementPlan,
+) -> dict[str, Any]:
+    return {
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "graph": {
+            "fingerprint": graph.graph_fingerprint,
+            "nodes": [
+                {
+                    "node_id": node.node_id,
+                    "input_value_ids": list(node.input_value_ids),
+                    "output_value_ids": list(node.output_value_ids),
+                    "parameter_ids": list(node.parameter_ids),
+                    "buffer_ids": list(node.buffer_ids),
+                }
+                for node in graph.nodes
+            ],
+            "states": [asdict(state) for state in graph.states],
+        },
+        "logical": logical.to_dict(),
+        "placement": placement.to_dict(),
+    }
+
+
+def _logical_node_violations(
+    graph: CanonicalGraphIR,
+    logical: LogicalPartitionPlan,
+) -> tuple[str, ...]:
+    expected = {node.node_id for node in graph.nodes if node.op_kind != "output"}
+    counts = Counter(
+        node_id for partition in logical.partitions for node_id in partition.node_ids
+    )
+    diagnostics: list[str] = []
+    if any(count > 1 for count in counts.values()):
+        diagnostics.append("duplicate_partition_node")
+    if expected - set(counts):
+        diagnostics.append("missing_partition_node")
+    if set(counts) - expected:
+        diagnostics.append("unknown_partition_node")
+    return tuple(diagnostics)
+
+
+def _logical_state_violations(
+    graph: CanonicalGraphIR,
+    logical: LogicalPartitionPlan,
+) -> tuple[str, ...]:
+    required = (
+        {state.canonical_state_id for state in graph.states}
+        if graph.states
+        else {
+            state_id
+            for node in graph.nodes
+            for state_id in node.parameter_ids + node.buffer_ids
+        }
+    )
+    owner_counts = Counter(
+        state_id
+        for partition in logical.partitions
+        for state_id in partition.owned_state_ids
+    )
+    diagnostics: list[str] = []
+    if any(count > 1 for state_id, count in owner_counts.items() if state_id in required):
+        diagnostics.append("duplicate_state_owner")
+    if required - set(owner_counts):
+        diagnostics.append("missing_state_owner")
+    if set(owner_counts) - required:
+        diagnostics.append("unknown_state_owner")
+    if any(
+        set(partition.owned_state_ids) & set(partition.read_only_state_ids)
+        for partition in logical.partitions
+    ):
+        diagnostics.append("state_read_owner_conflict")
+    return tuple(diagnostics)
+
+
+def _logical_boundary_violations(
+    graph: CanonicalGraphIR,
+    logical: LogicalPartitionPlan,
+) -> tuple[str, ...]:
+    partition_by_node = {
+        node_id: partition.partition_id
+        for partition in logical.partitions
+        for node_id in partition.node_ids
+    }
+    partition_by_id = {partition.partition_id: partition for partition in logical.partitions}
+    for edge in graph.edges:
+        source_partition_id = partition_by_node.get(edge.source_node_id)
+        target_partition_id = partition_by_node.get(edge.target_node_id)
+        if (
+            source_partition_id is None
+            or target_partition_id is None
+            or source_partition_id == target_partition_id
+        ):
+            continue
+        source = partition_by_id[source_partition_id]
+        target = partition_by_id[target_partition_id]
+        edge_id = edge.edge_id or f"{edge.source_node_id}->{edge.target_node_id}:{edge.value_id}"
+        if (
+            edge.value_id not in source.output_value_ids
+            or edge.value_id not in target.input_value_ids
+            or edge_id not in source.boundary_edges
+        ):
+            return ("missing_boundary_value",)
+    return ()
+
+
+def _placement_reference_violations(
+    logical: LogicalPartitionPlan,
+    placement: PlacementPlan,
+) -> tuple[str, ...]:
+    expected = {partition.partition_id for partition in logical.partitions}
+    counts = Counter(placed.partition_id for placed in placement.placements)
+    diagnostics: list[str] = []
+    if any(count > 1 for count in counts.values()):
+        diagnostics.append("duplicate_placement_partition")
+    if expected - set(counts):
+        diagnostics.append("missing_placement_partition")
+    if set(counts) - expected:
+        diagnostics.append("unknown_placement_partition")
+    if placement.selected_gpu_count != len({placed.gpu_id for placed in placement.placements}):
+        diagnostics.append("selected_gpu_count_mismatch")
+    return tuple(diagnostics)
 
 
 def generate_logical_partition_candidates(
