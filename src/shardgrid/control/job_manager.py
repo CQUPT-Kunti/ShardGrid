@@ -151,6 +151,32 @@ def _probe_log_has_oom(text: str | None) -> bool:
     )
 
 
+def _probe_log_has_port_collision(text: str | None) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "eaddrinuse",
+            "address already in use",
+            "server socket has failed to listen",
+        )
+    )
+
+
+def _parse_probe_marker_from_tail(text: str) -> dict[str, object] | None:
+    marker = "T074_TRAIN_EVIDENCE "
+    for line in reversed(text.splitlines()):
+        if not line.startswith(marker):
+            continue
+        try:
+            payload = json.loads(line[len(marker):])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
 def _parse_probe_data_payload(text: str | None) -> dict[str, object] | None:
     for line in (text or "").splitlines():
         line = line.strip()
@@ -2397,14 +2423,18 @@ class JobManager:
                 )
         return [by_worker[assignment.worker_id] for assignment in execution_plan.workers]
 
-    def _allocate_live_master_port(self, worker: WorkerConfig) -> int:
+    def _allocate_live_master_port(self, worker: WorkerConfig, attempt: int = 1) -> int:
         runtime = self._runtime_wrapper(worker)
         preferred = self._resolved_rendezvous_port()
+        random.seed()
+        offset = random.randint(0, 9973)
         script = (
             "import json, socket\n"
             f"preferred = {preferred}\n"
+            f"offset = {offset}\n"
             "chosen = None\n"
-            "for port in range(preferred + 1, preferred + 101):\n"
+            "for index in range(offset, offset + 128):\n"
+            "    port = preferred + 1 + (index % 10000)\n"
             "    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
             "    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
             "    try:\n"
@@ -2905,6 +2935,13 @@ class JobManager:
                     LauncherResultStatus.BLOCKED,
                     LauncherResultStatus.UNSUPPORTED,
                 }:
+                    if (
+                        monitor.status is LauncherResultStatus.FAILED
+                        and self._memory_probe_completed(
+                            probe_snapshot, probe_execution.world_size
+                        )
+                    ):
+                        continue
                     failure = current_status.failure or monitor.failure
                     return self._classify_probe_result(
                         probe_snapshot=probe_snapshot,
@@ -2938,6 +2975,11 @@ class JobManager:
                 pass
             try:
                 launcher.cleanup(context)
+            except Exception:
+                pass
+            try:
+                if hasattr(launcher, "remove_remote_snapshot"):
+                    launcher.remove_remote_snapshot(context)
             except Exception:
                 pass
 
@@ -3067,6 +3109,21 @@ class JobManager:
                 master_port=master.port,
             )
         if rendezvous_ready is True and not training_started:
+            if _probe_log_has_port_collision(log_tail):
+                return MemoryProbeResult(
+                    status=PROBE_INFRA_FAILURE,
+                    candidate_id=probe_plan.selected_candidate_id,
+                    subtype="PORT_COLLISION",
+                    message=(
+                        "probe rendezvous port collision detected; "
+                        "reallocating a fresh master port"
+                    ),
+                    rendezvous_ready=True,
+                    phase=phase,
+                    attempt=attempt,
+                    master_addr=master.address,
+                    master_port=master.port,
+                )
             return MemoryProbeResult(
                 status=PROBE_RUNTIME_FAILURE,
                 candidate_id=probe_plan.selected_candidate_id,
@@ -3137,6 +3194,12 @@ class JobManager:
                 train = payload.get("train")
                 if isinstance(train, dict):
                     payloads.append(train)
+                    continue
+                log_tail = payload.get("log_tail")
+                if isinstance(log_tail, str):
+                    parsed = _parse_probe_marker_from_tail(log_tail)
+                    if parsed is not None:
+                        payloads.append(parsed)
         if len(payloads) < world_size:
             return False
         return all(

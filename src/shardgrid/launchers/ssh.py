@@ -2738,6 +2738,29 @@ class SSHLauncher(Launcher):
         skipped_items: tuple[str, ...] = ()
         failure: FailureRecord | None = None
 
+    def remove_remote_snapshot(self, context: LauncherContext) -> None:
+        """Remove the remote snapshot root for a disposable probe job.
+
+        Memory-probe retries reuse the same probe job id; the stale remote
+        snapshot from a previous attempt would otherwise fail the identity
+        preflight on re-distribute.  Only the current job's own root is
+        removed and the target is validated to stay under ``jobs_root``.
+        """
+        for worker in self._selected_workers(context):
+            runtime = self._runtime_factory(worker)
+            remote_root = self._remote_root_for_worker(
+                context, str(worker.worker_id)
+            )
+            outcome = self._cleanup_path(
+                runtime,
+                worker=worker,
+                target=remote_root,
+                allowed_root=str(self.cluster_config.jobs_root),
+                label="disposable probe remote snapshot",
+            )
+            if outcome.failure is not None:
+                raise outcome.failure
+
     def _cleanup_remote_root(
         self,
         context: LauncherContext,
