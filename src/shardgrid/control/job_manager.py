@@ -1205,6 +1205,7 @@ class JobManager:
         *,
         job_id: JobId | None = None,
         dry_run: bool | None = None,
+        min_selected_physical_hosts: int | None = None,
     ) -> JobRunResult:
         if dry_run is None:
             dry_run = bool(getattr(entrypoint, "dry_run", False))
@@ -1311,6 +1312,7 @@ class JobManager:
                 cluster_state=cluster_state,
                 selected_engine=selected_engine,
                 captured_workload=captured_workload,
+                min_selected_physical_hosts=min_selected_physical_hosts,
             )
             execution_plan = self._build_execution_plan(
                 job=job,

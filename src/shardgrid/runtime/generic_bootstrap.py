@@ -626,16 +626,32 @@ def _materialize_owned_modules(
         if partition.partition_id in owned_partitions
         for node_id in partition.node_ids
     }
-    module_paths = {
+    owned_paths = {
         node.module_path
         for node in graph.nodes
         if node.node_id in owned_nodes and node.module_path
     }
     modules = dict(backend_graph.named_modules())
-    for path in sorted(module_paths):
+    for path in sorted(owned_paths):
         module = modules[path]
         module.to_empty(device=device)
         _load_owned_module_state(module, path, initial_state, device)
+    owned_prefixes = {path for path in owned_paths} | {
+        ".".join(path.split(".")[:index]) if index else path
+        for path in owned_paths
+        for index in range(1, len(path.split(".")))
+    }
+    for path, module in modules.items():
+        if not path:
+            continue
+        if path in owned_paths or path in owned_prefixes:
+            continue
+        if any(
+            path == prefix or path.startswith(prefix + ".")
+            for prefix in owned_paths
+        ):
+            continue
+        module.to_empty(device="meta")
 
 
 def _load_owned_module_state(
