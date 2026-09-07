@@ -174,6 +174,17 @@ def _plan(candidate_id: str) -> object:
     )
 
 
+def _captured_plan(candidate_id: str) -> object:
+    plan = _plan(candidate_id)
+    return replace(
+        plan,
+        requirements={
+            **plan.requirements,
+            "workload_source": "captured_context",
+        },
+    )
+
+
 def _network_state() -> NetworkState:
     return NetworkState(
         network_id="pair",
@@ -241,6 +252,38 @@ def _fake_preflight(fresh_port: int = 31001):
         return updated, cluster_state, network_state
 
     return fake
+
+
+def test_captured_workload_launch_uses_internal_generic_bootstrap(tmp_path: Path) -> None:
+    manager = JobManager(_cluster_config(tmp_path))
+    job = _job(tmp_path)
+    snapshot = manager._artifact_store.create_snapshot(job)
+    plan = _captured_plan("candidate-C")
+
+    command = manager._launch_command_for_assignment(
+        plan,
+        0,
+        job=job,
+        snapshot=snapshot,
+    )
+    probe_command = manager._launch_command_for_assignment(
+        replace(plan, requirements={**plan.requirements, "memory_probe": "true"}),
+        0,
+        job=job,
+        snapshot=snapshot,
+    )
+
+    assert "examples/models/train_generic_dag.py" not in command
+    assert "examples/models/train_automatic_plan.py" not in command
+    assert "python -m shardgrid.runtime.generic_bootstrap" in command
+    assert "--plan-artifact" in command
+    assert str(Path(snapshot.plan_path) / "original-parallel-plan.json") in command
+    assert "--context-artifact" in command
+    assert str(Path(snapshot.plan_path) / "captured-context.json") in command
+    assert "--job-id job-probe-launch" in command
+    assert "--selected-candidate-id candidate-C" in command
+    assert probe_command.startswith("python -m shardgrid.runtime.generic_bootstrap")
+    assert "--memory-probe" in probe_command
 
 
 def test_probe_launch_uses_live_plan_fresh_port_not_default(

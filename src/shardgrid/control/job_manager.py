@@ -6,6 +6,7 @@ import gc
 import json
 import os
 import random
+import shlex
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -1640,7 +1641,12 @@ class JobManager:
                         if worker.conda_prefix
                         else self.cluster_config.runtime.python_executable
                     ),
-                    launch_command=self._launch_command_for_assignment(parallel_plan, rank),
+                    launch_command=self._launch_command_for_assignment(
+                        parallel_plan,
+                        rank,
+                        job=job,
+                        snapshot=snapshot,
+                    ),
                     environment=self._assignment_environment(
                         training_config=training_config,
                         parallel_plan=parallel_plan,
@@ -1682,8 +1688,22 @@ class JobManager:
             labels=labels,
         )
 
-    def _launch_command_for_assignment(self, parallel_plan: ParallelPlan, rank: int) -> str:
+    def _launch_command_for_assignment(
+        self,
+        parallel_plan: ParallelPlan,
+        rank: int,
+        *,
+        job: TrainingJob | None = None,
+        snapshot: JobSnapshot | None = None,
+    ) -> str:
         if parallel_plan.partition_source == "automatic":
+            if self._generic_runtime_bootstrap_requested(parallel_plan):
+                return self._generic_runtime_bootstrap_command(
+                    parallel_plan,
+                    rank,
+                    job=job,
+                    snapshot=snapshot,
+                )
             if parallel_plan.requirements.get("generic_dag_runtime") == "true":
                 if parallel_plan.requirements.get("memory_probe") == "true":
                     return (
@@ -1693,6 +1713,48 @@ class JobManager:
                 return f"python examples/models/train_generic_dag.py --rank {rank}"
             return f"python examples/models/train_automatic_plan.py --rank {rank}"
         return f"python examples/models/train_pipeline.py --rank {rank}"
+
+    def _generic_runtime_bootstrap_requested(self, parallel_plan: ParallelPlan) -> bool:
+        return parallel_plan.requirements.get("workload_source") == "captured_context"
+
+    def _generic_runtime_bootstrap_command(
+        self,
+        parallel_plan: ParallelPlan,
+        rank: int,
+        *,
+        job: TrainingJob | None = None,
+        snapshot: JobSnapshot | None = None,
+    ) -> str:
+        plan_artifact = (
+            "plan/original-parallel-plan.json"
+            if snapshot is None
+            else str(Path(snapshot.plan_path) / "original-parallel-plan.json")
+        )
+        context_artifact = (
+            "plan/captured-context.json"
+            if snapshot is None
+            else str(Path(snapshot.plan_path) / "captured-context.json")
+        )
+        command = [
+            "python",
+            "-m",
+            "shardgrid.runtime.generic_bootstrap",
+            "--rank",
+            str(rank),
+            "--parallel-plan-id",
+            parallel_plan.parallel_plan_id,
+            "--selected-candidate-id",
+            parallel_plan.selected_candidate_id or "",
+            "--plan-artifact",
+            plan_artifact,
+            "--context-artifact",
+            context_artifact,
+            "--job-id",
+            "" if job is None else str(job.job_id),
+        ]
+        if parallel_plan.requirements.get("memory_probe") == "true":
+            command.append("--memory-probe")
+        return " ".join(shlex.quote(item) for item in command)
 
     def _assignment_environment(
         self,
