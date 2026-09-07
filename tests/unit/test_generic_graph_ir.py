@@ -8,6 +8,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import torch
+from torch import nn
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -65,6 +68,20 @@ def _functional_targets(graph) -> list[str]:
         for node in graph.nodes
         if node.module_path is None and node.op_kind not in {"placeholder", "output"}
     ]
+
+
+def _states_by_key(graph) -> dict[str, Any]:
+    return {state.state_dict_key: state for state in graph.states}
+
+
+class BufferStateModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bn = nn.BatchNorm1d(4)
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.bn(x))
 
 ZOO_MODELS = (
     "mini_resnet",
@@ -280,3 +297,69 @@ def test_ordinary_functional_ops_are_execution_nodes_without_modules() -> None:
     assert any("interpolate" in target for target in functional_targets)
     assert any("cat" in target for target in functional_targets)
     assert len(functional_targets) >= 4
+
+
+def test_state_objects_capture_parameter_metadata_and_use_sites() -> None:
+    case, graph = _capture_ordinary_case("sequential")
+    states = _states_by_key(graph)
+
+    first_weight = states["layers.0.weight"]
+
+    assert set(states) == set(case.module.state_dict())
+    assert first_weight.kind == "parameter"
+    assert first_weight.canonical_state_id == "p0000"
+    assert first_weight.shape == tuple(case.module.layers[0].weight.shape)
+    assert first_weight.dtype == "float32"
+    assert first_weight.requires_grad is True
+    assert first_weight.checkpoint_owner_key == "layers.0.weight"
+    assert first_weight.owner_node_ids == first_weight.use_node_ids
+    assert first_weight.use_node_ids
+    assert graph.to_dict()["states"][0]["state_dict_key"] in case.module.state_dict()
+
+
+def test_state_objects_capture_buffer_metadata_and_use_sites() -> None:
+    model = BufferStateModel().eval()
+    graph = capture_generic_graph(model, sample_args=(torch.randn(3, 4),))
+    states = _states_by_key(graph)
+    bn_node = next(node for node in graph.nodes if node.module_path == "bn")
+
+    running_mean = states["bn.running_mean"]
+
+    assert running_mean.kind == "buffer"
+    assert running_mean.canonical_state_id.startswith("b")
+    assert running_mean.shape == tuple(model.bn.running_mean.shape)
+    assert running_mean.dtype == "float32"
+    assert running_mean.requires_grad is False
+    assert running_mean.owner_node_ids == (bn_node.node_id,)
+    assert running_mean.use_node_ids == (bn_node.node_id,)
+
+
+def test_state_objects_preserve_tied_parameter_keys_with_one_canonical_owner() -> None:
+    _case, graph = _capture_ordinary_case("shared_tied_parameter")
+    states = _states_by_key(graph)
+
+    embedding = states["embedding.weight"]
+    decoder = states["decoder.weight"]
+
+    assert embedding.canonical_state_id == decoder.canonical_state_id
+    assert embedding.shared_group_id == decoder.shared_group_id == "p0000"
+    assert embedding.checkpoint_owner_key == "embedding.weight"
+    assert decoder.checkpoint_owner_key == "embedding.weight"
+    assert set(decoder.use_node_ids) == set(embedding.use_node_ids)
+    assert len(decoder.use_node_ids) == 2
+
+
+def test_state_owner_and_use_records_follow_graph_nodes_not_registration_order() -> None:
+    case, graph = _capture_ordinary_case("multi_branch")
+    registered = _registered_module_order(case.module)
+    executed = _executed_module_order(graph)
+    states = _states_by_key(graph)
+
+    right_node = next(node for node in graph.nodes if node.module_path == "right")
+    gate_node = next(node for node in graph.nodes if node.module_path == "gate")
+
+    assert registered.index("right") < registered.index("gate")
+    assert executed.index("gate") < executed.index("right")
+    assert states["right.weight"].use_node_ids == (right_node.node_id,)
+    assert states["gate.weight"].use_node_ids == (gate_node.node_id,)
+    assert int(gate_node.node_id[1:]) < int(right_node.node_id[1:])

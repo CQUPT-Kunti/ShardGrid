@@ -63,6 +63,21 @@ class ParameterUseSpec:
 
 
 @dataclass(frozen=True)
+class StateObjectSpec:
+    canonical_state_id: str
+    kind: str
+    state_dict_key: str
+    shape: tuple[int | str, ...] = ()
+    dtype: str | None = None
+    requires_grad: bool | None = None
+    storage_id: str | None = None
+    shared_group_id: str | None = None
+    checkpoint_owner_key: str | None = None
+    owner_node_ids: tuple[str, ...] = ()
+    use_node_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class BoundaryValueSpec:
     value_id: str
     producer_stage: str
@@ -88,6 +103,7 @@ class GenericGraphIR:
     output_pytree_spec: str = "unknown"
     parameter_uses: tuple[ParameterUseSpec, ...] = ()
     shared_parameter_ids: tuple[str, ...] = ()
+    states: tuple[StateObjectSpec, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +120,7 @@ class GenericGraphIR:
             "parameter_owners": dict(self.parameter_owners),
             "parameter_uses": [use.__dict__ for use in self.parameter_uses],
             "shared_parameter_ids": list(self.shared_parameter_ids),
+            "states": [state.__dict__ for state in self.states],
         }
 
 
@@ -372,6 +389,7 @@ def _graph_from_fx(
         output_pytree_spec=output_pytree_spec,
         parameter_uses=_parameter_uses(nodes),
         shared_parameter_ids=_shared_parameter_ids(nodes),
+        states=_state_objects(model, nodes, parameter_ids_by_path, buffer_ids_by_path),
     )
     return GenericGraphIR(
         **{
@@ -576,6 +594,85 @@ def _named_buffers(model: Any) -> tuple[tuple[str, Any], ...]:
         return tuple(model.named_buffers(remove_duplicate=False))
     except TypeError:
         return tuple(model.named_buffers())
+
+
+def _state_objects(
+    model: Any,
+    nodes: Sequence[GraphNodeSpec],
+    parameter_ids_by_path: Mapping[str, str],
+    buffer_ids_by_path: Mapping[str, str],
+) -> tuple[StateObjectSpec, ...]:
+    parameter_users: dict[str, list[str]] = {}
+    parameter_owner: dict[str, str] = {}
+    buffer_users: dict[str, list[str]] = {}
+    buffer_owner: dict[str, str] = {}
+    for node in nodes:
+        for state_id in node.parameter_ids:
+            parameter_users.setdefault(state_id, []).append(node.node_id)
+            parameter_owner.setdefault(state_id, node.node_id)
+        for state_id in node.buffer_ids:
+            buffer_users.setdefault(state_id, []).append(node.node_id)
+            buffer_owner.setdefault(state_id, node.node_id)
+
+    records: list[StateObjectSpec] = []
+    records.extend(
+        _state_records(
+            "parameter",
+            _named_parameters(model),
+            parameter_ids_by_path,
+            parameter_owner,
+            parameter_users,
+        )
+    )
+    records.extend(
+        _state_records(
+            "buffer",
+            _named_buffers(model),
+            buffer_ids_by_path,
+            buffer_owner,
+            buffer_users,
+        )
+    )
+    return tuple(records)
+
+
+def _state_records(
+    kind: str,
+    named_items: Sequence[tuple[str, Any]],
+    ids_by_path: Mapping[str, str],
+    owner_by_id: Mapping[str, str],
+    users_by_id: Mapping[str, Sequence[str]],
+) -> tuple[StateObjectSpec, ...]:
+    keys_by_id: dict[str, list[str]] = {}
+    for path, _item in named_items:
+        keys_by_id.setdefault(ids_by_path[path], []).append(path)
+
+    records: list[StateObjectSpec] = []
+    for path, item in named_items:
+        state_id = ids_by_path[path]
+        keys = keys_by_id[state_id]
+        records.append(
+            StateObjectSpec(
+                canonical_state_id=state_id,
+                kind=kind,
+                state_dict_key=path,
+                shape=tuple(getattr(item, "shape", ()) or ()),
+                dtype=str(getattr(item, "dtype", "")).replace("torch.", "") or None,
+                requires_grad=(
+                    bool(item.requires_grad)
+                    if hasattr(item, "requires_grad") and kind == "parameter"
+                    else False
+                ),
+                storage_id=state_id,
+                shared_group_id=state_id if len(keys) > 1 else None,
+                checkpoint_owner_key=keys[0],
+                owner_node_ids=(
+                    (owner_by_id[state_id],) if state_id in owner_by_id else ()
+                ),
+                use_node_ids=tuple(sorted(set(users_by_id.get(state_id, ())))),
+            )
+        )
+    return tuple(records)
 
 
 def _real_parameter_storage_bytes(model: Any) -> int:
