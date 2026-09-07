@@ -2,6 +2,7 @@
 
 from shardgrid.common.enums import (
     BackendStatus,
+    FailureCode,
     FailureStage,
     Health,
     JobState,
@@ -28,6 +29,7 @@ __all__ = [
     "BackendName",
     "BackendStatus",
     "EngineName",
+    "FailureCode",
     "FailureStage",
     "Health",
     "Hostname",
