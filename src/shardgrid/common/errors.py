@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from shardgrid.common.enums import FailureStage
+from shardgrid.common.enums import FailureCode, FailureStage
 from shardgrid.common.models import as_worker_id
 from shardgrid.common.process import ProcessResult, redact_command, redact_text
 from shardgrid.jobs.models import FailureRecord
@@ -38,6 +38,12 @@ def make_failure_record(
     retryable: bool = False,
     manual_action_required: bool = False,
     secrets: Sequence[str] = (),
+    code: FailureCode | None = None,
+    producer: str | None = None,
+    rank: int | None = None,
+    gpu_id: str | None = None,
+    log_refs: Sequence[str] = (),
+    artifact_refs: Sequence[str] = (),
 ) -> FailureRecord:
     rendered_command = None
     if command is not None:
@@ -63,6 +69,14 @@ def make_failure_record(
         recommended_action=redact_text(recommended_action, secrets) or recommended_action,
         retryable=retryable,
         manual_action_required=manual_action_required,
+        code=code,
+        producer=producer,
+        rank=rank,
+        gpu_id=gpu_id,
+        log_refs=tuple(redact_text(str(ref), secrets) or str(ref) for ref in log_refs),
+        artifact_refs=tuple(
+            redact_text(str(ref), secrets) or str(ref) for ref in artifact_refs
+        ),
     )
 
 
@@ -82,6 +96,12 @@ def failure_from_process_result(
     conda_prefix: str | None = None,
     retryable: bool = False,
     manual_action_required: bool = False,
+    code: FailureCode | None = None,
+    producer: str | None = None,
+    rank: int | None = None,
+    gpu_id: str | None = None,
+    log_refs: Sequence[str] = (),
+    artifact_refs: Sequence[str] = (),
 ) -> FailureRecord:
     return FailureRecord(
         stage=stage,
@@ -99,6 +119,12 @@ def failure_from_process_result(
         recommended_action=recommended_action,
         retryable=retryable,
         manual_action_required=manual_action_required,
+        code=code,
+        producer=producer,
+        rank=rank,
+        gpu_id=gpu_id,
+        log_refs=tuple(log_refs),
+        artifact_refs=tuple(artifact_refs),
     )
 
 def raise_stage_error(
@@ -119,6 +145,12 @@ def raise_stage_error(
     retryable: bool = False,
     manual_action_required: bool = False,
     secrets: Sequence[str] = (),
+    code: FailureCode | None = None,
+    producer: str | None = None,
+    rank: int | None = None,
+    gpu_id: str | None = None,
+    log_refs: Sequence[str] = (),
+    artifact_refs: Sequence[str] = (),
 ) -> None:
     raise StageError(
         make_failure_record(
@@ -138,5 +170,11 @@ def raise_stage_error(
             retryable=retryable,
             manual_action_required=manual_action_required,
             secrets=secrets,
+            code=code,
+            producer=producer,
+            rank=rank,
+            gpu_id=gpu_id,
+            log_refs=log_refs,
+            artifact_refs=artifact_refs,
         )
     )

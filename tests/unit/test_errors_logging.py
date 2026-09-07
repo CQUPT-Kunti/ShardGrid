@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from shardgrid.common.enums import FailureStage
+from shardgrid.common.enums import FailureCode, FailureStage
 from shardgrid.common.errors import (
     StageError,
     failure_from_process_result,
@@ -151,3 +151,65 @@ def test_required_failure_stages_are_supported() -> None:
     ]
 
     assert [failure.stage for failure in failures] == STAGES
+
+
+def test_make_failure_record_persists_structured_metadata() -> None:
+    failure = make_failure_record(
+        stage=FailureStage.TRAIN,
+        code=FailureCode.RUNTIME_FAILURE,
+        producer="ssh_launcher",
+        host="machine-c",
+        rank=2,
+        gpu_id="gpu1060",
+        worker_id="gpu1060",
+        message="worker training process failed",
+        recommended_action="inspect worker logs and rerun",
+        log_refs=["logs/train.rank2.stdout"],
+        artifact_refs=["checkpoint/model-state.pt"],
+        retryable=True,
+    )
+
+    assert failure.code is FailureCode.RUNTIME_FAILURE
+    assert failure.producer == "ssh_launcher"
+    assert failure.rank == 2
+    assert failure.gpu_id == "gpu1060"
+    assert failure.log_refs == ("logs/train.rank2.stdout",)
+    assert failure.artifact_refs == ("checkpoint/model-state.pt",)
+    assert failure.retryable is True
+
+
+def test_make_failure_record_redacts_secrets_in_log_refs() -> None:
+    failure = make_failure_record(
+        stage=FailureStage.NETWORK,
+        host="machine-c",
+        message="ssh failed",
+        recommended_action="verify connectivity",
+        log_refs=["logs/ssh.token@example.stdout"],
+        artifact_refs=["s3://bucket/secret-key/model-state.pt"],
+        secrets=["token@example", "secret-key"],
+    )
+
+    assert "token@example" not in "".join(failure.log_refs)
+    assert "secret-key" not in "".join(failure.artifact_refs)
+
+
+def test_retryable_is_explicit_not_derived_from_message() -> None:
+    retryable = make_failure_record(
+        stage=FailureStage.PROBE,
+        host="machine-c",
+        message="probe out of memory for candidate",
+        recommended_action="try next candidate",
+        code=FailureCode.MEMORY_REJECT,
+        retryable=True,
+    )
+    not_retryable = make_failure_record(
+        stage=FailureStage.TRAIN,
+        host="machine-c",
+        message="formal training out of memory",
+        recommended_action="reduce batch size or adjust placement",
+        code=FailureCode.FORMAL_TRAINING_OOM,
+        retryable=False,
+    )
+
+    assert retryable.retryable is True
+    assert not_retryable.retryable is False
