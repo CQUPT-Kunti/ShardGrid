@@ -135,6 +135,7 @@ def _probe_payload(
             "snapshot_present": snapshot_present,
             "metadata_job_id": metadata_job_id,
             "entrypoint_exists": entrypoint_exists,
+            "python_under_expected_prefix": True,
             "created_dirs": created_dirs or [],
             "output_dirs_ready": output_dirs_ready,
         }
@@ -545,9 +546,87 @@ def test_remote_runtime_command_uses_wrapper_and_transport_is_injected(
     launcher.distribute(context)
     launcher.launch(context)
 
-    assert runtime.run_calls
     assert runtime.script_calls
     assert transport.calls
+
+
+def test_generic_runtime_launch_passes_remote_exact_artifacts_and_keeps_rank_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeArtifactTransport(_success_transfer())
+    runtimes = {
+        worker_id: FakeRuntime(
+            run_results=[_ok_result("python --version", stdout="Python 3.12.13")],
+            script_results=[
+                _ok_result("probe", stdout=_probe_payload(created_dirs=["logs"])),
+                _ok_result("launch", stdout=str(4100 + index)),
+            ],
+        )
+        for index, worker_id in enumerate(("gpu4060", "gpu1060", "gpu3090"))
+    }
+    launcher = SSHLauncher(
+        _cluster_config(),
+        artifact_transport=transport,
+        runtime_factory=lambda worker: runtimes[str(worker.worker_id)],
+    )
+    context = _context()
+    local_plan = Path(context.snapshot.plan_path) / "original-parallel-plan.json"
+    local_context = Path(context.snapshot.plan_path) / "captured-context.json"
+    workers = tuple(
+        replace(
+            assignment,
+            launch_command=(
+                "python -m shardgrid.runtime.generic_bootstrap "
+                f"--rank {assignment.rank} "
+                "--parallel-plan-id plan-exact "
+                "--selected-candidate-id candidate-exact "
+                f"--plan-artifact {local_plan} "
+                f"--context-artifact {local_context} "
+                f"--job-id {context.job.job_id}"
+            ),
+        )
+        for assignment in context.execution_plan.workers
+    )
+    context = replace(
+        context,
+        execution_plan=replace(context.execution_plan, workers=workers),
+    )
+
+    def fake_distribute(*args, worker, transport, **kwargs):
+        transport.transfer(
+            [],
+            remote=RemoteArtifactLocation(
+                host=str(worker.host),
+                user=worker.ssh_user,
+                port=worker.ssh_port,
+                path=".",
+            ),
+        )
+        return _distribution_result(str(worker.worker_id))
+
+    monkeypatch.setattr(
+        "shardgrid.launchers.ssh.distribute_job_snapshot_to_worker",
+        fake_distribute,
+    )
+
+    assert launcher.prepare(context).status is LauncherResultStatus.SUCCESS
+    assert launcher.distribute(context).status is LauncherResultStatus.SUCCESS
+    assert launcher.launch(context).status is LauncherResultStatus.SUCCESS
+
+    script = runtimes["gpu4060"].script_calls[-1]
+    assert "shardgrid.runtime.generic_bootstrap" in script
+    assert str(local_plan) not in script
+    assert str(local_context) not in script
+    assert "/var/tmp/shardgrid/jobs/gpu4060/plan/original-parallel-plan.json" in script
+    assert "/var/tmp/shardgrid/jobs/gpu4060/plan/captured-context.json" in script
+    assert '\\"RANK\\": \\"0\\"' in script
+    assert '\\"WORLD_SIZE\\": \\"3\\"' in script
+    assert '\\"CUDA_VISIBLE_DEVICES\\": \\"0\\"' in script
+    assert (
+        '\\"SHARDGRID_RUNTIME_BOOTSTRAP_ENTRY\\": '
+        '\\"shardgrid.runtime.generic_bootstrap\\"'
+    ) in script
+    assert "/var/tmp/shardgrid/jobs/gpu4060/plan/captured-graph.json" in script
 
 
 def test_duplicate_launch_protection_and_process_identity_are_per_job_worker_rank() -> None:
@@ -596,9 +675,7 @@ def test_prepare_structures_ssh_failures(
     expected_status: LauncherResultStatus,
 ) -> None:
     runtime = FakeRuntime(
-        run_results=[
-            _ok_result("python --version", stderr=stderr, exit_code=255)
-        ]
+        script_results=[_ok_result("probe", stderr=stderr, exit_code=255)]
     )
     launcher = SSHLauncher(
         replace(_cluster_config(), workers=_cluster_config().workers[:1]),

@@ -33,7 +33,7 @@ from shardgrid.common.enums import BackendStatus, FailureStage, JobState
 from shardgrid.common.errors import make_failure_record
 from shardgrid.common.process import ProcessResult, redact_text
 from shardgrid.control.status_store import StatusStore
-from shardgrid.distributed.backend import select_backend
+from shardgrid.distributed.backend import BackendError, select_backend
 from shardgrid.jobs.models import FailureRecord, JobStatus
 from shardgrid.launchers.base import (
     Launcher,
@@ -59,6 +59,7 @@ _FORWARD_MARKER = "T072_FORWARD_EVIDENCE "
 _BACKWARD_MARKER = "T073_BACKWARD_EVIDENCE "
 _TRAIN_MARKER = "T074_TRAIN_EVIDENCE "
 _GENERIC_DAG_PROBE_MARKER = "GENERIC_DAG_PROBE_EVIDENCE "
+_GENERIC_RUNTIME_BOOTSTRAP_MODULE = "shardgrid.runtime.generic_bootstrap"
 
 _PROBE_RENDEZVOUS_PHASES = frozenset(
     {
@@ -128,6 +129,29 @@ def _clip_marker_payload(text: str, *, limit: int = 160) -> tuple[str, str]:
     if len(text) <= limit:
         return text, text
     return text[:limit], text[-limit:]
+
+
+def _is_generic_runtime_bootstrap_command(command: str | None) -> bool:
+    return _is_generic_runtime_bootstrap_argv(shlex.split(command or ""))
+
+
+def _is_generic_runtime_bootstrap_argv(argv: Sequence[str]) -> bool:
+    return (
+        len(argv) >= 3
+        and "python" in Path(argv[0]).name.lower()
+        and argv[1] == "-m"
+        and argv[2] == _GENERIC_RUNTIME_BOOTSTRAP_MODULE
+    )
+
+
+def _remote_plan_artifact(remote_root: str, artifact: str) -> str:
+    path = PurePosixPath(artifact)
+    name = path.name
+    if name in {"original-parallel-plan.json", "captured-context.json"}:
+        return str(PurePosixPath(remote_root) / "plan" / name)
+    if not path.is_absolute() and path.parts[:1] == ("plan",):
+        return str(PurePosixPath(remote_root) / path)
+    return artifact
 
 
 @dataclass(frozen=True)
@@ -1273,6 +1297,10 @@ class SSHLauncher(Launcher):
         code_root = Path(context.snapshot.code_path)
         entrypoints: dict[str, list[str]] = {}
         for assignment in context.execution_plan.workers:
+            worker_id = str(assignment.worker_id)
+            if _is_generic_runtime_bootstrap_command(assignment.launch_command):
+                entrypoints.setdefault(worker_id, [])
+                continue
             entrypoint = self._entrypoint_from_assignment(assignment.launch_command)
             if entrypoint is None:
                 raise ValueError(
@@ -1284,7 +1312,7 @@ class SSHLauncher(Launcher):
                 raise ValueError(
                     f"snapshot entry point is missing for rank {assignment.rank}: {entrypoint}"
                 )
-            entrypoints.setdefault(str(assignment.worker_id), []).append(entrypoint)
+            entrypoints.setdefault(worker_id, []).append(entrypoint)
         return {worker_id: tuple(dict.fromkeys(items)) for worker_id, items in entrypoints.items()}
 
     def _entrypoint_from_assignment(self, launch_command: str | None) -> str | None:
@@ -3867,6 +3895,9 @@ class SSHLauncher(Launcher):
         argv = shlex.split(assignment.launch_command or "")
         if not argv:
             return ()
+        generic_argv = self._generic_runtime_launch_argv(worker, argv, remote_code_root)
+        if generic_argv is not None:
+            return generic_argv
         entrypoint = self._entrypoint_from_assignment(assignment.launch_command)
         if entrypoint is None:
             return tuple(argv)
@@ -3875,6 +3906,27 @@ class SSHLauncher(Launcher):
             resolved = [self._python_executable(worker), remote_entrypoint, *argv[2:]]
         else:
             resolved = [remote_entrypoint, *argv[1:]]
+        return tuple(resolved)
+
+    def _generic_runtime_launch_argv(
+        self,
+        worker: WorkerConfig,
+        argv: Sequence[str],
+        remote_code_root: str,
+    ) -> tuple[str, ...] | None:
+        if not _is_generic_runtime_bootstrap_argv(argv):
+            return None
+        remote_root = str(PurePosixPath(remote_code_root).parent)
+        resolved = [self._python_executable(worker), "-m", _GENERIC_RUNTIME_BOOTSTRAP_MODULE]
+        index = 3
+        while index < len(argv):
+            item = argv[index]
+            if item in {"--plan-artifact", "--context-artifact"} and index + 1 < len(argv):
+                resolved.extend([item, _remote_plan_artifact(remote_root, argv[index + 1])])
+                index += 2
+                continue
+            resolved.append(item)
+            index += 1
         return tuple(resolved)
 
     def _launch_env(
@@ -3907,8 +3959,31 @@ class SSHLauncher(Launcher):
                 **network_env,
             }
         )
-        backend = select_backend(str(context.execution_plan.backend))
+        try:
+            backend = select_backend(str(context.execution_plan.backend))
+        except BackendError:
+            backend = select_backend(
+                str(self.cluster_config.backend_preference.communication_backend)
+            )
         env.setdefault("SHARDGRID_BACKEND", backend)
+        if _is_generic_runtime_bootstrap_command(assignment.launch_command):
+            remote_root = str(PurePosixPath(remote_code_root).parent)
+            env.update(
+                {
+                    "SHARDGRID_RUNTIME_BOOTSTRAP_ENTRY": (
+                        _GENERIC_RUNTIME_BOOTSTRAP_MODULE
+                    ),
+                    "SHARDGRID_EXACT_PLAN_ARTIFACT": str(
+                        PurePosixPath(remote_root) / "plan" / "original-parallel-plan.json"
+                    ),
+                    "SHARDGRID_CAPTURED_CONTEXT_ARTIFACT": str(
+                        PurePosixPath(remote_root) / "plan" / "captured-context.json"
+                    ),
+                    "SHARDGRID_GRAPH_ARTIFACT": str(
+                        PurePosixPath(remote_root) / "plan" / "captured-graph.json"
+                    ),
+                }
+            )
         env.setdefault("GLOO_SOCKET_IFNAME", env.get("GLOO_SOCKET_IFNAME", ""))
         env.setdefault("NCCL_SOCKET_IFNAME", env.get("NCCL_SOCKET_IFNAME", ""))
         return env
