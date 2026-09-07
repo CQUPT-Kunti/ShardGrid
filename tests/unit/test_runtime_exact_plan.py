@@ -41,6 +41,8 @@ def test_runtime_compiles_exact_planner_ownership_and_placement() -> None:
     assert worker_b.gpu_index == 0
     assert worker_b.owned_partitions == ("partition-a", "partition-c")
     assert worker_b.local_parameter_ids == ("p0", "p2")
+    assert runtime_plan.logical_partitions == logical.partitions
+    assert runtime_plan.placements == placement.placements
 
 
 def test_runtime_edges_preserve_planner_boundary_values() -> None:
@@ -59,6 +61,10 @@ def test_runtime_edges_preserve_planner_boundary_values() -> None:
     assert first.consumer_worker_id == "worker-a"
     assert first.producer_gpu_id == "gpu-b0"
     assert first.consumer_gpu_id == "gpu-a1"
+    assert first.shape == (4, 8)
+    assert first.dtype == "float32"
+    assert first.forward_transfer_bytes == 128
+    assert first.backward_transfer_bytes == 128
     assert second.edge_kind is EdgeKind.REMOTE
     assert second.producer_worker_id == "worker-a"
     assert second.consumer_worker_id == "worker-b"
@@ -91,6 +97,14 @@ def test_runtime_rejects_graph_fingerprint_mismatch(field: str) -> None:
         placement = replace(placement, graph_fingerprint="other-graph")
 
     with pytest.raises(ValueError, match="PLAN_VALIDATION_FAILURE.*fingerprint mismatch"):
+        compile_runtime_plan(graph, logical, placement)
+
+
+def test_runtime_rejects_non_exact_placement_coverage() -> None:
+    graph, logical, placement = _exact_plan_fixture()
+    placement = replace(placement, placements=placement.placements[:-1])
+
+    with pytest.raises(ValueError, match="PLAN_VALIDATION_FAILURE.*cover logical partitions"):
         compile_runtime_plan(graph, logical, placement)
 
 
@@ -133,14 +147,48 @@ def _exact_plan_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, Placeme
         ),
         values=(
             GraphValueSpec("input", None, ("n0",)),
-            GraphValueSpec("v0", "n0", ("n1", "n2")),
-            GraphValueSpec("v1", "n1", ("n2",)),
-            GraphValueSpec("v2", "n2", ()),
+            GraphValueSpec(
+                "v0",
+                "n0",
+                ("n1", "n2"),
+                shape=(4, 8),
+                dtype="float32",
+                requires_grad=True,
+                estimated_bytes=128,
+            ),
+            GraphValueSpec(
+                "v1",
+                "n1",
+                ("n2",),
+                shape=(4, 8),
+                dtype="float32",
+                requires_grad=True,
+                estimated_bytes=128,
+            ),
+            GraphValueSpec("v2", "n2", (), shape=(4, 2), dtype="float32"),
         ),
         edges=(
-            GraphEdgeSpec("n0", "n1", "v0"),
-            GraphEdgeSpec("n0", "n2", "v0"),
-            GraphEdgeSpec("n1", "n2", "v1"),
+            GraphEdgeSpec(
+                "n0",
+                "n1",
+                "v0",
+                forward_transfer_bytes=128,
+                backward_transfer_bytes=128,
+            ),
+            GraphEdgeSpec(
+                "n0",
+                "n2",
+                "v0",
+                forward_transfer_bytes=128,
+                backward_transfer_bytes=128,
+            ),
+            GraphEdgeSpec(
+                "n1",
+                "n2",
+                "v1",
+                forward_transfer_bytes=128,
+                backward_transfer_bytes=128,
+            ),
         ),
         states=(
             StateObjectSpec("p0", "parameter", "encoder.weight"),

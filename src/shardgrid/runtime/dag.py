@@ -17,6 +17,7 @@ from shardgrid.planner.planning_contract import (
     LogicalPartitionPlan,
     LogicalPartitionSpec,
     PlacementPlan,
+    PlacementSpec,
 )
 
 TensorMap = dict[str, Any]
@@ -60,6 +61,11 @@ class RuntimeEdgeSpec:
     consumer_worker_id: str
     producer_gpu_id: str
     consumer_gpu_id: str
+    shape: tuple[int | str, ...] = ()
+    dtype: str | None = None
+    requires_grad: bool | None = None
+    forward_transfer_bytes: int = 0
+    backward_transfer_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,12 +79,18 @@ class RuntimePlan:
     graph_fingerprint: str
     ownership: WorkerOwnershipPlan
     edges: tuple[RuntimeEdgeSpec, ...]
+    logical_partitions: tuple[LogicalPartitionSpec, ...] = ()
+    placements: tuple[PlacementSpec, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "graph_fingerprint": self.graph_fingerprint,
             "ownership": self.ownership.to_dict(),
             "edges": [edge.to_dict() for edge in self.edges],
+            "logical_partitions": [
+                partition.to_dict() for partition in self.logical_partitions
+            ],
+            "placements": [placement.__dict__ for placement in self.placements],
         }
 
 
@@ -228,6 +240,13 @@ def compile_runtime_plan(
     if placement.graph_fingerprint != graph.graph_fingerprint:
         raise ValueError("PLAN_VALIDATION_FAILURE: placement plan graph fingerprint mismatch")
     partition_by_id = {partition.partition_id: partition for partition in logical.partitions}
+    if len(partition_by_id) != len(logical.partitions):
+        raise ValueError("PLAN_VALIDATION_FAILURE: duplicate logical partition ids")
+    placed_partition_ids = [placed.partition_id for placed in placement.placements]
+    if len(set(placed_partition_ids)) != len(placed_partition_ids):
+        raise ValueError("PLAN_VALIDATION_FAILURE: duplicate placement partition ids")
+    if set(placed_partition_ids) != set(partition_by_id):
+        raise ValueError("PLAN_VALIDATION_FAILURE: placement must cover logical partitions")
     partition_by_node = {
         node_id: partition.partition_id
         for partition in logical.partitions
@@ -236,6 +255,7 @@ def compile_runtime_plan(
     placement_by_partition = {
         placed.partition_id: placed for placed in placement.placements
     }
+    value_by_id = {value.value_id: value for value in graph.values}
     worker_groups: dict[tuple[str, int, str], list[LogicalPartitionSpec]] = {}
     for placed in placement.placements:
         partition = partition_by_id[placed.partition_id]
@@ -294,6 +314,7 @@ def compile_runtime_plan(
             continue
         source = placement_by_partition[source_partition]
         target = placement_by_partition[target_partition]
+        value = value_by_id.get(edge.value_id)
         same_device = (
             source.worker_id == target.worker_id
             and source.gpu_index == target.gpu_index
@@ -309,12 +330,19 @@ def compile_runtime_plan(
                 consumer_worker_id=target.worker_id,
                 producer_gpu_id=source.gpu_id,
                 consumer_gpu_id=target.gpu_id,
+                shape=() if value is None else value.shape,
+                dtype=None if value is None else value.dtype,
+                requires_grad=None if value is None else value.requires_grad,
+                forward_transfer_bytes=edge.forward_transfer_bytes,
+                backward_transfer_bytes=edge.backward_transfer_bytes,
             )
         )
     return RuntimePlan(
         graph_fingerprint=graph.graph_fingerprint,
         ownership=ownership,
         edges=tuple(edges),
+        logical_partitions=tuple(logical.partitions),
+        placements=tuple(placement.placements),
     )
 
 
