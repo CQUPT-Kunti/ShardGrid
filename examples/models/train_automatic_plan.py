@@ -1,4 +1,4 @@
-"""Automatic-plan multi-host training runner.
+"""Legacy/example automatic-plan multi-host training runner.
 
 This runner consumes the preserved `ParallelPlan`/`ExecutionPlan` from the
 distributed snapshot and trains exactly the stage assigned to the current rank.
@@ -16,7 +16,6 @@ import signal
 import socket
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +23,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed.pipelining import PipelineStage, ScheduleGPipe, SplitPoint, pipeline
 
-from examples.models.minimal_transformer import (
-    MinimalTransformerConfig,
-    build_minimal_transformer,
-)
 from examples.models.large_residual_transformer import (
     LargeResidualTransformerConfig,
     build_large_residual_transformer,
@@ -35,6 +30,10 @@ from examples.models.large_residual_transformer import (
     make_large_residual_batch,
     make_large_residual_stage_inputs,
     required_boundary_state_names,
+)
+from examples.models.minimal_transformer import (
+    MinimalTransformerConfig,
+    build_minimal_transformer,
 )
 from examples.models.partition_stress_model import (
     PartitionStressConfig,

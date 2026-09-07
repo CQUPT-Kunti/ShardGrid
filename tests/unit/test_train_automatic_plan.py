@@ -3,10 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
-from examples.models import train_generic_dag
+from examples.models import train_automatic_plan, train_generic_dag
 from examples.models.train_automatic_plan import (
     _automatic_batch_sizes,
     _build_large_stage_module,
+    _build_model,
 )
 
 from shardgrid.common.config import TrainingConfig
@@ -170,3 +171,35 @@ def test_generic_dag_runtime_remains_example_regression_asset() -> None:
     assert train_generic_dag.EVENT_MARKER == "GENERIC_DAG_RUNTIME_EVIDENCE "
     assert train_generic_dag.build_zoo_model is not None
     assert train_generic_dag.make_zoo_sample is not None
+
+
+def test_automatic_plan_runtime_remains_legacy_example_compatibility_asset() -> None:
+    assert "Legacy/example" in (train_automatic_plan.__doc__ or "")
+    assert train_automatic_plan.EVENT_MARKER == "STAGE_PLACEMENT_EVIDENCE "
+    assert _build_model(_large_training_config()).__class__.__name__ == "LargeResidualTransformer"
+
+
+def test_automatic_plan_runtime_rejects_non_legacy_generic_contract() -> None:
+    config = TrainingConfig.from_dict(
+        {
+            "job": {
+                "name": "generic-production",
+                "backend": "ssh",
+                "communication_backend": "gloo",
+            },
+            "model": {
+                "name": "ordinary-user-model",
+                "type": "captured_context",
+                "parameters": {},
+            },
+            "resources": {"world_size": 1},
+            "planning": {"mode": "automatic"},
+        }
+    )
+
+    try:
+        _build_model(config)
+    except ValueError as exc:
+        assert "unsupported automatic training model.type" in str(exc)
+    else:
+        raise AssertionError("legacy example script must not define production generic runtime")
