@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from shardgrid.artifacts.snapshot import create_code_snapshot
+from shardgrid.artifacts.snapshot import create_code_snapshot, write_capture_context
 from shardgrid.artifacts.store import ArtifactStore
 from shardgrid.common.models import as_backend_name, as_job_id
+from shardgrid.common.serialization import stable_json_dumps
 from shardgrid.control.job_manager import create_training_job
 
 _SECRET = "TEST_PASSWORD_DO_NOT_LEAK"
@@ -128,3 +129,36 @@ def test_symlink_escape_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="symlink"):
         create_code_snapshot(snapshot, source_root=source_root)
+
+
+def test_capture_context_json_serialization_is_deterministic(tmp_path: Path) -> None:
+    snapshot = _job_snapshot(tmp_path)
+    payload = {
+        "tensor_metadata": {
+            "kwarg.input_ids": {"dtype": "torch.int64", "shape": [2, 5]},
+            "arg0": {"dtype": "torch.float32", "shape": [3, 4]},
+        },
+        "entrypoint_path": "train.py",
+        "argv": ("--epochs", "1"),
+    }
+
+    first = write_capture_context(snapshot, payload).read_text(encoding="utf-8")
+    second = stable_json_dumps(
+        {
+            "argv": ["--epochs", "1"],
+            "entrypoint_path": "train.py",
+            "tensor_metadata": {
+                "arg0": {"shape": [3, 4], "dtype": "torch.float32"},
+                "kwarg.input_ids": {"shape": [2, 5], "dtype": "torch.int64"},
+            },
+        }
+    )
+
+    assert first == second
+
+
+def test_capture_context_json_rejects_arbitrary_live_python_objects(tmp_path: Path) -> None:
+    snapshot = _job_snapshot(tmp_path)
+
+    with pytest.raises(TypeError, match="live Python object"):
+        write_capture_context(snapshot, {"model": object()})

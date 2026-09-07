@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 from typing import Any
+
+from shardgrid.artifacts.snapshot import write_capture_context
+from shardgrid.jobs.models import JobSnapshot
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "ordinary_training_scripts"
 
@@ -18,6 +22,21 @@ def _capture(script_name: str, *argv: str) -> Any:
         argv=tuple(argv),
         cwd=FIXTURE_ROOT,
         environment={"SHARDGRID_TEST_CAPTURE": "1"},
+    )
+
+
+def _job_snapshot(tmp_path: Path) -> JobSnapshot:
+    root = tmp_path / "jobs" / "job-capture"
+    return JobSnapshot(
+        job_id="job-capture",
+        root_path=str(root),
+        code_path=str(root / "code"),
+        config_path=str(root / "config"),
+        plan_path=str(root / "plan"),
+        logs_path=str(root / "logs"),
+        environment_path=str(root / "environment"),
+        checkpoint_path=str(root / "checkpoint"),
+        diagnostics_path=str(root / "diagnostics"),
     )
 
 
@@ -116,6 +135,52 @@ def test_capture_contract_returns_structured_unsupported_diagnostics(tmp_path: P
     assert result.failure.message
     assert result.failure.artifact_log_ref
     assert "generic exception" not in result.failure.message.lower()
+
+
+def test_capture_context_is_persisted_to_snapshot_plan_artifact(tmp_path: Path) -> None:
+    context = _capture(
+        "kwargs_hf_mapping_train.py",
+        "--config",
+        "user-model.yaml",
+        "--checkpoint",
+        "out/mapping.pt",
+    )
+    snapshot = _job_snapshot(tmp_path)
+
+    output_path = write_capture_context(snapshot, context)
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert output_path == Path(snapshot.plan_path) / "capture-context.json"
+    assert payload["entrypoint_path"].endswith("kwargs_hf_mapping_train.py")
+    assert payload["argv"] == ["--config", "user-model.yaml", "--checkpoint", "out/mapping.pt"]
+    assert payload["cwd"] == str(FIXTURE_ROOT)
+    assert payload["environment_summary"]["SHARDGRID_TEST_CAPTURE"] == "present"
+    assert payload["capture_backend"] == "torch-monkeypatch"
+    assert payload["capture_backend_version"] == "v1"
+    assert payload["model_identity"]["class_name"] == "KeywordClassifier"
+    assert payload["first_batch_structure"]["kind"] == "dict"
+    assert payload["model_call"]["kwargs"]["fields"]["input_ids"]["kind"] == "tensor"
+    assert payload["tensor_metadata"]["kwarg.input_ids"]["shape"] == [2, 5]
+    assert payload["optimizer"]["class_name"] == "AdamW"
+    assert payload["lifecycle"]["backward_called_before_optimizer_step"] is True
+    assert payload["state_dict_key_to_canonical_state_id"]["embedding.weight"] == "state:0000"
+
+
+def test_unsupported_capture_diagnostics_are_persisted_without_live_objects(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "unsupported_dynamic_control_flow_train.py"
+    script.write_text("raise RuntimeError('dynamic control flow unsupported')\n", encoding="utf-8")
+    result = _capture_module().capture_entrypoint(script, cwd=tmp_path, environment={})
+
+    output_path = write_capture_context(_job_snapshot(tmp_path), result)
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert payload["ok"] is False
+    assert payload["failure"]["stage"] == "capture"
+    assert payload["failure"]["code"] == "RuntimeError"
+    assert payload["failure"]["artifact_log_ref"] == "diagnostics/capture.json"
+    assert payload["context"] is None
 
 
 def test_ordinary_training_script_fixtures_do_not_import_shardgrid_user_api() -> None:

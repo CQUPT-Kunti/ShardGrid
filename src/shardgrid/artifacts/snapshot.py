@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePath
 from typing import Iterable, Sequence
 
+from shardgrid.common.serialization import stable_json_dumps
 from shardgrid.jobs.models import JobSnapshot
 
 DEFAULT_CODE_SNAPSHOT_INCLUDES = (
@@ -18,6 +19,7 @@ DEFAULT_CODE_SNAPSHOT_INCLUDES = (
     "examples/models",
 )
 _MANIFEST_NAME = ".shardgrid-code-snapshot.json"
+CAPTURE_CONTEXT_FILE = "capture-context.json"
 _TRANSIENT_NAMES = {
     "__pycache__",
     ".pytest_cache",
@@ -93,6 +95,21 @@ def create_code_snapshot(
     )
     manifest_path.write_text(json.dumps(snapshot.to_dict(), indent=2, sort_keys=True))
     return snapshot
+
+
+def write_capture_context(
+    job_snapshot: JobSnapshot,
+    capture_context: object,
+) -> Path:
+    snapshot_root = Path(job_snapshot.root_path).resolve()
+    plan_root = Path(job_snapshot.plan_path).resolve()
+    _ensure_contained(plan_root, snapshot_root)
+    plan_root.mkdir(parents=True, exist_ok=True)
+
+    output_path = plan_root / CAPTURE_CONTEXT_FILE
+    _ensure_contained(output_path, snapshot_root)
+    output_path.write_text(stable_json_dumps(capture_context), encoding="utf-8")
+    return output_path
 
 
 def _resolve_include(root: Path, include: str) -> Path:
