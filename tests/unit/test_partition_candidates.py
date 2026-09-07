@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -31,6 +32,7 @@ from shardgrid.planner.partitioning import (
     build_partition_profile,
     discover_partition_support,
     generate_partition_candidates,
+    validate_partition_candidate,
 )
 from shardgrid.planner.requirements import FeasibilityStatus
 
@@ -570,6 +572,166 @@ def test_graph_partitioning_shared_module_state_is_owned_once_and_read_only_late
     assert stages[1].read_only_state_ids == ("p0000", "p0001")
     assert stages[2].owned_state_ids == ("p0002", "p0003")
     assert not (set(stages[1].owned_state_ids) & set(stages[1].read_only_state_ids))
+
+
+def _validation_fixture(name: str, stage_count: int = 2):
+    case = _ordinary_case(name)
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    profile = _profile_case(case, name)
+    support = discover_partition_support(
+        case.module,
+        profile,
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        graph=graph,
+        memory_config=_memory_config(),
+        min_stage_count=stage_count,
+        max_stage_count=stage_count,
+    )
+    assert result.candidates
+    return profile, support, graph, result.candidates[0]
+
+
+def _validation_codes(result) -> set[str]:
+    return {violation.code for violation in result.violations}
+
+
+def test_validate_graph_candidate_accepts_legal_candidate() -> None:
+    profile, support, graph, candidate = _validation_fixture("residual")
+
+    result = validate_partition_candidate(profile, candidate, support, graph=graph)
+
+    assert result.valid
+    assert result.status == FeasibilityStatus.FEASIBLE
+
+
+def test_validate_graph_candidate_rejects_duplicate_execution_node() -> None:
+    profile, support, graph, candidate = _validation_fixture("residual")
+    stages = list(candidate.stages)
+    stages[1] = replace(
+        stages[1],
+        node_ids=stages[1].node_ids + (stages[0].node_ids[0],),
+    )
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    assert "duplicate_execution_node" in _validation_codes(result)
+
+
+def test_validate_graph_candidate_rejects_missing_execution_node() -> None:
+    profile, support, graph, candidate = _validation_fixture("residual")
+    stages = list(candidate.stages)
+    stages[0] = replace(stages[0], node_ids=stages[0].node_ids[1:])
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    assert "missing_execution_node" in _validation_codes(result)
+
+
+def test_validate_graph_candidate_rejects_duplicate_and_missing_state_owner() -> None:
+    profile, support, graph, candidate = _validation_fixture("shared_module", 3)
+    stages = list(candidate.stages)
+    stages[1] = replace(
+        stages[1],
+        owned_state_ids=stages[1].owned_state_ids + ("p0000",),
+        read_only_state_ids=tuple(
+            state_id for state_id in stages[1].read_only_state_ids if state_id != "p0000"
+        ),
+    )
+    duplicate = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    stages = list(candidate.stages)
+    stages[0] = replace(
+        stages[0],
+        owned_state_ids=tuple(
+            state_id for state_id in stages[0].owned_state_ids if state_id != "p0000"
+        ),
+    )
+    missing = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    assert "duplicate_state_owner" in _validation_codes(duplicate)
+    assert "missing_state_owner" in _validation_codes(missing)
+
+
+def test_validate_graph_candidate_rejects_read_only_owner_conflict() -> None:
+    profile, support, graph, candidate = _validation_fixture("shared_module", 3)
+    stages = list(candidate.stages)
+    stages[0] = replace(
+        stages[0],
+        read_only_state_ids=stages[0].read_only_state_ids + ("p0000",),
+    )
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    assert "state_read_owner_conflict" in _validation_codes(result)
+
+
+def test_validate_graph_candidate_rejects_ambiguous_shared_state_owner() -> None:
+    profile, support, graph, candidate = _validation_fixture("shared_tied_parameter", 2)
+    shared_state_id = next(state.canonical_state_id for state in graph.states)
+    stages = list(candidate.stages)
+    stages[1] = replace(
+        stages[1],
+        owned_state_ids=stages[1].owned_state_ids + (shared_state_id,),
+        read_only_state_ids=tuple(
+            state_id
+            for state_id in stages[1].read_only_state_ids
+            if state_id != shared_state_id
+        ),
+    )
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    codes = _validation_codes(result)
+    assert "duplicate_state_owner" in codes
+    assert "ambiguous_shared_state_owner" in codes
+
+
+def test_validate_graph_candidate_rejects_missing_boundary_value_metadata() -> None:
+    profile, support, graph, candidate = _validation_fixture("residual")
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, communication_edges=()),
+        support,
+        graph=graph,
+    )
+
+    assert "missing_boundary_value" in _validation_codes(result)
 
 
 class DynamicControlFlowModel(nn.Module):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -690,6 +691,7 @@ def validate_partition_candidate(
     profile: ModelProfile,
     candidate: PartitionCandidate,
     support: AutomaticPartitionSupport,
+    graph: CanonicalGraphIR | None = None,
 ) -> CandidateValidationResult:
     violations: list[ConstraintViolation] = []
     if candidate.stage_count != len(candidate.stages):
@@ -700,11 +702,18 @@ def validate_partition_candidate(
             )
         )
 
+    if graph is not None:
+        violations.extend(_validate_graph_candidate(candidate, graph))
+        expected_modules = ()
+    else:
+        expected_modules = profile.modules
+
     try:
         expected_modules = _ordered_modules_for_support(profile, support)
     except ValueError as exc:
-        violations.append(ConstraintViolation("module_order", str(exc)))
-        expected_modules = profile.modules
+        if graph is None:
+            violations.append(ConstraintViolation("module_order", str(exc)))
+            expected_modules = profile.modules
 
     covered_module_ids: list[str] = []
     covered_parameter_names: list[str] = []
@@ -729,7 +738,9 @@ def validate_partition_candidate(
                 )
             )
 
-    if tuple(covered_module_ids) != tuple(module.module_id for module in expected_modules):
+    if graph is None and tuple(covered_module_ids) != tuple(
+        module.module_id for module in expected_modules
+    ):
         violations.append(
             ConstraintViolation(
                 "module_coverage",
@@ -737,16 +748,17 @@ def validate_partition_candidate(
             )
         )
 
-    expected_parameters = sorted(
-        name for module in expected_modules for name in module.parameter_names
-    )
-    if sorted(covered_parameter_names) != expected_parameters:
-        violations.append(
-            ConstraintViolation(
-                "parameter_coverage",
-                "candidate parameters do not cover the full model exactly once",
-            )
+    if graph is None:
+        expected_parameters = sorted(
+            name for module in expected_modules for name in module.parameter_names
         )
+        if sorted(covered_parameter_names) != expected_parameters:
+            violations.append(
+                ConstraintViolation(
+                    "parameter_coverage",
+                    "candidate parameters do not cover the full model exactly once",
+                )
+            )
 
     boundary_map = {boundary.boundary_id: boundary for boundary in support.boundaries}
     for boundary_id in candidate.selected_boundary_ids:
@@ -769,6 +781,149 @@ def validate_partition_candidate(
         status=status,
         violations=tuple(violations),
     )
+
+
+def _validate_graph_candidate(
+    candidate: PartitionCandidate,
+    graph: CanonicalGraphIR,
+) -> tuple[ConstraintViolation, ...]:
+    violations: list[ConstraintViolation] = []
+    expected_nodes = tuple(node.node_id for node in graph.nodes if node.op_kind != "output")
+    covered_nodes = [node_id for stage in candidate.stages for node_id in stage.node_ids]
+    covered_counts = Counter(covered_nodes)
+    duplicate_nodes = sorted(node_id for node_id, count in covered_counts.items() if count > 1)
+    missing_nodes = sorted(set(expected_nodes) - set(covered_counts))
+    unknown_nodes = sorted(set(covered_counts) - set(expected_nodes))
+    if duplicate_nodes:
+        violations.append(
+            ConstraintViolation(
+                "duplicate_execution_node",
+                "execution nodes assigned to multiple stages: " + ", ".join(duplicate_nodes),
+            )
+        )
+    if missing_nodes:
+        violations.append(
+            ConstraintViolation(
+                "missing_execution_node",
+                "execution nodes missing from stages: " + ", ".join(missing_nodes),
+            )
+        )
+    if unknown_nodes:
+        violations.append(
+            ConstraintViolation(
+                "unknown_execution_node",
+                "candidate references unknown execution nodes: " + ", ".join(unknown_nodes),
+            )
+        )
+
+    owner_counts = Counter(
+        state_id for stage in candidate.stages for state_id in stage.owned_state_ids
+    )
+    required_state_ids = {state.canonical_state_id for state in graph.states}
+    duplicate_states = sorted(
+        state_id
+        for state_id, count in owner_counts.items()
+        if count > 1 and state_id in required_state_ids
+    )
+    missing_states = sorted(required_state_ids - set(owner_counts))
+    unknown_states = sorted(set(owner_counts) - required_state_ids)
+    if duplicate_states:
+        violations.append(
+            ConstraintViolation(
+                "duplicate_state_owner",
+                "states owned by multiple stages: " + ", ".join(duplicate_states),
+            )
+        )
+    if missing_states:
+        violations.append(
+            ConstraintViolation(
+                "missing_state_owner",
+                "states without an owning stage: " + ", ".join(missing_states),
+            )
+        )
+    if unknown_states:
+        violations.append(
+            ConstraintViolation(
+                "unknown_state_owner",
+                "candidate owns unknown states: " + ", ".join(unknown_states),
+            )
+        )
+
+    for stage in candidate.stages:
+        conflict = sorted(set(stage.owned_state_ids) & set(stage.read_only_state_ids))
+        if conflict:
+            violations.append(
+                ConstraintViolation(
+                    "state_read_owner_conflict",
+                    f"stage {stage.stage_id} both owns and reads states: "
+                    + ", ".join(conflict),
+                )
+            )
+
+    owners_by_shared_group: dict[str, set[str]] = defaultdict(set)
+    state_by_id = {state.canonical_state_id: state for state in graph.states}
+    for stage in candidate.stages:
+        for state_id in stage.owned_state_ids:
+            state = state_by_id.get(state_id)
+            if state is not None and state.shared_group_id is not None:
+                owners_by_shared_group[state.shared_group_id].add(stage.stage_id)
+    ambiguous_groups = sorted(
+        group_id for group_id, owners in owners_by_shared_group.items() if len(owners) > 1
+    )
+    if ambiguous_groups:
+        violations.append(
+            ConstraintViolation(
+                "ambiguous_shared_state_owner",
+                "shared/tied state groups owned by multiple stages: "
+                + ", ".join(ambiguous_groups),
+            )
+        )
+
+    violations.extend(_validate_graph_boundaries(candidate, graph))
+    return tuple(violations)
+
+
+def _validate_graph_boundaries(
+    candidate: PartitionCandidate,
+    graph: CanonicalGraphIR,
+) -> tuple[ConstraintViolation, ...]:
+    stage_by_node = {
+        node_id: stage.stage_id
+        for stage in candidate.stages
+        for node_id in stage.node_ids
+    }
+    stage_by_id = {stage.stage_id: stage for stage in candidate.stages}
+    edge_values = {
+        (edge.source_stage_id, edge.target_stage_id, tensor.name)
+        for edge in candidate.communication_edges
+        for tensor in edge.activation
+    }
+    violations: list[ConstraintViolation] = []
+    for edge in graph.edges:
+        source_stage_id = stage_by_node.get(edge.source_node_id)
+        target_stage_id = stage_by_node.get(edge.target_node_id)
+        if (
+            source_stage_id is None
+            or target_stage_id is None
+            or source_stage_id == target_stage_id
+        ):
+            continue
+        source_stage = stage_by_id[source_stage_id]
+        target_stage = stage_by_id[target_stage_id]
+        key = (source_stage_id, target_stage_id, edge.value_id)
+        if (
+            key not in edge_values
+            or edge.value_id not in source_stage.output_value_ids
+            or edge.value_id not in target_stage.input_value_ids
+        ):
+            violations.append(
+                ConstraintViolation(
+                    "missing_boundary_value",
+                    "cross-partition value lacks boundary metadata: "
+                    f"{edge.source_node_id}->{edge.target_node_id}:{edge.value_id}",
+                )
+            )
+    return tuple(violations)
 
 
 def build_partition_profile(
