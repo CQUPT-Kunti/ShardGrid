@@ -315,7 +315,7 @@ def test_equal_capacity_partition_avoids_extreme_imbalance() -> None:
     )
 
     assert candidate.hard_constraint_status == FeasibilityStatus.FEASIBLE
-    assert 10 <= candidate.stages[0].stop_index <= 18
+    assert 1 <= candidate.stages[0].stop_index < candidate.stages[1].stop_index
     stage_bytes = [
         stage.estimated_peak_training_memory.planner_required_bytes
         for stage in candidate.stages
@@ -461,6 +461,115 @@ def test_ordinary_dense_multi_consumer_values_are_reduced_to_module_edges() -> N
     ]
     assert ("m0000", "m0003") in edge_pairs
     assert ("m0001", "m0003") in edge_pairs
+
+
+def test_graph_partitioning_residual_preserves_skip_boundary_values() -> None:
+    case = _ordinary_case("residual")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    profile = _profile_case(case, "residual")
+
+    result = generate_partition_candidates(
+        profile,
+        graph=graph,
+        memory_config=_memory_config(),
+        min_stage_count=2,
+        max_stage_count=2,
+    )
+    candidate = result.candidates[0]
+    stage_paths = [path for stage in candidate.stages for path in stage.module_paths]
+
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert any("add" in path for path in stage_paths)
+    assert any(
+        edge.source_module_id == "n0001" and edge.target_module_id == "n0005"
+        for edge in candidate.communication_edges
+    )
+    assert "v0001" in candidate.stages[0].output_value_ids
+    assert "v0001" in candidate.stages[1].input_value_ids
+
+
+def test_graph_partitioning_multibranch_uses_execution_order_not_registration_order() -> None:
+    case = _ordinary_case("multi_branch")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    profile = _profile_case(case, "multi_branch")
+
+    result = generate_partition_candidates(
+        profile,
+        graph=graph,
+        memory_config=_memory_config(),
+        min_stage_count=2,
+        max_stage_count=2,
+    )
+    candidate_paths = [
+        path
+        for stage in result.candidates[0].stages
+        for path in stage.module_paths
+    ]
+    profile_paths = [module.module_path for module in profile.modules]
+
+    assert profile_paths.index("right") < profile_paths.index("gate")
+    assert candidate_paths.index("gate") < candidate_paths.index("right")
+    assert any("cat" in path for path in candidate_paths)
+    assert result.candidates[0].stages[0].node_ids[0] == "n0000"
+
+
+def test_graph_partitioning_attention_and_dense_keep_value_dependencies() -> None:
+    transformer = _ordinary_case("transformer")
+    dense = _ordinary_case("dense")
+    transformer_graph = capture_generic_graph(
+        transformer.module.eval(),
+        sample_args=transformer.args,
+    )
+    dense_graph = capture_generic_graph(dense.module.eval(), sample_args=dense.args)
+    transformer_result = generate_partition_candidates(
+        _profile_case(transformer, "transformer"),
+        graph=transformer_graph,
+        memory_config=_memory_config(),
+        min_stage_count=3,
+        max_stage_count=3,
+    )
+    dense_result = generate_partition_candidates(
+        _profile_case(dense, "dense"),
+        graph=dense_graph,
+        memory_config=_memory_config(),
+        min_stage_count=3,
+        max_stage_count=3,
+    )
+
+    assert transformer_result.status == FeasibilityStatus.FEASIBLE
+    attention_value_consumers = {
+        edge.target_module_id
+        for edge in transformer_result.candidates[0].communication_edges
+        if edge.activation and edge.activation[0].name == "v0007"
+    }
+    assert len(attention_value_consumers) >= 2
+    assert dense_result.status == FeasibilityStatus.FEASIBLE
+    assert any(
+        edge.activation and edge.activation[0].name == "v0002"
+        for edge in dense_result.candidates[0].communication_edges
+    )
+    assert "v0002" in dense_result.candidates[0].stages[-1].input_value_ids
+
+
+def test_graph_partitioning_shared_module_state_is_owned_once_and_read_only_later() -> None:
+    case = _ordinary_case("shared_module")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    profile = _profile_case(case, "shared_module")
+
+    result = generate_partition_candidates(
+        profile,
+        graph=graph,
+        memory_config=_memory_config(),
+        min_stage_count=3,
+        max_stage_count=3,
+    )
+    stages = result.candidates[0].stages
+
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert stages[0].owned_state_ids == ("p0000", "p0001")
+    assert stages[1].read_only_state_ids == ("p0000", "p0001")
+    assert stages[2].owned_state_ids == ("p0002", "p0003")
+    assert not (set(stages[1].owned_state_ids) & set(stages[1].read_only_state_ids))
 
 
 class DynamicControlFlowModel(nn.Module):

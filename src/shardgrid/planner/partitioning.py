@@ -16,10 +16,15 @@ from shardgrid.engines.models import (
     TrainingMemoryEstimate,
 )
 from shardgrid.planner.generic_graph import (
+    CanonicalGraphIR,
     FXGraphCaptureAdapter,
     module_dependencies_from_graph,
 )
-from shardgrid.planner.memory import MemoryEstimationConfig, estimate_stage_memory
+from shardgrid.planner.memory import (
+    MemoryEstimationConfig,
+    dtype_bytes,
+    estimate_stage_memory,
+)
 from shardgrid.planner.requirements import (
     ConstraintViolation,
     FeasibilityStatus,
@@ -44,6 +49,11 @@ class StagePartition:
     estimated_peak_training_memory: TrainingMemoryEstimate = TrainingMemoryEstimate()
     required_runtime: str | None = None
     required_backends: tuple[str, ...] = ()
+    node_ids: tuple[str, ...] = ()
+    input_value_ids: tuple[str, ...] = ()
+    output_value_ids: tuple[str, ...] = ()
+    owned_state_ids: tuple[str, ...] = ()
+    read_only_state_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.stage_id.strip():
@@ -72,6 +82,11 @@ class StagePartition:
             "estimated_peak_training_memory": self.estimated_peak_training_memory.to_dict(),
             "required_runtime": self.required_runtime,
             "required_backends": list(self.required_backends),
+            "node_ids": list(self.node_ids),
+            "input_value_ids": list(self.input_value_ids),
+            "output_value_ids": list(self.output_value_ids),
+            "owned_state_ids": list(self.owned_state_ids),
+            "read_only_state_ids": list(self.read_only_state_ids),
         }
 
 
@@ -286,6 +301,7 @@ def generate_partition_candidates(
     profile: ModelProfile,
     *,
     partition_support: AutomaticPartitionSupport | None = None,
+    graph: CanonicalGraphIR | None = None,
     memory_config: MemoryEstimationConfig | None = None,
     original_engine_plan_ref: str | None = None,
     usable_memory_bytes: Sequence[int] | int | None = None,
@@ -294,6 +310,27 @@ def generate_partition_candidates(
     max_candidates: int = 128,
 ) -> PartitionGenerationResult:
     support = partition_support or profile.partition_support
+    if graph is not None and support is not None and _blocks_graph_partitioning(support):
+        return PartitionGenerationResult(
+            model_profile_id=profile.profile_id,
+            engine_id=profile.engine_id,
+            status=_support_to_feasibility(support.status),
+            partition_support=support,
+            reasons=support.reasons,
+        )
+    if graph is not None:
+        return _generate_graph_partition_candidates(
+            profile,
+            graph,
+            partition_support=support,
+            memory_config=memory_config or MemoryEstimationConfig(),
+            original_engine_plan_ref=original_engine_plan_ref,
+            usable_memory_bytes=usable_memory_bytes,
+            min_stage_count=min_stage_count,
+            max_stage_count=max_stage_count,
+            max_candidates=max_candidates,
+        )
+
     if support is None:
         return PartitionGenerationResult(
             model_profile_id=profile.profile_id,
@@ -421,6 +458,234 @@ def generate_partition_candidates(
     )
 
 
+def _generate_graph_partition_candidates(
+    profile: ModelProfile,
+    graph: CanonicalGraphIR,
+    *,
+    partition_support: AutomaticPartitionSupport | None,
+    memory_config: MemoryEstimationConfig,
+    original_engine_plan_ref: str | None,
+    usable_memory_bytes: Sequence[int] | int | None,
+    min_stage_count: int,
+    max_stage_count: int | None,
+    max_candidates: int,
+) -> PartitionGenerationResult:
+    nodes = tuple(node for node in graph.nodes if node.op_kind != "output")
+    if not nodes:
+        return PartitionGenerationResult(
+            model_profile_id=profile.profile_id,
+            engine_id=profile.engine_id,
+            status=FeasibilityStatus.UNSUPPORTED,
+            partition_support=partition_support,
+            reasons=("no execution graph nodes available",),
+        )
+    capacities = _normalize_capacity_bytes(usable_memory_bytes)
+    if capacities and len(capacities) < min_stage_count:
+        return PartitionGenerationResult(
+            model_profile_id=profile.profile_id,
+            engine_id=profile.engine_id,
+            status=FeasibilityStatus.INFEASIBLE,
+            partition_support=partition_support,
+            reasons=("insufficient usable-memory capacity slots for requested stage count",),
+        )
+
+    upper = max_stage_count or min(len(nodes), len(capacities) if capacities else len(nodes))
+    upper = min(upper, len(nodes))
+    candidates: list[PartitionCandidate] = []
+    for stage_count in range(min_stage_count, upper + 1):
+        ranges = _balanced_node_ranges(nodes, stage_count)
+        candidate = _build_graph_candidate(
+            profile,
+            graph,
+            nodes,
+            ranges,
+            memory_config=memory_config,
+            original_engine_plan_ref=original_engine_plan_ref,
+            stage_capacities=capacities[:stage_count] if capacities else (),
+        )
+        candidates.append(candidate)
+        if len(candidates) >= max_candidates:
+            break
+
+    ordered = tuple(sorted(candidates, key=_candidate_sort_key))
+    status = (
+        FeasibilityStatus.FEASIBLE
+        if any(
+            candidate.hard_constraint_status is FeasibilityStatus.FEASIBLE
+            for candidate in ordered
+        )
+        else FeasibilityStatus.INFEASIBLE
+    )
+    return PartitionGenerationResult(
+        model_profile_id=profile.profile_id,
+        engine_id=profile.engine_id,
+        status=status,
+        candidates=ordered,
+        partition_support=partition_support,
+        reasons=tuple(
+            sorted(
+                {
+                    reason
+                    for candidate in ordered
+                    for reason in candidate.rejection_reasons
+                }
+            )
+        )
+        if status is FeasibilityStatus.INFEASIBLE
+        else (),
+    )
+
+
+def _balanced_node_ranges(
+    nodes: Sequence[Any],
+    stage_count: int,
+) -> tuple[tuple[int, int], ...]:
+    total = sum(_graph_node_weight(node) for node in nodes)
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    running = 0
+    for index, node in enumerate(nodes):
+        remaining_nodes = len(nodes) - index - 1
+        remaining_stages = stage_count - len(ranges) - 1
+        running += _graph_node_weight(node)
+        target = total * (len(ranges) + 1) // stage_count
+        if (
+            len(ranges) < stage_count - 1
+            and remaining_nodes >= remaining_stages
+            and (running >= target or remaining_nodes == remaining_stages)
+        ):
+            ranges.append((start, index + 1))
+            start = index + 1
+    ranges.append((start, len(nodes)))
+    return tuple(ranges)
+
+
+def _build_graph_candidate(
+    profile: ModelProfile,
+    graph: CanonicalGraphIR,
+    nodes: Sequence[Any],
+    ranges: Sequence[tuple[int, int]],
+    *,
+    memory_config: MemoryEstimationConfig,
+    original_engine_plan_ref: str | None,
+    stage_capacities: Sequence[int],
+) -> PartitionCandidate:
+    node_to_stage: dict[str, str] = {}
+    stages: list[StagePartition] = []
+    value_by_id = {value.value_id: value for value in graph.values}
+    for stage_index, (start, stop) in enumerate(ranges):
+        stage_id = f"stage{stage_index}"
+        chunk = tuple(nodes[start:stop])
+        node_ids = tuple(node.node_id for node in chunk)
+        for node_id in node_ids:
+            node_to_stage[node_id] = stage_id
+        owned_state_ids, read_only_state_ids = _graph_stage_state_ids(graph, set(node_ids))
+        parameter_bytes, buffer_bytes = _graph_stage_state_bytes(
+            profile,
+            owned_state_ids,
+            kind="parameter",
+        ), _graph_stage_state_bytes(profile, owned_state_ids, kind="buffer")
+        trainable_count, trainable_bytes = _graph_stage_trainable_state(profile, owned_state_ids)
+        gradient_bytes = _graph_gradient_bytes(trainable_count, trainable_bytes, memory_config)
+        optimizer_bytes = _graph_optimizer_bytes(
+            trainable_count,
+            trainable_bytes,
+            memory_config,
+        )
+        state_memory = parameter_bytes + buffer_bytes
+        activation = sum(_graph_node_activation_bytes(node, value_by_id) for node in chunk)
+        temporary = int(activation * memory_config.temporary_buffer_factor)
+        peak = None
+        if gradient_bytes is not None and optimizer_bytes is not None:
+            peak = (
+                state_memory
+                + gradient_bytes
+                + optimizer_bytes
+                + activation
+                + temporary
+                + memory_config.runtime_overhead_bytes
+                + memory_config.communication_buffer_bytes
+            )
+        stages.append(
+            StagePartition(
+                stage_id=stage_id,
+                module_ids=node_ids,
+                module_paths=tuple(node.module_path or node.target for node in chunk),
+                start_index=start,
+                stop_index=stop,
+                parameter_names_or_ranges=tuple(
+                    state.state_dict_key
+                    for state in profile.state_memory
+                    if state.kind == "parameter"
+                    and state.canonical_state_id in owned_state_ids
+                ),
+                parameter_bytes=parameter_bytes,
+                gradient_bytes=gradient_bytes,
+                activation_bytes=activation,
+                estimated_compute_units=sum(
+                    node.estimated_compute_cost for node in chunk
+                ),
+                estimated_peak_training_memory=TrainingMemoryEstimate(
+                    parameter_bytes=parameter_bytes,
+                    gradient_bytes=gradient_bytes,
+                    optimizer_bytes=optimizer_bytes,
+                    activation_bytes=activation,
+                    temporary_bytes=temporary,
+                    runtime_overhead_bytes=memory_config.runtime_overhead_bytes,
+                    communication_buffer_bytes=memory_config.communication_buffer_bytes,
+                    estimated_peak_bytes=peak,
+                    safety_headroom_bytes=memory_config.safety_headroom_bytes,
+                    planner_required_bytes=(
+                        None if peak is None else peak + memory_config.safety_headroom_bytes
+                    ),
+                    estimate_kind=EstimateKind.ESTIMATED,
+                    source=memory_config.source,
+                ),
+                required_runtime=profile.required_runtime,
+                required_backends=profile.required_backends,
+                node_ids=node_ids,
+                input_value_ids=_stage_input_values(graph, set(node_ids)),
+                output_value_ids=_stage_output_values(graph, set(node_ids)),
+                owned_state_ids=owned_state_ids,
+                read_only_state_ids=read_only_state_ids,
+            )
+        )
+    edges = _graph_candidate_edges(graph, node_to_stage)
+    rejection_reasons = _capacity_reasons(tuple(stages), stage_capacities)
+    return PartitionCandidate(
+        candidate_id=_candidate_id(profile, stages),
+        model_profile_id=profile.profile_id,
+        stage_count=len(stages),
+        stages=tuple(stages),
+        communication_edges=edges,
+        estimated_bytes_per_step=_sum_edge_bytes(edges),
+        required_worker_count=len(stages),
+        hard_constraint_status=(
+            FeasibilityStatus.FEASIBLE
+            if not rejection_reasons
+            else FeasibilityStatus.INFEASIBLE
+        ),
+        rejection_reasons=rejection_reasons,
+        engine_id=profile.engine_id,
+        required_runtime=profile.required_runtime,
+        required_backends=profile.required_backends,
+        original_engine_plan_ref=original_engine_plan_ref,
+        score_breakdown={
+            "stage_count": len(stages),
+            "balance_penalty_bytes": _capacity_balance_penalty(tuple(stages), stage_capacities),
+            "communication_bytes": _sum_edge_bytes(edges) or -1,
+            "max_stage_required_bytes": max(
+                (
+                    stage.estimated_peak_training_memory.planner_required_bytes or 0
+                    for stage in stages
+                ),
+                default=0,
+            ),
+            "memory_shortfall_bytes": _capacity_shortfall(tuple(stages), stage_capacities),
+        },
+    )
+
+
 def validate_partition_candidate(
     profile: ModelProfile,
     candidate: PartitionCandidate,
@@ -518,6 +783,15 @@ def build_partition_profile(
     min_stage_count: int = 2,
     max_stage_count: int | None = None,
 ) -> PartitionGenerationResult:
+    graph: CanonicalGraphIR | None = None
+    try:
+        graph = FXGraphCaptureAdapter().capture(
+            model,
+            sample_args=sample_args,
+            sample_kwargs=sample_kwargs,
+        ).canonical_graph
+    except Exception:
+        graph = None
     support = discover_partition_support(
         model,
         profile,
@@ -527,6 +801,7 @@ def build_partition_profile(
     return generate_partition_candidates(
         _with_partition_support(profile, support),
         partition_support=support,
+        graph=graph,
         memory_config=memory_config,
         original_engine_plan_ref=original_engine_plan_ref,
         usable_memory_bytes=usable_memory_bytes,
@@ -692,6 +967,212 @@ def _candidate_communication_edges(
                 edge.target_module_id,
             ),
         )
+    )
+
+
+def _graph_candidate_edges(
+    graph: CanonicalGraphIR,
+    node_to_stage: Mapping[str, str],
+) -> tuple[StageCommunicationEdge, ...]:
+    value_by_id = {value.value_id: value for value in graph.values}
+    edges: list[StageCommunicationEdge] = []
+    for edge in graph.edges:
+        source_stage = node_to_stage.get(edge.source_node_id)
+        target_stage = node_to_stage.get(edge.target_node_id)
+        if source_stage is None or target_stage is None or source_stage == target_stage:
+            continue
+        value = value_by_id[edge.value_id]
+        tensor = TensorMetadata(
+            name=edge.value_id,
+            shape=value.shape,
+            dtype=value.dtype,
+            estimated_bytes=value.estimated_bytes,
+            estimate_kind=EstimateKind.ESTIMATED,
+            source="generic_graph",
+        )
+        estimated_bytes = (
+            edge.communication_weight
+            if edge.communication_weight > 0
+            else (
+                None
+                if value.estimated_bytes is None
+                else value.estimated_bytes * 2
+            )
+        )
+        edges.append(
+            StageCommunicationEdge(
+                source_stage_id=source_stage,
+                target_stage_id=target_stage,
+                source_module_id=edge.source_node_id,
+                target_module_id=edge.target_node_id,
+                activation=(tensor,),
+                gradient=(tensor,),
+                estimated_bytes_per_step=estimated_bytes,
+                estimate_kind=EstimateKind.ESTIMATED,
+            )
+        )
+    return tuple(edges)
+
+
+def _blocks_graph_partitioning(support: AutomaticPartitionSupport) -> bool:
+    if support.status is PartitionSupportStatus.SUPPORTED:
+        return False
+    return any("unsupported custom op" in reason for reason in support.reasons)
+
+
+def _graph_stage_state_ids(
+    graph: CanonicalGraphIR,
+    node_ids: set[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if not graph.states:
+        return (), ()
+    owned: set[str] = set()
+    read_only: set[str] = set()
+    for state in graph.states:
+        if not set(state.use_node_ids) & node_ids:
+            continue
+        if set(state.owner_node_ids) & node_ids:
+            owned.add(state.canonical_state_id)
+        else:
+            read_only.add(state.canonical_state_id)
+    return tuple(sorted(owned)), tuple(sorted(read_only - owned))
+
+
+def _stage_input_values(graph: CanonicalGraphIR, node_ids: set[str]) -> tuple[str, ...]:
+    produced = {
+        value_id
+        for node in graph.nodes
+        if node.node_id in node_ids
+        for value_id in node.output_value_ids
+    }
+    return tuple(
+        sorted(
+            {
+                value_id
+                for node in graph.nodes
+                if node.node_id in node_ids
+                for value_id in node.input_value_ids
+                if value_id not in produced
+            }
+        )
+    )
+
+
+def _stage_output_values(graph: CanonicalGraphIR, node_ids: set[str]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                value_id
+                for edge in graph.edges
+                if edge.source_node_id in node_ids and edge.target_node_id not in node_ids
+                for value_id in (edge.value_id,)
+            }
+            | {
+                value_id
+                for node in graph.nodes
+                if node.node_id in node_ids
+                for value_id in node.output_value_ids
+                if value_id in graph.output_value_ids
+            }
+        )
+    )
+
+
+def _graph_stage_state_bytes(
+    profile: ModelProfile,
+    state_ids: Sequence[str],
+    *,
+    kind: str,
+) -> int:
+    wanted = set(state_ids)
+    return sum(
+        state.bytes
+        for state in profile.state_memory
+        if state.kind == kind
+        and state.canonical_state_id in wanted
+        and state.checkpoint_owner_key == state.state_dict_key
+    )
+
+
+def _graph_stage_trainable_state(
+    profile: ModelProfile,
+    state_ids: Sequence[str],
+) -> tuple[int, int]:
+    wanted = set(state_ids)
+    count = 0
+    bytes_total = 0
+    for state in profile.state_memory:
+        if (
+            state.kind == "parameter"
+            and state.requires_grad
+            and state.canonical_state_id in wanted
+            and state.checkpoint_owner_key == state.state_dict_key
+        ):
+            count += _state_numel(state.bytes)
+            bytes_total += state.bytes
+    return count, bytes_total
+
+
+def _state_numel(byte_count: int) -> int:
+    return byte_count // 4
+
+
+def _graph_gradient_bytes(
+    trainable_parameter_count: int,
+    trainable_parameter_bytes: int,
+    config: MemoryEstimationConfig,
+) -> int | None:
+    if config.gradient_dtype is None:
+        return trainable_parameter_bytes
+    size = dtype_bytes(config.gradient_dtype)
+    return None if size is None else trainable_parameter_count * size
+
+
+def _graph_optimizer_bytes(
+    trainable_parameter_count: int,
+    trainable_parameter_bytes: int,
+    config: MemoryEstimationConfig,
+) -> int | None:
+    master_weight_bytes = 0
+    if config.master_weight_dtype is not None:
+        master_size = dtype_bytes(config.master_weight_dtype)
+        if master_size is None:
+            return None
+        master_weight_bytes = trainable_parameter_count * master_size
+    optimizer = config.optimizer_type.strip().lower()
+    if optimizer in {"adam", "adamw"}:
+        state_size = dtype_bytes(config.optimizer_state_dtype)
+        return (
+            None
+            if state_size is None
+            else trainable_parameter_count * state_size * 2 + master_weight_bytes
+        )
+    if optimizer == "sgd":
+        momentum = float(config.optimizer_kwargs.get("momentum", 0.0) or 0.0)
+        if momentum <= 0:
+            return master_weight_bytes
+        state_size = dtype_bytes(config.optimizer_state_dtype)
+        return (
+            None
+            if state_size is None
+            else trainable_parameter_count * state_size + master_weight_bytes
+        )
+    del trainable_parameter_bytes
+    return None
+
+
+def _graph_node_weight(node: Any) -> int:
+    return max(int(getattr(node, "estimated_peak_memory_contribution", 0)), 1)
+
+
+def _graph_node_activation_bytes(
+    node: Any,
+    value_by_id: Mapping[str, Any],
+) -> int:
+    return sum(
+        value_by_id[value_id].estimated_bytes or 0
+        for value_id in node.output_value_ids
+        if value_id in value_by_id
     )
 
 
@@ -1323,6 +1804,14 @@ def _with_partition_support(
         required_runtime=profile.required_runtime,
         required_backends=profile.required_backends,
         total_memory=profile.total_memory,
+        execution_costs=profile.execution_costs,
+        graph_value_costs=profile.graph_value_costs,
+        state_memory=profile.state_memory,
+        state_parameter_bytes=profile.state_parameter_bytes,
+        state_buffer_bytes=profile.state_buffer_bytes,
+        graph_value_activation_bytes=profile.graph_value_activation_bytes,
+        execution_activation_bytes=profile.execution_activation_bytes,
+        execution_temporary_bytes=profile.execution_temporary_bytes,
         evidence_paths=profile.evidence_paths,
         diagnostics=profile.diagnostics,
     )
