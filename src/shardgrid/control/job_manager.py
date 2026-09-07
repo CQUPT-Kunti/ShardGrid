@@ -3801,11 +3801,10 @@ class JobManager:
                     f"checkpoint shard world_size mismatch for rank {assignment.rank}"
                 )
             local_path = Path(artifact.local_path).resolve()
-            if training_config.model.type == "generic_dag":
-                checkpoint_metadata = {
-                    **self._generic_checkpoint_metadata_from_shard(local_path),
-                    **checkpoint_metadata,
-                }
+            checkpoint_metadata = {
+                **self._generic_checkpoint_metadata_from_shard(local_path),
+                **checkpoint_metadata,
+            }
             shard = {
                 "worker_id": str(assignment.worker_id),
                 "rank": assignment.rank,
@@ -3832,6 +3831,18 @@ class JobManager:
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict):
             return {}
+        if payload.get("schema_version") == "shardgrid.generic_dag_checkpoint.v1":
+            return {
+                "checkpoint_schema_version": payload["schema_version"],
+                "graph_fingerprint": payload.get("graph_fingerprint"),
+                "plan_id": payload.get("plan_id"),
+                "step": payload.get("training_step"),
+                "rank": payload.get("rank"),
+                "worker_id": payload.get("worker_id"),
+                "gpu_index": payload.get("gpu_index"),
+                "gpu_id": payload.get("gpu_id"),
+                "owned_partition_ids": payload.get("owned_partition_ids", ()),
+            }
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
             return dict(metadata)
@@ -3887,14 +3898,32 @@ class JobManager:
         manifest_ref: str,
         device: str,
     ) -> str | None:
-        if training_config.model.type == "generic_dag":
-            return self._write_generic_dag_model_state(
+        if self._checkpoint_shards_are_generic(shards):
+            return self._write_generic_model_state(
                 snapshot=snapshot,
-                training_config=training_config,
                 current=current,
                 shards=shards,
                 manifest_ref=manifest_ref,
             )
+        return self._write_legacy_consolidated_model(
+            snapshot=snapshot,
+            training_config=training_config,
+            current=current,
+            shards=shards,
+            manifest_ref=manifest_ref,
+            device=device,
+        )
+
+    def _write_legacy_consolidated_model(
+        self,
+        *,
+        snapshot: JobSnapshot,
+        training_config: TrainingConfig,
+        current: JobStatus,
+        shards: Sequence[dict[str, object]],
+        manifest_ref: str,
+        device: str,
+    ) -> str | None:
         if training_config.model.type != "minimal_sequential":
             return None
 
@@ -3989,42 +4018,35 @@ class JobManager:
         full_model.load_state_dict(reloaded["model_state_dict"], strict=True)
         return consolidated_ref
 
-    def _write_generic_dag_model_state(
+    def _checkpoint_shards_are_generic(self, shards: Sequence[dict[str, object]]) -> bool:
+        return bool(shards) and all(
+            isinstance(shard.get("checkpoint_metadata"), dict)
+            and shard["checkpoint_metadata"].get("checkpoint_schema_version")
+            == "shardgrid.generic_dag_checkpoint.v1"
+            for shard in shards
+        )
+
+    def _write_generic_model_state(
         self,
         *,
         snapshot: JobSnapshot,
-        training_config: TrainingConfig,
         current: JobStatus,
         shards: Sequence[dict[str, object]],
         manifest_ref: str,
     ) -> str:
-        import torch
-        from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_sample
-
         from shardgrid.runtime.checkpoint import consolidate_worker_state_shards
 
-        zoo_model = str(training_config.model.parameters.get("zoo_model", "mini_unet"))
-        model_kwargs = self._generic_dag_model_kwargs(training_config)
-        full_model = build_zoo_model(zoo_model, **model_kwargs)
-        expected_state = full_model.state_dict()
         output_ref = "checkpoint/model-state.pt"
         output_path = Path(snapshot.checkpoint_path) / "model-state.pt"
         payload = consolidate_worker_state_shards(
             [Path(str(shard["local_path"])) for shard in shards],
             output_path,
-            expected_state_keys=tuple(expected_state),
+            expected_graph_fingerprint=str(
+                shards[0]["checkpoint_metadata"].get("graph_fingerprint")
+            ),
+            expected_plan_id=str(shards[0]["checkpoint_metadata"].get("plan_id")),
+            expected_training_step=int(shards[0]["checkpoint_metadata"].get("step", 0)),
         )
-        for key, expected in expected_state.items():
-            actual = payload["state_dict"][key]
-            if tuple(actual.shape) != tuple(expected.shape):
-                raise ValueError(f"checkpoint tensor shape mismatch for {key}")
-            if actual.dtype != expected.dtype:
-                raise ValueError(f"checkpoint tensor dtype mismatch for {key}")
-        load_result = full_model.load_state_dict(payload["state_dict"], strict=True)
-        sample_args, sample_kwargs = make_zoo_sample(zoo_model, **model_kwargs)
-        full_model.eval()
-        with torch.no_grad():
-            output = full_model(*sample_args, **sample_kwargs)
         training_evidence = payload.get("training_evidence")
         if not isinstance(training_evidence, dict):
             training_evidence = {
@@ -4032,25 +4054,23 @@ class JobManager:
                 "any_parameter_changed": False,
                 "all_trainable_workers_parameter_changed": False,
             }
-        payload.update(
-            {
-                "format": "shardgrid-generic-dag-model-state/v1",
-                "job_id": str(current.job_id),
-                "model_name": training_config.model.name,
-                "model_type": training_config.model.type,
-                "zoo_model": zoo_model,
-                "model_config": training_config.to_dict()["model"],
-                "checkpoint_ref": manifest_ref,
-                "final_metrics": dict(current.final_metrics),
-                "strict_load_missing_keys": list(load_result.missing_keys),
-                "strict_load_unexpected_keys": list(load_result.unexpected_keys),
-                "validation_forward_passed": _contains_tensor(output),
-                "training_evidence": training_evidence,
-                "parameter_changed": bool(training_evidence["any_parameter_changed"]),
-                "final_model_path": str(output_path.resolve()),
-            }
+        metadata_path = Path(snapshot.checkpoint_path) / "model-state-metadata.json"
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "format": "shardgrid-generic-model-state/v1",
+                    "job_id": str(current.job_id),
+                    "checkpoint_ref": manifest_ref,
+                    "final_metrics": dict(current.final_metrics),
+                    "training_evidence": training_evidence,
+                    "parameter_changed": bool(training_evidence["any_parameter_changed"]),
+                    "final_model_path": str(output_path.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
         )
-        torch.save(payload, output_path)
         print(f"FINAL_MODEL_PATH={output_path.resolve()}", flush=True)
         return output_ref
 

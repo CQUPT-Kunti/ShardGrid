@@ -4,7 +4,7 @@ import importlib.util
 import inspect
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -433,12 +433,54 @@ def test_tied_parameter_checkpoint_currently_keeps_only_canonical_state_key(
 
 def test_job_manager_consolidated_model_finalization_is_model_specific() -> None:
     consolidated_source = inspect.getsource(JobManager._write_consolidated_model)
-    generic_source = inspect.getsource(JobManager._write_generic_dag_model_state)
+    generic_source = inspect.getsource(JobManager._write_generic_model_state)
 
-    assert "training_config.model.type" in consolidated_source
-    assert '"minimal_sequential"' in consolidated_source
-    assert '"generic_dag"' in consolidated_source
-    assert "MinimalTransformer" in consolidated_source
-    assert "build_zoo_model" in generic_source
-    assert "make_zoo_sample" in generic_source
-    assert "load_state_dict" in generic_source
+    assert "training_config.model.type" not in consolidated_source
+    assert "build_zoo_model" not in generic_source
+    assert "make_zoo_sample" not in generic_source
+    assert "load_state_dict" not in generic_source
+
+
+def test_job_manager_generic_checkpoint_finalization_writes_standard_state_dict(
+    tmp_path,
+) -> None:
+    case = _ordinary_case("sequential")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    parameter_ids = _parameter_ids(graph)
+    runtime_plan = _runtime_plan(
+        graph,
+        worker0_parameters=parameter_ids[:2],
+        worker1_parameters=parameter_ids[2:],
+    )
+    shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
+    manager = object.__new__(JobManager)
+    shards = [
+        {
+            "local_path": str(path),
+            "checkpoint_metadata": manager._generic_checkpoint_metadata_from_shard(path),
+        }
+        for path in shard_paths
+    ]
+    snapshot = SimpleNamespace(checkpoint_path=str(tmp_path / "checkpoint"))
+    current = SimpleNamespace(job_id="job-test", final_metrics={"loss": 1.0})
+
+    ref = manager._write_consolidated_model(
+        snapshot=snapshot,
+        training_config=SimpleNamespace(),
+        current=current,
+        shards=shards,
+        manifest_ref="checkpoint/manifest.json",
+        device="cpu",
+    )
+
+    model_state = torch.load(
+        tmp_path / "checkpoint" / "model-state.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    target = _ordinary_case("sequential")
+    load_result = target.module.load_state_dict(model_state, strict=True)
+    assert ref == "checkpoint/model-state.pt"
+    assert set(model_state) == set(case.module.state_dict())
+    assert load_result.missing_keys == []
+    assert load_result.unexpected_keys == []

@@ -107,18 +107,16 @@ def test_launch_command_does_not_use_generic_dag_example_for_production_captured
     assert "python -m shardgrid.runtime.generic_bootstrap" in command
 
 
-def test_consolidated_checkpoint_currently_uses_model_specific_reconstruction() -> None:
+def test_consolidated_checkpoint_no_longer_uses_generic_zoo_reconstruction() -> None:
     consolidated_source = inspect.getsource(JobManager._write_consolidated_model)
-    generic_dag_source = inspect.getsource(JobManager._write_generic_dag_model_state)
+    generic_source = inspect.getsource(JobManager._write_generic_model_state)
 
-    assert "training_config.model.type" in consolidated_source
-    assert '"generic_dag"' in consolidated_source
-    assert '"minimal_sequential"' in consolidated_source
-    assert "MinimalTransformer" in consolidated_source
-    assert "MinimalTransformerConfig" in consolidated_source
-    assert "_write_generic_dag_model_state" in consolidated_source
+    assert "training_config.model.type" not in consolidated_source
+    assert '"generic_dag"' not in consolidated_source
+    assert "_checkpoint_shards_are_generic" in consolidated_source
+    assert "_write_generic_model_state" in consolidated_source
 
-    assert "build_zoo_model" in generic_dag_source
-    assert "make_zoo_sample" in generic_dag_source
-    assert "zoo_model" in generic_dag_source
-    assert "load_state_dict" in generic_dag_source
+    assert "build_zoo_model" not in generic_source
+    assert "make_zoo_sample" not in generic_source
+    assert "zoo_model" not in generic_source
+    assert "load_state_dict" not in generic_source
