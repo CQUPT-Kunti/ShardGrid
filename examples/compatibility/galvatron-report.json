@@ -1,0 +1,55 @@
+{
+  "blockers": [
+    "Galvatron Hardware Profiler: BLOCKED_BY_WSL2_CUPTI (profile_hardware.py child exits SIGSEGV -11 under torch.profiler in WSL2)",
+    "Search engine: blocked because it consumes hardware profiler output (allreduce/p2p bandwidth configs), which the CUPTI blocker prevents",
+    "GTX 1650 4 GiB VRAM: stage budgets above ~1 GiB are rejected or experimental; larger-GPU-heavy splits detected as risk notes"
+  ],
+  "commands": [
+    "shardgrid dist-test --backend nccl --workers gpu4060,gpu1060 (NCCL SUCCESS)",
+    "shardgrid dist-test --backend gloo --workers gpu4060,gpu1060 (GLOO PASS)",
+    "pytest --run-multi-host tests/multi_host/test_galvatron_one_gpu_per_host.py (T058: true_multi_host)",
+    "pytest --run-multi-host tests/multi_host/test_galvatron_heterogeneous.py (T059: accepted)",
+    "pytest --run-multi-host tests/multi_host/test_galvatron_capabilities.py (T060)",
+    "python galvatron/models/gpt_hf/profiler.py --profile_type computation (model profiler PASS)",
+    "python galvatron/models/gpt_hf/profiler.py --profile_type memory (model profiler PASS)",
+    "python galvatron/models/gpt_hf/search_dist.py (BLOCKED: hardware profiler output missing)",
+    "python galvatron/models/gpt_hf/train_dist_random.py (runtime launch + checkpoint PASS)",
+    "python galvatron/profile_hardware/profile_hardware.py (BLOCKED_BY_WSL2_CUPTI)"
+  ],
+  "component": "galvatron",
+  "created_at": "2026-08-22T12:07:03.189378+00:00",
+  "decision": "Galvatron v2.4.0 is ACCEPTED for MVP use with explicit parallel configuration on the real two-physical-host environment: T058 one-GPU-per-host placement PASS, T059 heterogeneous stage placement ACCEPTED for small-model budgets, T060 pipeline construction / runtime launch / checkpoint / model profiler PASS. Profiler-driven automatic planning (hardware profiler and its search-engine consumer) is BLOCKED by WSL2 CUPTI and must not be used; downstream work uses Galvatron only with explicit parallel configs (galvatron_config_path) and per-stage budgets within the verified limits.",
+  "logs_path": null,
+  "machines_tested": [
+    "gpu4060@10.87.5.155 (RTX 4060, cap 8.9, 8 GiB)",
+    "gpu1060@10.87.5.15 (GTX 1650, cap 7.5, 4 GiB)"
+  ],
+  "recommended_next_action": "Use Galvatron with explicit parallel plans (e.g. pp_deg=2 one stage per physical host as proven in T058/T059); keep GTX 1650 stage budgets <= 1 GiB; do not run profiler-driven search; record the WSL2/CUPTI limitation as a standing blocker.",
+  "report_id": "galvatron-decision-2026-08-22",
+  "results": [
+    "T058 placement: true_multi_host (2 physical hosts, 1 rank+1 GPU each)",
+    "T059 heterogeneous: accepted (small-model stage budgets)",
+    "T060 model profiler: pass (computation + memory configs written)",
+    "T060 pipeline construction: pass (pp_deg=1 layout built on GPU)",
+    "T060 runtime launch: pass (80-iter synthetic training, loss finite)",
+    "T060 checkpoint: pass (global_checkpoint=1 activation checkpoint applied)",
+    "T060 search engine: blocked (requires hardware profiler output)",
+    "hardware profiler: blocked (BLOCKED_BY_WSL2_CUPTI)"
+  ],
+  "stage": "PROBE",
+  "status": "experimental",
+  "versions": {
+    "apex": "9e3568a6f90fbc1996a06f8f9e99310bdaf2253a",
+    "conda_environment": "shardgrid",
+    "conda_prefix": "/home/shardgrid/miniconda3/envs/shardgrid",
+    "driver_1650": "527.41",
+    "driver_4060": "566.07",
+    "galvatron": "1.0.0 (official v2.4.0 tag)",
+    "galvatron_commit": "498bcadeb6ff80cd246bdc4321124da0f4b2d89b",
+    "galvatron_source": "/home/shardgrid/miniconda3/envs/shardgrid/lib/python3.12/site-packages/galvatron/__init__.py",
+    "nccl": "2.31.2-1+cuda12.9",
+    "python_version": "3.12.13",
+    "torch": "2.7.1+cu118",
+    "torch_cuda": "11.8"
+  }
+}

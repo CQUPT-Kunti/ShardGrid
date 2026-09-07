@@ -1,0 +1,281 @@
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: JobStatus
+type: object
+required:
+  - job_id
+  - state
+  - phase
+properties:
+  job_id:
+    type: string
+    minLength: 1
+  state:
+    enum:
+      - created
+      - probing
+      - planning
+      - snapshotting
+      - distributing
+      - launching
+      - rendezvous
+      - training
+      - checkpointing
+      - completed
+      - failed
+      - stopping
+      - stopped
+  phase:
+    type: string
+    minLength: 1
+  workers:
+    type: array
+    items:
+      type: string
+  assignments:
+    type: array
+    items:
+      type: object
+      required:
+        - worker_id
+        - rank
+      properties:
+        worker_id:
+          type: string
+        rank:
+          type: integer
+          minimum: 0
+        local_rank:
+          type: integer
+          minimum: 0
+        stage:
+          type:
+            - string
+            - "null"
+        stage_metadata_ref:
+          type:
+            - string
+            - "null"
+        estimated_peak_training_memory:
+          type:
+            - integer
+            - "null"
+          minimum: 0
+        communication_edges:
+          type: array
+          items:
+            type: string
+        gpu_index:
+          type: integer
+          minimum: 0
+        host:
+          type:
+            - string
+            - "null"
+        machine_id:
+          type:
+            - string
+            - "null"
+        physical_os:
+          type:
+            - string
+            - "null"
+        runtime_os:
+          type:
+            - string
+            - "null"
+        runtime:
+          type:
+            - string
+            - "null"
+        runtime_distro:
+          type:
+            - string
+            - "null"
+        conda_environment:
+          type:
+            - string
+            - "null"
+        conda_prefix:
+          type:
+            - string
+            - "null"
+        python_executable:
+          type:
+            - string
+            - "null"
+        launch_command:
+          type:
+            - string
+            - "null"
+        environment:
+          type: object
+          additionalProperties:
+            type: string
+        status:
+          type: string
+        pid:
+          type:
+            - integer
+            - "null"
+        log_path:
+          type:
+            - string
+            - "null"
+      additionalProperties: false
+  runtime_environment_refs:
+    type: object
+    additionalProperties:
+      type: string
+  latest_loss:
+    type:
+      - number
+      - "null"
+  loss_history:
+    type: array
+    items:
+      type: number
+  final_metrics:
+    type: object
+    additionalProperties:
+      type: number
+  backend:
+    type:
+      - string
+      - "null"
+  fallback_used:
+    type: boolean
+  started_at:
+    type:
+      - string
+      - "null"
+  finished_at:
+    type:
+      - string
+      - "null"
+  failure:
+    type:
+      - object
+      - "null"
+    required:
+      - stage
+      - host
+      - message
+      - recommended_action
+    properties:
+      stage:
+        enum:
+          - BOOTSTRAP
+          - PROBE
+          - NETWORK
+          - PROFILE
+          - PLAN
+          - DISTRIBUTE
+          - LAUNCH
+          - RENDEZVOUS
+          - TRAIN
+          - CHECKPOINT
+          - SCHEDULE
+          - GPU_SHARE
+          - STOP
+          - CLEANUP
+      host:
+        type: string
+        minLength: 1
+      worker_id:
+        type:
+          - string
+          - "null"
+      command:
+        type:
+          - string
+          - "null"
+      exit_code:
+        type:
+          - integer
+          - "null"
+      stdout_path:
+        type:
+          - string
+          - "null"
+      stderr_path:
+        type:
+          - string
+          - "null"
+      runtime_environment:
+        type: object
+        additionalProperties:
+          type: string
+      python_executable:
+        type:
+          - string
+          - "null"
+      conda_environment:
+        type:
+          - string
+          - "null"
+      conda_prefix:
+        type:
+          - string
+          - "null"
+      message:
+        type: string
+        minLength: 1
+      recommended_action:
+        type: string
+        minLength: 1
+      retryable:
+        type: boolean
+      manual_action_required:
+        type: boolean
+    additionalProperties: false
+  checkpoint_ref:
+    type:
+      - string
+      - "null"
+  distributed_checkpoint_ref:
+    type:
+      - string
+      - "null"
+  consolidated_model_ref:
+    type:
+      - string
+      - "null"
+  reload_validation_ref:
+    type:
+      - string
+      - "null"
+additionalProperties: false
+allOf:
+  - if:
+      properties:
+        state:
+          const: failed
+      required:
+        - state
+    then:
+      required:
+        - failure
+      properties:
+        failure:
+          type: object
+  - if:
+      properties:
+        state:
+          const: completed
+      required:
+        - state
+    then:
+      required:
+        - checkpoint_ref
+        - final_metrics
+      properties:
+        checkpoint_ref:
+          type: string
+          minLength: 1
+        final_metrics:
+          type: object
+          required:
+            - final_loss
+          properties:
+            final_loss:
+              type: number

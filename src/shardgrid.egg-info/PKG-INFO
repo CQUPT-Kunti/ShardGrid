@@ -1,3 +1,27 @@
+Metadata-Version: 2.4
+Name: shardgrid
+Version: 0.1.0
+Summary: ShardGrid control-plane package
+Description-Content-Type: text/markdown
+Requires-Dist: PyYAML<7,>=6
+Provides-Extra: dev
+Requires-Dist: build<2,>=1.2; extra == "dev"
+Requires-Dist: mypy<2,>=1.11; extra == "dev"
+Requires-Dist: pytest<9,>=8; extra == "dev"
+Requires-Dist: ruff<1,>=0.6; extra == "dev"
+Requires-Dist: types-PyYAML<7,>=6.0.12; extra == "dev"
+Provides-Extra: test
+Requires-Dist: pytest<9,>=8; extra == "test"
+Provides-Extra: lint
+Requires-Dist: ruff<1,>=0.6; extra == "lint"
+Provides-Extra: typecheck
+Requires-Dist: mypy<2,>=1.11; extra == "typecheck"
+Requires-Dist: types-PyYAML<7,>=6.0.12; extra == "typecheck"
+Provides-Extra: kubernetes
+Provides-Extra: engines
+Provides-Extra: volcano
+Provides-Extra: hami
+
 # ShardGrid
 
 ShardGrid is a Python control-plane project for real cross-host AI training across separate physical GPU workers.
@@ -26,9 +50,7 @@ This repository does not claim those later platform paths are available yet.
 - Use the existing `src` layout: `src/shardgrid/`
 - Prefer mature components and adapters over custom reimplementation
 - Keep machine addresses, users, paths, ports, and runtime details configurable
-- Manage Python development and training environments with Conda
-- Detect Conda first, reuse a compatible existing Conda environment when available, and create a ShardGrid environment only when needed
-- Do not force one exact Python or Conda version without a demonstrated compatibility reason
+- Reuse a compatible local Python environment when available instead of forcing one exact patch/minor version
 
 ## Project Pointers
 
@@ -42,17 +64,11 @@ This repository does not claim those later platform paths are available yet.
 These commands are expected to work on Ubuntu Machine A in the current repository state:
 
 ```bash
-command -v conda
-conda info
-python -m pip install -e .
-python -c "import shardgrid; print(shardgrid.__file__)"
+python3 -m pip install -e .
+python3 -c "import shardgrid; print(shardgrid.__file__)"
 pytest
 ruff check
 mypy
 ```
-
-Run them from the selected compatible Conda environment. If no compatible Conda
-environment exists yet, bootstrap should create one only after checking existing
-Conda installations and without deleting user environments.
 
 Commands such as `shardgrid doctor`, distributed training, SSH launch, Kubernetes, Volcano, and HAMi flows are planned but not implemented yet.

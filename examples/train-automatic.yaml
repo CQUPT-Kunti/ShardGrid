@@ -1,0 +1,31 @@
+job:
+  name: train-automatic
+  backend: ssh
+  communication_backend: auto
+
+model:
+  name: tiny-sequential
+  type: minimal_sequential
+  stage_count: 2
+  max_train_minutes: 15
+  min_loss_decrease_percent: 5.0
+
+resources:
+  world_size: 4
+  preferred_workers:
+    - gpu4060
+    - gpu1060
+    - gpu4060-cqupt
+
+planning:
+  mode: automatic
+
+artifacts:
+  snapshot_name: train-automatic
+  keep_failed_snapshots: true
+  transport: auto
+  checkpoint:
+    consolidation:
+      enabled: false
+      device: auto
+      required: false
