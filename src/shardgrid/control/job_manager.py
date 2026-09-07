@@ -8,10 +8,10 @@ import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 from uuid import uuid4
 
 from shardgrid.artifacts.collector import (
@@ -212,6 +212,15 @@ class JobRunResult:
     network_state: NetworkState | None = None
     collection_result: ArtifactCollectionResult | None = None
     launcher_result: LauncherResult | None = None
+
+
+@dataclass(frozen=True)
+class PlannerWorkload:
+    model: object
+    sample_args: tuple[object, ...] = ()
+    sample_kwargs: Mapping[str, object] = field(default_factory=dict)
+    model_name: str = "captured_model"
+    source: str = "captured_context"
 
 
 PROBE_PASS = "PASS"
@@ -2740,6 +2749,7 @@ class JobManager:
         cluster_state: ClusterState,
         selected_engine: SelectedEngine,
         min_selected_physical_hosts: int | None = None,
+        captured_workload: PlannerWorkload | None = None,
     ) -> ParallelPlan:
         memory_config = self._planner_memory_config()
         min_worker_count, max_worker_count = self._automatic_worker_count_bounds(
@@ -2773,11 +2783,18 @@ class JobManager:
         profile = None
         joint = None
         try:
-            model, sample_args, sample_kwargs = self._planner_workload(training_config)
+            workload = self._automatic_planner_workload(
+                training_config,
+                captured_workload=captured_workload,
+            )
+            model = workload.model
+            sample_args = workload.sample_args
+            sample_kwargs = dict(workload.sample_kwargs)
+            evidence["planner_workload_source"] = workload.source
             profile = build_model_profile(
                 model,
                 engine_id=self._selected_engine_name(selected_engine),
-                model_name=training_config.model.name,
+                model_name=workload.model_name,
                 sample_args=sample_args,
                 sample_kwargs=sample_kwargs,
                 memory_config=memory_config,
@@ -2831,6 +2848,23 @@ class JobManager:
             gc.collect()
             evidence["control_rss_after_cleanup"] = _process_rss_bytes()
             self._last_planning_evidence = dict(evidence)
+
+    def _automatic_planner_workload(
+        self,
+        training_config: TrainingConfig,
+        *,
+        captured_workload: PlannerWorkload | None = None,
+    ) -> PlannerWorkload:
+        if captured_workload is not None:
+            return captured_workload
+        model, sample_args, sample_kwargs = self._planner_workload(training_config)
+        return PlannerWorkload(
+            model=model,
+            sample_args=tuple(sample_args),
+            sample_kwargs=dict(sample_kwargs),
+            model_name=training_config.model.name,
+            source="legacy_config_model_type",
+        )
 
     def _automatic_worker_count_bounds(
         self,

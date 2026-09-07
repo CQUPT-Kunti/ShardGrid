@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 
-from shardgrid.control.job_manager import JobManager
+from shardgrid.control.job_manager import JobManager, PlannerWorkload
 
 
 def test_planner_workload_currently_branches_on_model_type_and_zoo_builders() -> None:
@@ -16,6 +16,40 @@ def test_planner_workload_currently_branches_on_model_type_and_zoo_builders() ->
     assert "build_zoo_model" in source
     assert "make_zoo_sample" in source
     assert "zoo_model" in source
+
+
+def test_generic_captured_planner_workload_bypasses_legacy_model_type_dispatch() -> None:
+    model = object()
+    workload = PlannerWorkload(
+        model=model,
+        sample_args=("batch",),
+        sample_kwargs={"mask": object()},
+        model_name="ordinary_user_model",
+    )
+
+    class ManagerWithoutLegacyWorkload:
+        def _planner_workload(self, _training_config: object) -> object:
+            raise AssertionError("generic captured workload used legacy model-type dispatch")
+
+    result = JobManager._automatic_planner_workload(
+        ManagerWithoutLegacyWorkload(),
+        object(),
+        captured_workload=workload,
+    )
+
+    assert result is workload
+    assert result.model is model
+    assert result.model_name == "ordinary_user_model"
+    assert result.source == "captured_context"
+
+
+def test_automatic_plan_builder_has_generic_captured_workload_entrypoint() -> None:
+    source = inspect.getsource(JobManager._build_automatic_parallel_plan)
+
+    assert "captured_workload: PlannerWorkload | None = None" in source
+    assert "_automatic_planner_workload" in source
+    assert "planner_workload_source" in source
+    assert "model_name=workload.model_name" in source
 
 
 def test_launch_command_currently_dispatches_to_example_model_runtimes() -> None:
