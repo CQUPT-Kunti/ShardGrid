@@ -152,6 +152,7 @@ def test_checkpoint_shards_preserve_original_parameter_state_dict_keys(tmp_path)
     assert consolidated["plan_id"] == "plan-test"
     assert consolidated["training_step"] == 7
     assert [shard["rank"] for shard in consolidated["shards"]] == [0, 1]
+    assert [shard["gpu_id"] for shard in consolidated["shards"]] == ["gpu0", "gpu1"]
     for shard_path in shard_paths:
         shard = torch.load(shard_path, map_location="cpu", weights_only=False)
         assert shard["schema_version"] == CHECKPOINT_SCHEMA_VERSION
@@ -161,7 +162,16 @@ def test_checkpoint_shards_preserve_original_parameter_state_dict_keys(tmp_path)
         assert shard["training_step"] == 7
         assert shard["worker_id"] in {"worker0", "worker1"}
         assert shard["gpu_index"] == 0
+        assert shard["gpu_id"] in {"gpu0", "gpu1"}
         assert tuple(shard["owned_partition_ids"]) in {("stage0",), ("stage1",)}
+        assert tuple(shard["ownership"]["owned_partitions"]) == tuple(
+            shard["owned_partition_ids"]
+        )
+        assert {
+            entry["canonical_id"] for entry in shard["parameters"]
+        } == set(shard["ownership"]["local_parameter_ids"])
+        assert shard["ownership"]["local_buffer_ids"] == ()
+        assert shard["ownership"]["read_only_state_ids"] == ()
         assert all(
             entry["state_dict_key"] in case.module.state_dict()
             for entry in shard["parameters"]
@@ -198,6 +208,9 @@ def test_checkpoint_shards_preserve_original_buffer_state_dict_keys(tmp_path) ->
         "bn.running_var",
         "bn.num_batches_tracked",
     ]
+    assert {
+        entry["canonical_id"] for entry in shard["buffers"]
+    } == set(shard["ownership"]["local_buffer_ids"])
     for entry in shard["buffers"]:
         tensor = model.state_dict()[entry["state_dict_key"]]
         assert entry["canonical_id"].startswith("b")

@@ -57,7 +57,14 @@ def save_worker_state_shard(
         "worker_id": worker_id,
         "rank": rank,
         "gpu_index": gpu_index,
+        "gpu_id": owner.gpu_id,
         "owned_partition_ids": owner.owned_partitions,
+        "ownership": {
+            "owned_partitions": owner.owned_partitions,
+            "local_parameter_ids": owner.local_parameter_ids,
+            "local_buffer_ids": owner.local_buffer_ids,
+            "read_only_state_ids": owner.read_only_state_ids,
+        },
         "metadata": dict(metadata or {}),
         "parameters": _entries(owner.local_parameter_ids, parameter_keys, state_dict),
         "buffers": _entries(owner.local_buffer_ids, buffer_keys, state_dict),
@@ -103,7 +110,9 @@ def consolidate_worker_state_shards(
                 "worker_id": shard["worker_id"],
                 "rank": shard.get("rank"),
                 "gpu_index": shard["gpu_index"],
+                "gpu_id": shard.get("gpu_id"),
                 "owned_partition_ids": tuple(shard["owned_partition_ids"]),
+                "ownership": dict(shard.get("ownership") or {}),
                 "metadata": dict(shard.get("metadata") or {}),
             }
         )
