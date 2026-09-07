@@ -1,19 +1,65 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
 import torch
 from torch import nn
 
 from shardgrid.common.enums import BackendStatus, Health, PhysicalOS, RuntimeOS
 from shardgrid.common.models import as_hostname, as_worker_id
 from shardgrid.engines.models import EstimateKind, ModelProfile, ProfileResult
+from shardgrid.planner.generic_graph import capture_generic_graph
 from shardgrid.planner.memory import (
     MemoryEstimationConfig,
+    _iter_target_modules,
     build_model_profile,
     dtype_bytes,
     estimate_stage_memory,
     evaluate_stage_memory_fit,
 )
 from shardgrid.resources.models import WorkerResource
+
+
+def _generic_fixture_module() -> ModuleType:
+    module_name = "generic_training_models"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "generic_training_models.py"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load fixture module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _ordinary_case(name: str) -> Any:
+    return _generic_fixture_module().generic_training_case(name)
+
+
+def _profile_ordinary_case(name: str) -> ModelProfile:
+    case = _ordinary_case(name)
+    return build_model_profile(
+        case.module,
+        engine_id="pytorch_pipeline",
+        model_name=name,
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+
+
+def _parameter_names(profile: ModelProfile) -> set[str]:
+    return {
+        parameter_name
+        for module in profile.modules
+        for parameter_name in module.parameter_names
+    }
 
 
 class TinyTransformerModel(nn.Module):
@@ -216,6 +262,74 @@ def test_stage_memory_fit_rejects_worker_after_headroom() -> None:
     assert fit.shortfall_bytes is not None
     assert fit.shortfall_bytes > 0
     assert "after headroom" in (fit.reason or "")
+
+
+def test_model_profile_module_order_follows_target_module_registration_order() -> None:
+    case = _ordinary_case("multi_branch")
+    profile = _profile_ordinary_case("multi_branch")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+
+    target_paths = [name for name, _module in _iter_target_modules(case.module)]
+    profile_paths = [module.module_path for module in profile.modules]
+    executed_paths = [node.module_path for node in graph.nodes if node.module_path]
+
+    assert target_paths == ["left", "right", "gate", "head"]
+    assert profile_paths == target_paths
+    assert profile.module_order == tuple(module.module_id for module in profile.modules)
+    assert executed_paths.index("gate") < executed_paths.index("right")
+    assert profile_paths != executed_paths[: len(profile_paths)]
+
+
+def test_model_profile_has_no_slot_for_parameterless_functional_execution_nodes() -> None:
+    case = _ordinary_case("unet_like")
+    profile = _profile_ordinary_case("unet_like")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+
+    profile_paths = [module.module_path for module in profile.modules]
+    functional_targets = [
+        node.target
+        for node in graph.nodes
+        if node.module_path is None and node.op_kind not in {"placeholder", "output"}
+    ]
+
+    assert profile_paths == ["enc1", "enc2", "dec1", "out"]
+    assert any("avg_pool2d" in target for target in functional_targets)
+    assert any("interpolate" in target for target in functional_targets)
+    assert any("cat" in target for target in functional_targets)
+    assert all("avg_pool2d" not in path for path in profile_paths)
+    assert all("interpolate" not in path for path in profile_paths)
+    assert all("cat" not in path for path in profile_paths)
+
+
+def test_model_profile_omits_root_owned_state_without_standalone_module_entry() -> None:
+    case = _ordinary_case("transformer")
+    profile = _profile_ordinary_case("transformer")
+
+    model_parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in case.module.parameters()
+    )
+
+    assert "position" in dict(case.module.named_parameters())
+    assert "position" not in _parameter_names(profile)
+    assert "" not in [module.module_path for module in profile.modules]
+    assert profile.total_memory.parameter_bytes < model_parameter_bytes
+
+
+def test_model_profile_currently_counts_tied_parameters_per_module_owner() -> None:
+    case = _ordinary_case("shared_tied_parameter")
+    profile = _profile_ordinary_case("shared_tied_parameter")
+
+    unique_model_parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in case.module.parameters()
+    )
+
+    assert case.module.embedding.weight is case.module.decoder.weight
+    assert profile.shared_parameter_groups == (("embedding.weight", "decoder.weight"),)
+    assert _parameter_names(profile) == {"embedding.weight", "decoder.weight"}
+    assert profile.total_memory.parameter_bytes == unique_model_parameter_bytes * 2
+    assert "shared/tied parameters detected in model profile" in profile.diagnostics
 
 
 def test_unsupported_optimizer_stays_explicitly_unsupported() -> None:
