@@ -94,6 +94,26 @@ class ReverseRegisteredChain(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.second(torch.relu(self.first(x)))
 
+
+class FunctionalParameterModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(3, 4))
+        self.bias = nn.Parameter(torch.randn(3))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
+class FunctionalBufferModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("scale", torch.ones(4))
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x * self.scale)
+
 ZOO_MODELS = (
     "mini_resnet",
     "mini_unet",
@@ -429,3 +449,74 @@ def test_execution_dependencies_ignore_module_registration_order() -> None:
     assert executed[:2] == ["first", "second"]
     assert ordered[:2] == ("first", "second")
     assert ("first", "second") in dependencies
+
+
+def test_functional_parameter_use_maps_to_canonical_state_id() -> None:
+    model = FunctionalParameterModel().eval()
+    graph = capture_generic_graph(model, sample_args=(torch.randn(2, 4),))
+    states = _states_by_key(graph)
+    linear_node = next(node for node in graph.nodes if "linear" in node.target)
+
+    assert linear_node.module_path is None
+    assert linear_node.parameter_paths == ("weight", "bias")
+    assert linear_node.parameter_ids == (
+        states["weight"].canonical_state_id,
+        states["bias"].canonical_state_id,
+    )
+    assert states["weight"].use_node_ids == (linear_node.node_id,)
+    assert states["bias"].use_node_ids == (linear_node.node_id,)
+
+
+def test_functional_buffer_read_maps_to_canonical_state_id() -> None:
+    model = FunctionalBufferModel().eval()
+    graph = capture_generic_graph(model, sample_args=(torch.randn(2, 4),))
+    states = _states_by_key(graph)
+    mul_node = next(node for node in graph.nodes if "mul" in node.target)
+
+    assert mul_node.module_path is None
+    assert mul_node.buffer_paths == ("scale",)
+    assert mul_node.buffer_ids == (states["scale"].canonical_state_id,)
+    assert states["scale"].kind == "buffer"
+    assert states["scale"].use_node_ids == (mul_node.node_id,)
+
+
+def test_state_owner_without_independent_module_execution_records_use() -> None:
+    _case, graph = _capture_ordinary_case("transformer")
+    states = _states_by_key(graph)
+
+    position = states["position"]
+    position_user = next(node for node in graph.nodes if node.node_id == position.use_node_ids[0])
+
+    assert position.kind == "parameter"
+    assert position.owner_node_ids == position.use_node_ids
+    assert len(position.use_node_ids) == 1
+    assert position_user.module_path is None
+    assert position_user.op_kind == "call_function"
+    assert position_user.parameter_ids == (position.canonical_state_id,)
+
+
+def test_parameter_reuse_aggregates_module_execution_sites() -> None:
+    _case, graph = _capture_ordinary_case("shared_module")
+    states = _states_by_key(graph)
+    shared_weight = states["shared.weight"]
+    shared_nodes = [
+        node.node_id for node in graph.nodes if node.module_path == "shared"
+    ]
+
+    assert len(shared_nodes) == 2
+    assert set(shared_weight.use_node_ids) == set(shared_nodes)
+    assert shared_weight.owner_node_ids == (shared_nodes[0],)
+
+
+def test_execution_node_without_state_is_allowed() -> None:
+    _case, graph = _capture_ordinary_case("unet_like")
+    cat_node = next(
+        node
+        for node in graph.nodes
+        if node.op_kind == "call_function" and "cat" in node.target
+    )
+
+    assert cat_node.parameter_ids == ()
+    assert cat_node.buffer_ids == ()
+    assert cat_node.input_value_ids
+    assert cat_node.output_value_ids

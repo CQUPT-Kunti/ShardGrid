@@ -293,14 +293,30 @@ def _graph_from_fx(
     for fx_node in graph_module.graph.nodes:
         node_id = f"n{node_index:04d}"
         node_index += 1
+        input_nodes = walk_fx_nodes((fx_node.args, fx_node.kwargs))
         input_ids = tuple(
-            value_by_node[parent]
-            for parent in walk_fx_nodes((fx_node.args, fx_node.kwargs))
-            if parent in value_by_node
+            value_by_node[parent] for parent in input_nodes if parent in value_by_node
         )
         module_path = _node_module_path(fx_node)
         parameter_paths = _node_parameter_paths(fx_node, module_by_path)
         buffer_paths = _node_buffer_paths(fx_node, module_by_path)
+        if fx_node.op in {"call_function", "call_method"}:
+            parameter_paths = _unique(
+                parameter_paths
+                + tuple(
+                    path
+                    for parent in input_nodes
+                    for path in _get_attr_state_paths(parent, parameter_ids_by_path)
+                )
+            )
+            buffer_paths = _unique(
+                buffer_paths
+                + tuple(
+                    path
+                    for parent in input_nodes
+                    for path in _get_attr_state_paths(parent, buffer_ids_by_path)
+                )
+            )
         output_ids: tuple[str, ...]
         if fx_node.op == "output":
             output_ids = ()
@@ -494,6 +510,17 @@ def _node_buffer_paths(node: Any, module_by_path: Mapping[str, Any]) -> tuple[st
         f"{module_path}.{name}" if module_path else name
         for name, _buffer in module.named_buffers(recurse=False)
     )
+
+
+def _get_attr_state_paths(node: Any, ids_by_path: Mapping[str, str]) -> tuple[str, ...]:
+    if getattr(node, "op", None) != "get_attr":
+        return ()
+    path = str(getattr(node, "target", ""))
+    return (path,) if path in ids_by_path else ()
+
+
+def _unique(items: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(items))
 
 
 def _canonical_target(node: Any, module_by_path: Mapping[str, Any]) -> str:
