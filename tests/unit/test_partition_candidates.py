@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
 import math
 import sys
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 import torch
@@ -22,6 +25,7 @@ from examples.models.partition_stress_model import (
 from torch import nn
 from torch.fx import wrap
 
+from shardgrid.planner.generic_graph import capture_generic_graph
 from shardgrid.planner.memory import MemoryEstimationConfig, build_model_profile
 from shardgrid.planner.partitioning import (
     build_partition_profile,
@@ -41,6 +45,48 @@ def _memory_config() -> MemoryEstimationConfig:
         safety_headroom_bytes=4096,
         temporary_buffer_factor=0.25,
     )
+
+
+def _generic_fixture_module() -> ModuleType:
+    module_name = "generic_training_models"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "generic_training_models.py"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load fixture module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _ordinary_case(name: str) -> Any:
+    return _generic_fixture_module().generic_training_case(name)
+
+
+def _profile_case(case: Any, name: str):
+    return build_model_profile(
+        case.module,
+        engine_id="pytorch_pipeline",
+        model_name=name,
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+        memory_config=_memory_config(),
+    )
+
+
+def _ordinary_profile_and_support(name: str):
+    case = _ordinary_case(name)
+    profile = _profile_case(case, name)
+    support = discover_partition_support(
+        case.module,
+        profile,
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    return case, profile, support
 
 
 def test_partition_stress_model_forward_is_deterministic() -> None:
@@ -275,6 +321,146 @@ def test_equal_capacity_partition_avoids_extreme_imbalance() -> None:
         for stage in candidate.stages
     ]
     assert max(stage_bytes) - min(stage_bytes) < 80_000
+
+
+def test_ordinary_unet_functional_execution_nodes_are_not_partition_slots() -> None:
+    case, profile, support = _ordinary_profile_and_support("unet_like")
+    graph = capture_generic_graph(
+        case.module.eval(),
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    functional_targets = {
+        node.target
+        for node in graph.nodes
+        if node.module_path is None and node.op_kind == "call_function"
+    }
+    profile_paths = {module.module_path for module in profile.modules}
+
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+        max_stage_count=3,
+    )
+
+    assert {"enc1", "enc2", "dec1", "out"} == profile_paths
+    assert any("avg_pool2d" in target for target in functional_targets)
+    assert any("interpolate" in target for target in functional_targets)
+    assert any("cat" in target for target in functional_targets)
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert all(
+        path in profile_paths
+        for candidate in result.candidates
+        for stage in candidate.stages
+        for path in stage.module_paths
+    )
+    assert all(
+        "cat" not in path and "interpolate" not in path and "avg_pool2d" not in path
+        for candidate in result.candidates
+        for stage in candidate.stages
+        for path in stage.module_paths
+    )
+
+
+def test_ordinary_transformer_state_owner_without_execution_node_is_unsupported() -> None:
+    case, profile, support = _ordinary_profile_and_support("transformer")
+    graph = capture_generic_graph(
+        case.module.eval(),
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    profile_paths = {module.module_path for module in profile.modules}
+    executed_paths = {node.module_path for node in graph.nodes if node.module_path}
+
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+    )
+
+    assert "attn.out_proj" in profile_paths
+    assert "attn.out_proj" not in executed_paths
+    assert any(
+        "out_proj" in parameter
+        for module in profile.modules
+        if module.module_path == "attn.out_proj"
+        for parameter in module.parameter_names
+    )
+    assert support.status.value == "unsupported"
+    assert result.status == FeasibilityStatus.UNSUPPORTED
+    assert any("attn.out_proj" in reason for reason in support.reasons)
+
+
+def test_ordinary_shared_module_is_collapsed_to_one_partition_module_slot() -> None:
+    case, profile, support = _ordinary_profile_and_support("shared_module")
+    graph = capture_generic_graph(
+        case.module.eval(),
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    shared_executions = [
+        node
+        for node in graph.nodes
+        if node.op_kind == "call_module" and node.module_path == "shared"
+    ]
+
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+    )
+
+    assert len(shared_executions) == 2
+    assert [module.module_path for module in profile.modules].count("shared") == 1
+    assert support.status.value == "supported"
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert all(
+        [path for stage in candidate.stages for path in stage.module_paths].count("shared")
+        == 1
+        for candidate in result.candidates
+    )
+
+
+def test_ordinary_dense_multi_consumer_values_are_reduced_to_module_edges() -> None:
+    case, profile, support = _ordinary_profile_and_support("dense")
+    graph = capture_generic_graph(
+        case.module.eval(),
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    multi_consumer_values = [
+        value for value in graph.values if len(set(value.consumer_node_ids)) > 1
+    ]
+
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+        min_stage_count=3,
+        max_stage_count=3,
+    )
+    candidate = result.candidates[0]
+    edge_pairs = {
+        (edge.source_module_id, edge.target_module_id)
+        for edge in candidate.communication_edges
+    }
+
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert any(len(value.consumer_node_ids) >= 2 for value in multi_consumer_values)
+    assert any(
+        "input->head" in boundary.forward_dependencies for boundary in support.boundaries
+    )
+    assert any(
+        "layer1->head" in boundary.forward_dependencies for boundary in support.boundaries
+    )
+    assert [stage.module_paths for stage in candidate.stages] == [
+        ("input", "layer1"),
+        ("layer2",),
+        ("head",),
+    ]
+    assert ("m0000", "m0003") in edge_pairs
+    assert ("m0001", "m0003") in edge_pairs
 
 
 class DynamicControlFlowModel(nn.Module):
