@@ -36,6 +36,7 @@ class WorkerOwnershipSpec:
     owned_partitions: tuple[str, ...]
     local_parameter_ids: tuple[str, ...]
     local_buffer_ids: tuple[str, ...]
+    read_only_state_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__
@@ -239,23 +240,44 @@ def compile_runtime_plan(
             [],
         ).append(partition)
 
-    ownership = WorkerOwnershipPlan(
-        tuple(
+    state_kind = {state.canonical_state_id: state.kind for state in graph.states}
+    owned_by_worker: dict[str, tuple[str, int, str]] = {}
+    workers: list[WorkerOwnershipSpec] = []
+    for (worker_id, gpu_index, gpu_id), partitions in sorted(worker_groups.items()):
+        owned_state_ids = {
+            state_id
+            for partition in partitions
+            for state_id in (
+                partition.owned_state_ids
+                or partition.parameter_ids + partition.buffer_ids
+            )
+        }
+        for state_id in owned_state_ids:
+            previous = owned_by_worker.setdefault(state_id, (worker_id, gpu_index, gpu_id))
+            if previous != (worker_id, gpu_index, gpu_id):
+                raise ValueError(f"state {state_id} has multiple runtime owners")
+        workers.append(
             WorkerOwnershipSpec(
                 worker_id=worker_id,
                 gpu_index=gpu_index,
                 gpu_id=gpu_id,
                 owned_partitions=tuple(partition.partition_id for partition in partitions),
-                local_parameter_ids=tuple(
-                    sorted({pid for partition in partitions for pid in partition.parameter_ids})
-                ),
-                local_buffer_ids=tuple(
-                    sorted({bid for partition in partitions for bid in partition.buffer_ids})
+                local_parameter_ids=_owned_state_ids(partitions, state_kind, "parameter"),
+                local_buffer_ids=_owned_state_ids(partitions, state_kind, "buffer"),
+                read_only_state_ids=tuple(
+                    sorted(
+                        {
+                            state_id
+                            for partition in partitions
+                            for state_id in partition.read_only_state_ids
+                            if state_id not in owned_state_ids
+                        }
+                    )
                 ),
             )
-            for (worker_id, gpu_index, gpu_id), partitions in sorted(worker_groups.items())
         )
-    )
+
+    ownership = WorkerOwnershipPlan(tuple(workers))
     edges: list[RuntimeEdgeSpec] = []
     for edge in graph.edges:
         source_partition = partition_by_node.get(edge.source_node_id)
@@ -268,7 +290,11 @@ def compile_runtime_plan(
             continue
         source = placement_by_partition[source_partition]
         target = placement_by_partition[target_partition]
-        same_device = source.worker_id == target.worker_id and source.gpu_index == target.gpu_index
+        same_device = (
+            source.worker_id == target.worker_id
+            and source.gpu_index == target.gpu_index
+            and source.gpu_id == target.gpu_id
+        )
         edges.append(
             RuntimeEdgeSpec(
                 producer_partition=source_partition,
@@ -285,6 +311,37 @@ def compile_runtime_plan(
         graph_fingerprint=graph.graph_fingerprint,
         ownership=ownership,
         edges=tuple(edges),
+    )
+
+
+def _owned_state_ids(
+    partitions: Sequence[LogicalPartitionSpec],
+    state_kind: Mapping[str, str],
+    kind: str,
+) -> tuple[str, ...]:
+    if not state_kind:
+        attr = "parameter_ids" if kind == "parameter" else "buffer_ids"
+        return tuple(
+            sorted(
+                {
+                    state_id
+                    for partition in partitions
+                    for state_id in getattr(partition, attr)
+                }
+            )
+        )
+    return tuple(
+        sorted(
+            {
+                state_id
+                for partition in partitions
+                for state_id in (
+                    partition.owned_state_ids
+                    or partition.parameter_ids + partition.buffer_ids
+                )
+                if state_kind.get(state_id) == kind
+            }
+        )
     )
 
 

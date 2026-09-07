@@ -12,6 +12,7 @@ from shardgrid.planner.generic_graph import (
     GenericGraphIR,
     GraphEdgeSpec,
     GraphNodeSpec,
+    StateObjectSpec,
 )
 from shardgrid.planner.models import ExecutionPlan, MasterMetadata, WorkerAssignment
 from shardgrid.planner.planning_contract import (
@@ -42,8 +43,17 @@ def test_worker_ownership_allows_non_contiguous_partitions_on_same_gpu() -> None
     worker0 = next(
         worker for worker in runtime_plan.ownership.workers if worker.worker_id == "worker0"
     )
+    worker1 = next(
+        worker for worker in runtime_plan.ownership.workers if worker.worker_id == "worker1"
+    )
+    worker2 = next(
+        worker for worker in runtime_plan.ownership.workers if worker.worker_id == "worker2"
+    )
     assert worker0.owned_partitions == ("P0", "P4")
     assert set(worker0.local_parameter_ids) == {"p0", "p4"}
+    assert worker0.read_only_state_ids == ()
+    assert worker1.read_only_state_ids == ("p0",)
+    assert worker2.local_buffer_ids == ("b2",)
     assert any(
         edge.producer_partition == "P0"
         and edge.consumer_partition == "P4"
@@ -102,6 +112,32 @@ def test_runtime_uses_exact_selected_plan_without_rank_index_swap() -> None:
     assert worker0.local_parameter_ids == ("p1", "p2", "p3", "p4")
     assert worker1.owned_partitions == ("stage0",)
     assert worker1.local_parameter_ids == ("p0",)
+    gpu_by_worker = {worker.worker_id: worker.gpu_id for worker in runtime_plan.ownership.workers}
+    assert gpu_by_worker == {
+        placed.worker_id: placed.gpu_id for placed in placement.placements
+    }
+
+
+def test_runtime_edge_is_remote_for_same_worker_different_gpu() -> None:
+    graph, logical, placement = _runtime_fixture()
+    placement = PlacementPlan(
+        placement.graph_fingerprint,
+        selected_gpu_count=2,
+        placements=(
+            PlacementSpec("P0", "gpu0", "worker0", 0),
+            PlacementSpec("P1", "gpu1", "worker0", 1),
+            *placement.placements[2:],
+        ),
+    )
+
+    runtime_plan = compile_runtime_plan(graph, logical, placement)
+
+    assert any(
+        edge.producer_partition == "P0"
+        and edge.consumer_partition == "P1"
+        and edge.edge_kind is EdgeKind.REMOTE
+        for edge in runtime_plan.edges
+    )
 
 
 def test_value_store_releases_values_after_last_consumer() -> None:
@@ -263,6 +299,7 @@ def _runtime_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, PlacementP
             input_value_ids=("input",) if index == 0 else (f"v{index - 1}",),
             output_value_ids=(f"v{index}",),
             parameter_ids=(f"p{index}",),
+            buffer_ids=("b2",) if index == 2 else (),
         )
         for index in range(5)
     )
@@ -296,6 +333,25 @@ def _runtime_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, PlacementP
         parameter_owners={f"p{index}": f"n{index}" for index in range(5)},
         capture_backend="test",
         graph_fingerprint="fixture",
+        states=tuple(
+            StateObjectSpec(
+                canonical_state_id=f"p{index}",
+                kind="parameter",
+                state_dict_key=f"partition{index}.weight",
+                owner_node_ids=(f"n{index}",),
+                use_node_ids=(f"n{index}",),
+            )
+            for index in range(5)
+        )
+        + (
+            StateObjectSpec(
+                canonical_state_id="b2",
+                kind="buffer",
+                state_dict_key="partition2.running",
+                owner_node_ids=("n2",),
+                use_node_ids=("n2",),
+            ),
+        ),
     )
     logical = LogicalPartitionPlan(
         graph_fingerprint="fixture",
@@ -306,10 +362,12 @@ def _runtime_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, PlacementP
                 input_value_ids=nodes[index].input_value_ids,
                 output_value_ids=nodes[index].output_value_ids,
                 parameter_ids=(f"p{index}",),
-                buffer_ids=(),
+                buffer_ids=("b2",) if index == 2 else (),
                 estimated_compute=1,
                 estimated_memory=1,
                 boundary_edges=(),
+                owned_state_ids=((f"p{index}",) + (("b2",) if index == 2 else ())),
+                read_only_state_ids=("p0",) if index == 1 else (),
             )
             for index in range(5)
         ),
