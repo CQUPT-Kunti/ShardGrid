@@ -281,6 +281,114 @@ def test_checkpoint_merge_rejects_missing_expected_state_keys(tmp_path) -> None:
     assert not (tmp_path / "model-state.pt").exists()
 
 
+def test_checkpoint_merge_rejects_missing_parameter_entry_versus_claim(tmp_path) -> None:
+    case = _ordinary_case("sequential")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    parameter_ids = _parameter_ids(graph)
+    runtime_plan = _runtime_plan(
+        graph,
+        worker0_parameters=parameter_ids[:2],
+        worker1_parameters=parameter_ids[2:],
+    )
+    shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
+    shard = torch.load(shard_paths[0], map_location="cpu", weights_only=False)
+    shard["parameters"] = shard["parameters"][:1]
+    torch.save(shard, shard_paths[0])
+
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*parameter entries disagree with claimed ownership",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths,
+            tmp_path / "model-state.pt",
+            runtime_plan=runtime_plan,
+        )
+    assert not (tmp_path / "model-state.pt").exists()
+
+
+def test_checkpoint_merge_rejects_missing_buffer_entry_versus_claim(tmp_path) -> None:
+    model = BufferKeyModel().eval()
+    graph = capture_generic_graph(model, sample_args=(torch.randn(3, 4),))
+    runtime_plan = _runtime_plan(
+        graph,
+        worker0_parameters=_parameter_ids(graph),
+        worker0_buffers=_buffer_ids(graph),
+    )
+    shard_paths = _save_shards(tmp_path, graph, runtime_plan, model.state_dict())
+    shard = torch.load(shard_paths[0], map_location="cpu", weights_only=False)
+    shard["buffers"] = shard["buffers"][:-1]
+    torch.save(shard, shard_paths[0])
+
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*buffer entries disagree with claimed ownership",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths,
+            tmp_path / "model-state.pt",
+            runtime_plan=runtime_plan,
+        )
+    assert not (tmp_path / "model-state.pt").exists()
+
+
+def test_checkpoint_merge_rejects_parameter_entry_not_claimed_by_worker(tmp_path) -> None:
+    case = _ordinary_case("sequential")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    parameter_ids = _parameter_ids(graph)
+    runtime_plan = _runtime_plan(
+        graph,
+        worker0_parameters=parameter_ids[:2],
+        worker1_parameters=parameter_ids[2:],
+    )
+    shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
+    shard = torch.load(shard_paths[0], map_location="cpu", weights_only=False)
+    unclaimed = dict(shard["parameters"][0])
+    unclaimed["canonical_id"] = "p9999"
+    unclaimed["state_dict_key"] = "unclaimed.weight"
+    shard["parameters"] = list(shard["parameters"]) + [unclaimed]
+    torch.save(shard, shard_paths[0])
+
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*parameter entries disagree with claimed ownership",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths,
+            tmp_path / "model-state.pt",
+            runtime_plan=runtime_plan,
+        )
+    assert not (tmp_path / "model-state.pt").exists()
+
+
+def test_checkpoint_merge_rejects_incomplete_shard_without_expected_keys(tmp_path) -> None:
+    case = _ordinary_case("sequential")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    parameter_ids = _parameter_ids(graph)
+    runtime_plan = _runtime_plan(
+        graph,
+        worker0_parameters=parameter_ids[:2],
+        worker1_parameters=parameter_ids[2:],
+    )
+    shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
+    shard = torch.load(shard_paths[0], map_location="cpu", weights_only=False)
+    shard["parameters"] = shard["parameters"][:1]
+    torch.save(shard, shard_paths[0])
+
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*parameter entries disagree with claimed ownership",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths,
+            tmp_path / "model-state.pt",
+            expected_graph_fingerprint=graph.graph_fingerprint,
+            expected_plan_id="plan-test",
+            expected_training_step=7,
+        )
+    assert not (tmp_path / "model-state.pt").exists()
+
+
 def test_checkpoint_merge_rejects_shape_and_dtype_mismatches(tmp_path) -> None:
     case = _ordinary_case("sequential")
     graph = capture_generic_graph(case.module.eval(), sample_args=case.args)

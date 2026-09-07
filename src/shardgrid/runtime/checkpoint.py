@@ -122,6 +122,7 @@ def consolidate_worker_state_shards(
             raise _checkpoint_failure(f"{shard_path} checkpoint ownership mismatch")
         seen_workers.add(worker_key)
         _validate_ownership(shard_path, shard, expected_workers.get(worker_key))
+        _validate_claimed_entries(shard_path, shard)
         shards.append(
             {
                 "path": str(shard_path),
@@ -258,6 +259,24 @@ def _validate_ownership(
             mismatch = actual.get(key) != value
         if mismatch:
             raise _checkpoint_failure(f"{path} checkpoint ownership mismatch")
+
+
+def _validate_claimed_entries(path: Path, shard: Mapping[str, Any]) -> None:
+    ownership = shard.get("ownership")
+    if not isinstance(ownership, Mapping):
+        raise _checkpoint_failure(f"{path} checkpoint ownership missing")
+    claimed_parameters = set(ownership.get("local_parameter_ids") or ())
+    claimed_buffers = set(ownership.get("local_buffer_ids") or ())
+    entry_parameters = {item["canonical_id"] for item in shard.get("parameters", ())}
+    entry_buffers = {item["canonical_id"] for item in shard.get("buffers", ())}
+    if entry_parameters != claimed_parameters:
+        raise _checkpoint_failure(
+            f"{path} checkpoint parameter entries disagree with claimed ownership"
+        )
+    if entry_buffers != claimed_buffers:
+        raise _checkpoint_failure(
+            f"{path} checkpoint buffer entries disagree with claimed ownership"
+        )
 
 
 def _training_evidence(shards: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
