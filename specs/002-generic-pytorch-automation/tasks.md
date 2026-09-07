@@ -105,7 +105,7 @@ T001-T008 regression baseline
   - Tests: `pytest tests/unit/test_checkpoint_generic_state.py`
   - Acceptance Criteria: Current checkpoint behavior is pinned before generic merge changes.
 
-- [ ] T008 Run Phase 0 regression gate and record command output in `specs/002-generic-pytorch-automation/tasks.md`
+- [x] T008 Run Phase 0 regression gate and record command output in `specs/002-generic-pytorch-automation/tasks.md`
   - Title: Phase 0 gate
   - Phase: Phase 0
   - Priority: P0 BLOCKING
@@ -115,6 +115,10 @@ T001-T008 regression baseline
   - Implementation Notes: Do not proceed to planner changes until this gate is green or expected-xfail reasons are explicit.
   - Tests: `pytest tests/unit/test_cli_registration.py tests/unit/test_job_manager_model_coupling.py tests/unit/test_generic_graph_ir.py tests/unit/test_model_profile_memory.py tests/unit/test_partition_candidates.py tests/unit/test_checkpoint_generic_state.py`
   - Acceptance Criteria: `REGRESSION_BASELINE=PASS`.
+  - Gate Evidence:
+    - `REGRESSION_BASELINE=PASS`
+    - Command: `pytest tests/unit/test_cli_registration.py tests/unit/test_job_manager_model_coupling.py tests/unit/test_generic_graph_ir.py tests/unit/test_model_profile_memory.py tests/unit/test_partition_candidates.py tests/unit/test_checkpoint_generic_state.py`
+    - Result: `59 passed, 0 failed, 0 xfailed, 0 xpassed, 0 skipped`
 
 ## Phase 1: Planner Semantic Repair
 
