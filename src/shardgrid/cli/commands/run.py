@@ -99,12 +99,21 @@ def _render_human(entrypoint: TrainingEntrypoint, result: JobRunResult) -> str:
     failure = result.status.failure
     if failure is not None:
         lines.append(f"Stage: {failure.stage.value}")
+        if failure.code is not None:
+            lines.append(f"Code: {failure.code.value}")
+        if failure.producer is not None:
+            lines.append(f"Producer: {failure.producer}")
+        lines.append(f"Retryable: {'YES' if failure.retryable else 'NO'}")
         lines.append(f"Failure: {failure.message}")
         if failure.recommended_action:
             lines.append(f"Recommended Action: {failure.recommended_action}")
         artifact_log = failure.runtime_environment.get("artifact_log")
         if artifact_log:
             lines.append(f"Artifact Log: {artifact_log}")
+        for ref in failure.log_refs:
+            lines.append(f"Log Ref: {ref}")
+        for ref in failure.artifact_refs:
+            lines.append(f"Artifact Ref: {ref}")
     return "\n".join(lines)
 
 

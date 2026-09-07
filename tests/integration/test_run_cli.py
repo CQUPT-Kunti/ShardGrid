@@ -213,6 +213,193 @@ def test_failure_display_contract_includes_stage_message_and_artifact_ref() -> N
     assert failure.runtime_environment["artifact_log"] == "diagnostics/capture.json"
 
 
+def test_run_human_output_shows_structured_failure_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from shardgrid.common.enums import FailureCode
+
+    class FakeManager:
+        def __init__(self, config) -> None:
+            del config
+
+        def run_entrypoint(self, entrypoint: run_command.TrainingEntrypoint) -> JobRunResult:
+            del entrypoint
+            snapshot = JobSnapshot(
+                job_id=as_job_id("job-run-structured"),
+                root_path=str(tmp_path / "jobs" / "job-run-structured"),
+                code_path=str(tmp_path / "jobs" / "job-run-structured" / "code"),
+                config_path=str(tmp_path / "jobs" / "job-run-structured" / "config"),
+                plan_path=str(tmp_path / "jobs" / "job-run-structured" / "plan"),
+                logs_path=str(tmp_path / "jobs" / "job-run-structured" / "logs"),
+                environment_path=str(tmp_path / "jobs" / "job-run-structured" / "environment"),
+                checkpoint_path=str(tmp_path / "jobs" / "job-run-structured" / "checkpoint"),
+                diagnostics_path=str(tmp_path / "jobs" / "job-run-structured" / "diagnostics"),
+            )
+            job = TrainingJob(
+                job_id=snapshot.job_id,
+                config_path=str(tmp_path / "train.yaml"),
+                model="tiny",
+                requested_world_size=1,
+                backend_preference=as_backend_name("gloo"),
+                runtime_environment_ref="env:cluster/shardgrid",
+            )
+            status = JobStatus(
+                job_id=job.job_id,
+                state=JobState.FAILED,
+                phase="training",
+                backend=as_backend_name("gloo"),
+                final_metrics={},
+                checkpoint_ref=None,
+                failure=make_failure_record(
+                    stage=FailureStage.TRAIN,
+                    code=FailureCode.RUNTIME_FAILURE,
+                    producer="ssh_launcher",
+                    host="control.local",
+                    rank=1,
+                    message="worker training process failed",
+                    recommended_action="inspect rank logs and rerun",
+                    log_refs=("logs/train.rank1.stdout",),
+                    artifact_refs=("checkpoint/model-state.pt",),
+                    retryable=True,
+                ),
+            )
+            return JobRunResult(job=job, status=status, snapshot=snapshot)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(run_command, "JobManager", FakeManager)
+
+    exit_code = main(["--config", str(_cluster_config(tmp_path)), "run", "train.py"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "Stage: TRAIN" in output
+    assert "Code: RUNTIME_FAILURE" in output
+    assert "Producer: ssh_launcher" in output
+    assert "Retryable: YES" in output
+    assert "Log Ref: logs/train.rank1.stdout" in output
+    assert "Artifact Ref: checkpoint/model-state.pt" in output
+
+
+def test_run_json_output_is_machine_readable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json as jsonlib
+
+    from shardgrid.common.enums import FailureCode
+
+    class FakeManager:
+        def __init__(self, config) -> None:
+            del config
+
+        def run_entrypoint(self, entrypoint: run_command.TrainingEntrypoint) -> JobRunResult:
+            del entrypoint
+            return _result(tmp_path, JobState.FAILED)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(run_command, "JobManager", FakeManager)
+
+    exit_code = main(
+        [
+            "--config",
+            str(_cluster_config(tmp_path)),
+            "run",
+            "--json",
+            "train.py",
+        ]
+    )
+
+    payload = jsonlib.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["failure"]["stage"] == "PLAN"
+    assert payload["failure"]["code"] is None
+    assert payload["failure"]["retryable"] is False
+    assert payload["failure"]["producer"] is None
+    assert payload["failure"]["log_refs"] == []
+    assert payload["failure"]["artifact_refs"] == []
+
+
+def test_run_json_output_preserves_structured_failure_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import json as jsonlib
+
+    from shardgrid.common.enums import FailureCode
+
+    class FakeManager:
+        def __init__(self, config) -> None:
+            del config
+
+        def run_entrypoint(self, entrypoint: run_command.TrainingEntrypoint) -> JobRunResult:
+            del entrypoint
+            snapshot = JobSnapshot(
+                job_id=as_job_id("job-run-json-code"),
+                root_path=str(tmp_path / "jobs" / "job-run-json-code"),
+                code_path=str(tmp_path / "jobs" / "job-run-json-code" / "code"),
+                config_path=str(tmp_path / "jobs" / "job-run-json-code" / "config"),
+                plan_path=str(tmp_path / "jobs" / "job-run-json-code" / "plan"),
+                logs_path=str(tmp_path / "jobs" / "job-run-json-code" / "logs"),
+                environment_path=str(tmp_path / "jobs" / "job-run-json-code" / "environment"),
+                checkpoint_path=str(tmp_path / "jobs" / "job-run-json-code" / "checkpoint"),
+                diagnostics_path=str(tmp_path / "jobs" / "job-run-json-code" / "diagnostics"),
+            )
+            job = TrainingJob(
+                job_id=snapshot.job_id,
+                config_path=str(tmp_path / "train.yaml"),
+                model="tiny",
+                requested_world_size=1,
+                backend_preference=as_backend_name("gloo"),
+                runtime_environment_ref="env:cluster/shardgrid",
+            )
+            status = JobStatus(
+                job_id=job.job_id,
+                state=JobState.FAILED,
+                phase="checkpoint",
+                backend=as_backend_name("gloo"),
+                final_metrics={},
+                checkpoint_ref=None,
+                failure=make_failure_record(
+                    stage=FailureStage.CHECKPOINT,
+                    code=FailureCode.RUNTIME_FAILURE,
+                    producer="job_manager",
+                    host="control.local",
+                    message="checkpoint merge failed",
+                    recommended_action="inspect checkpoint logs",
+                    log_refs=("logs/checkpoint.stdout",),
+                    artifact_refs=("checkpoint/model-state.pt",),
+                    retryable=False,
+                ),
+            )
+            return JobRunResult(job=job, status=status, snapshot=snapshot)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(run_command, "JobManager", FakeManager)
+
+    exit_code = main(
+        [
+            "--config",
+            str(_cluster_config(tmp_path)),
+            "run",
+            "--json",
+            "train.py",
+        ]
+    )
+
+    payload = jsonlib.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["failure"]["stage"] == "CHECKPOINT"
+    assert payload["failure"]["code"] == "RUNTIME_FAILURE"
+    assert payload["failure"]["producer"] == "job_manager"
+    assert payload["failure"]["retryable"] is False
+    assert payload["failure"]["log_refs"] == ["logs/checkpoint.stdout"]
+    assert payload["failure"]["artifact_refs"] == ["checkpoint/model-state.pt"]
+
+
 def test_existing_train_command_remains_available(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
