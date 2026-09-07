@@ -354,6 +354,9 @@ def _run_training(
         "loss_isfinite": final_loss is None or math.isfinite(final_loss),
         "checkpoint_roundtrip_ok": True,
         "checkpoint_ref": "checkpoint/model.pt",
+        "checkpoint_path": str(
+            (_snapshot_root() / "checkpoint" / "model.pt").resolve()
+        ),
     }
     return {"runtime": runtime_evidence, "train": train}
 
@@ -1125,11 +1128,15 @@ def _input_sample() -> tuple[Any, ...]:
     args = context.get("model_call", {}).get("args")
     names: tuple[str, ...] = ()
     if isinstance(args, dict):
-        names = tuple(str(key) for key in sorted(args))
+        kind = args.get("kind")
+        if kind in {"tuple", "list"}:
+            names = tuple(str(index) for index in range(len(_pytree_children(args))))
+        elif kind in {"dict", "kwargs"}:
+            names = tuple(str(key) for key in sorted(_pytree_children(args)))
+        elif args.get("kind") == "tensor":
+            names = ("0",)
     elif isinstance(args, tuple):
         names = tuple(str(index) for index in range(len(args)))
-    elif args is not None and not isinstance(args, (list, tuple)):
-        names = ("0",)
     if not names:
         metadata = context.get("tensor_metadata", {})
         if isinstance(metadata, dict) and metadata:
@@ -1141,6 +1148,14 @@ def _input_sample() -> tuple[Any, ...]:
             raise ValueError(f"CAPTURE_ARTIFACT_MISSING: plan/input-{key}.pt is required")
         samples.append(torch.load(artifact, map_location="cpu", weights_only=False))
     return tuple(samples)
+
+
+def _pytree_children(args: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in args.items()
+        if key not in {"kind", "fields"}
+    }
 
 
 def _memory_peak(device: torch.device) -> dict[str, int]:

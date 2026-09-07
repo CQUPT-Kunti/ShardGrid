@@ -4007,7 +4007,10 @@ class JobManager:
         if step_values:
             manifest["training_step"] = next(iter(step_values))
         consolidation = training_config.artifacts.checkpoint.consolidation
-        generic_dag_checkpoint = training_config.model.type == "generic_dag"
+        generic_dag_checkpoint = training_config.model.type in {
+            "generic_dag",
+            "captured_entrypoint",
+        }
         optional_artifact: dict[str, object] = {
             "enabled": consolidation.enabled or generic_dag_checkpoint,
             "required": consolidation.required or generic_dag_checkpoint,
