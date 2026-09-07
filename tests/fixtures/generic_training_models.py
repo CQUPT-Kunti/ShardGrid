@@ -84,7 +84,7 @@ class KeywordAttention(nn.Module):
         self.norm = nn.LayerNorm(8)
         self.head = nn.Linear(8, 2)
 
-    def forward(self, *, tokens: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         hidden, _weights = self.attn(
             tokens,
             tokens,
@@ -93,6 +93,23 @@ class KeywordAttention(nn.Module):
             need_weights=False,
         )
         return self.head(self.norm(tokens + hidden).mean(dim=1))
+
+
+class EncoderDecoderMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(6, 10), nn.ReLU(), nn.Linear(10, 8))
+        self.bridge = nn.Linear(8, 8)
+        self.decoder = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(8, 10),
+            nn.ReLU(),
+            nn.Linear(10, 4),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        encoded = self.encoder(x)
+        return self.decoder(self.bridge(encoded))
 
 
 class TinyUNetLike(nn.Module):
@@ -189,10 +206,15 @@ def _cases() -> dict[str, Callable[[], GenericTrainingCase]]:
         "attention": lambda: GenericTrainingCase(
             "attention",
             KeywordAttention(),
-            kwargs={
-                "tokens": torch.randn(2, 4, 8),
-                "mask": torch.tensor([[False, False, False, True], [False, False, True, True]]),
-            },
+            (
+                torch.randn(2, 4, 8),
+                torch.tensor([[False, False, False, True], [False, False, True, True]]),
+            ),
+        ),
+        "encoder_decoder": lambda: GenericTrainingCase(
+            "encoder_decoder",
+            EncoderDecoderMLP(),
+            (torch.randn(3, 6),),
         ),
         "unet_like": lambda: GenericTrainingCase(
             "unet_like",

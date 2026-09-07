@@ -495,7 +495,7 @@ def _node_parameter_paths(node: Any, module_by_path: Mapping[str, Any]) -> tuple
         return ()
     return tuple(
         f"{module_path}.{name}" if module_path else name
-        for name, _parameter in module.named_parameters(recurse=False)
+        for name, _parameter in _module_named_parameters(module)
     )
 
 
@@ -508,7 +508,7 @@ def _node_buffer_paths(node: Any, module_by_path: Mapping[str, Any]) -> tuple[st
         return ()
     return tuple(
         f"{module_path}.{name}" if module_path else name
-        for name, _buffer in module.named_buffers(recurse=False)
+        for name, _buffer in _module_named_buffers(module)
     )
 
 
@@ -616,11 +616,25 @@ def _named_parameters(model: Any) -> tuple[tuple[str, Any], ...]:
         return tuple(model.named_parameters())
 
 
+def _module_named_parameters(module: Any) -> tuple[tuple[str, Any], ...]:
+    try:
+        return tuple(module.named_parameters(recurse=True, remove_duplicate=False))
+    except TypeError:
+        return tuple(module.named_parameters(recurse=True))
+
+
 def _named_buffers(model: Any) -> tuple[tuple[str, Any], ...]:
     try:
         return tuple(model.named_buffers(remove_duplicate=False))
     except TypeError:
         return tuple(model.named_buffers())
+
+
+def _module_named_buffers(module: Any) -> tuple[tuple[str, Any], ...]:
+    try:
+        return tuple(module.named_buffers(recurse=True, remove_duplicate=False))
+    except TypeError:
+        return tuple(module.named_buffers(recurse=True))
 
 
 def _state_objects(
