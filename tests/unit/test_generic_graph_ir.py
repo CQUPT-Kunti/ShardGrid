@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from examples.models import generic_partition_zoo  # noqa: E402
 from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_sample  # noqa: E402
 
+from shardgrid.common.enums import FailureCode  # noqa: E402
 from shardgrid.planner.generic_graph import (  # noqa: E402
     CanonicalGraphIR,
     GraphCaptureUnsupported,
@@ -242,6 +243,23 @@ def test_custom_op_failure_is_classified_without_incomplete_graph(monkeypatch) -
 
     assert error.value.code == "CUSTOM_OP_UNSUPPORTED"
     assert error.value.diagnostics
+
+
+def test_capture_failure_codes_are_structured_failure_taxonomy_values() -> None:
+    with pytest.raises(GraphCaptureUnsupported) as error:
+        capture_generic_graph_with_backend_fallback(
+            DynamicControlFlowModel().eval(),
+            sample_args=(torch.randn(2, 4),),
+        )
+
+    assert isinstance(error.value.code, FailureCode)
+    assert error.value.code is FailureCode.DYNAMIC_CONTROL_FLOW_UNSUPPORTED
+    assert set(FailureCode.__members__) >= {
+        "MODEL_CAPTURE_UNSUPPORTED",
+        "GRAPH_BREAK_UNSUPPORTED",
+        "CUSTOM_OP_UNSUPPORTED",
+        "DYNAMIC_CONTROL_FLOW_UNSUPPORTED",
+    }
 
 
 def _capture(name: str):

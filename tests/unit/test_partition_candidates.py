@@ -26,6 +26,7 @@ from examples.models.partition_stress_model import (
 from torch import nn
 from torch.fx import wrap
 
+from shardgrid.common.enums import FailureCode
 from shardgrid.planner.generic_graph import capture_generic_graph
 from shardgrid.planner.memory import MemoryEstimationConfig, build_model_profile
 from shardgrid.planner.partitioning import (
@@ -815,6 +816,7 @@ def test_untraceable_dynamic_control_flow_returns_structured_unsupported() -> No
 
     assert result.status == FeasibilityStatus.UNSUPPORTED
     assert any("untraceable graph" in reason for reason in result.reasons)
+    assert result.failure_code is FailureCode.GRAPH_BREAK_UNSUPPORTED
 
 
 def test_custom_op_returns_structured_unsupported() -> None:
@@ -837,6 +839,42 @@ def test_custom_op_returns_structured_unsupported() -> None:
 
     assert result.status == FeasibilityStatus.UNSUPPORTED
     assert any("unsupported custom op" in reason for reason in result.reasons)
+    assert result.failure_code is FailureCode.CUSTOM_OP_UNSUPPORTED
+
+
+def test_partition_failure_codes_distinguish_budget_from_no_feasible_plan() -> None:
+    case = _ordinary_case("sequential")
+    profile = _profile_case(case, "sequential")
+    support = discover_partition_support(
+        case.module,
+        profile,
+        sample_args=case.args,
+    )
+    capacity = (1000, 1000)
+
+    budget_result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+        min_stage_count=2,
+        max_stage_count=3,
+        usable_memory_bytes=capacity,
+        max_candidates=1,
+    )
+    full_result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+        min_stage_count=2,
+        max_stage_count=3,
+        usable_memory_bytes=capacity,
+        max_candidates=1000,
+    )
+
+    assert budget_result.status == FeasibilityStatus.INFEASIBLE
+    assert budget_result.failure_code is FailureCode.SEARCH_BUDGET_LIMIT
+    assert full_result.status == FeasibilityStatus.INFEASIBLE
+    assert full_result.failure_code is FailureCode.NO_FEASIBLE_PLAN
 
 
 def test_shared_parameter_boundary_is_rejected_explicitly() -> None:

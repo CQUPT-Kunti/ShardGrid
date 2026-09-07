@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+from shardgrid.common.enums import FailureCode
 from shardgrid.engines.models import (
     AutomaticPartitionSupport,
     BoundaryTensorSpec,
@@ -176,6 +177,7 @@ class PartitionGenerationResult:
     partition_support: AutomaticPartitionSupport | None = None
     reasons: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    failure_code: FailureCode | None = None
 
 
 @dataclass(frozen=True)
@@ -318,6 +320,7 @@ def generate_partition_candidates(
             status=_support_to_feasibility(support.status),
             partition_support=support,
             reasons=support.reasons,
+            failure_code=_support_failure_code(support),
         )
     if graph is not None:
         return _generate_graph_partition_candidates(
@@ -338,6 +341,7 @@ def generate_partition_candidates(
             engine_id=profile.engine_id,
             status=FeasibilityStatus.UNSUPPORTED,
             reasons=("partition support metadata is required",),
+            failure_code=FailureCode.PARTITION_FAILURE,
         )
     if support.status is not PartitionSupportStatus.SUPPORTED:
         return PartitionGenerationResult(
@@ -346,6 +350,7 @@ def generate_partition_candidates(
             status=_support_to_feasibility(support.status),
             partition_support=support,
             reasons=support.reasons,
+            failure_code=_support_failure_code(support),
         )
 
     try:
@@ -357,6 +362,7 @@ def generate_partition_candidates(
             status=FeasibilityStatus.UNSUPPORTED,
             partition_support=support,
             reasons=(str(exc),),
+            failure_code=FailureCode.PARTITION_FAILURE,
         )
 
     if not support.boundaries:
@@ -366,6 +372,7 @@ def generate_partition_candidates(
             status=FeasibilityStatus.UNSUPPORTED,
             partition_support=support,
             reasons=("no partition boundaries available",),
+            failure_code=FailureCode.PARTITION_FAILURE,
         )
 
     capacities = _normalize_capacity_bytes(usable_memory_bytes)
@@ -376,6 +383,7 @@ def generate_partition_candidates(
             status=FeasibilityStatus.INFEASIBLE,
             partition_support=support,
             reasons=("insufficient usable-memory capacity slots for requested stage count",),
+            failure_code=FailureCode.PARTITION_FAILURE,
         )
 
     upper_stage_count = max_stage_count or min(len(ordered_modules), len(support.boundaries) + 1)
@@ -390,6 +398,7 @@ def generate_partition_candidates(
 
     candidates: list[PartitionCandidate] = []
     failures: list[str] = []
+    budget_exhausted = False
     for stage_count in range(min_stage_count, upper_stage_count + 1):
         ranges = _plan_stage_ranges(
             ordered_modules,
@@ -416,6 +425,7 @@ def generate_partition_candidates(
             )
         )
         if len(candidates) >= max_candidates:
+            budget_exhausted = True
             break
 
     if not candidates:
@@ -427,6 +437,7 @@ def generate_partition_candidates(
             reasons=tuple(sorted(set(failures))) or (
                 "no stage candidates can be generated from discovered boundaries",
             ),
+            failure_code=FailureCode.PARTITION_FAILURE,
         )
 
     ordered = tuple(sorted(candidates, key=_candidate_sort_key))
@@ -449,6 +460,13 @@ def generate_partition_candidates(
                 }
             )
         )
+    failure_code = None
+    if status is not FeasibilityStatus.FEASIBLE:
+        failure_code = (
+            FailureCode.SEARCH_BUDGET_LIMIT
+            if budget_exhausted
+            else FailureCode.NO_FEASIBLE_PLAN
+        )
     return PartitionGenerationResult(
         model_profile_id=profile.profile_id,
         engine_id=profile.engine_id,
@@ -456,6 +474,7 @@ def generate_partition_candidates(
         candidates=ordered,
         partition_support=support,
         reasons=reasons,
+        failure_code=failure_code,
     )
 
 
@@ -479,6 +498,7 @@ def _generate_graph_partition_candidates(
             status=FeasibilityStatus.UNSUPPORTED,
             partition_support=partition_support,
             reasons=("no execution graph nodes available",),
+            failure_code=FailureCode.PARTITION_FAILURE,
         )
     capacities = _normalize_capacity_bytes(usable_memory_bytes)
     if capacities and len(capacities) < min_stage_count:
@@ -488,11 +508,13 @@ def _generate_graph_partition_candidates(
             status=FeasibilityStatus.INFEASIBLE,
             partition_support=partition_support,
             reasons=("insufficient usable-memory capacity slots for requested stage count",),
+            failure_code=FailureCode.PARTITION_FAILURE,
         )
 
     upper = max_stage_count or min(len(nodes), len(capacities) if capacities else len(nodes))
     upper = min(upper, len(nodes))
     candidates: list[PartitionCandidate] = []
+    budget_exhausted = False
     for stage_count in range(min_stage_count, upper + 1):
         ranges = _balanced_node_ranges(nodes, stage_count)
         candidate = _build_graph_candidate(
@@ -506,6 +528,7 @@ def _generate_graph_partition_candidates(
         )
         candidates.append(candidate)
         if len(candidates) >= max_candidates:
+            budget_exhausted = True
             break
 
     ordered = tuple(sorted(candidates, key=_candidate_sort_key))
@@ -517,6 +540,13 @@ def _generate_graph_partition_candidates(
         )
         else FeasibilityStatus.INFEASIBLE
     )
+    failure_code = None
+    if status is not FeasibilityStatus.FEASIBLE:
+        failure_code = (
+            FailureCode.SEARCH_BUDGET_LIMIT
+            if budget_exhausted
+            else FailureCode.NO_FEASIBLE_PLAN
+        )
     return PartitionGenerationResult(
         model_profile_id=profile.profile_id,
         engine_id=profile.engine_id,
@@ -534,6 +564,7 @@ def _generate_graph_partition_candidates(
         )
         if status is FeasibilityStatus.INFEASIBLE
         else (),
+        failure_code=failure_code,
     )
 
 
@@ -1173,6 +1204,15 @@ def _blocks_graph_partitioning(support: AutomaticPartitionSupport) -> bool:
     if support.status is PartitionSupportStatus.SUPPORTED:
         return False
     return any("unsupported custom op" in reason for reason in support.reasons)
+
+
+def _support_failure_code(support: AutomaticPartitionSupport) -> FailureCode:
+    reasons = " ".join(support.reasons).lower()
+    if "unsupported custom op" in reasons:
+        return FailureCode.CUSTOM_OP_UNSUPPORTED
+    if "untraceable graph" in reasons or "torch.fx failed" in reasons:
+        return FailureCode.GRAPH_BREAK_UNSUPPORTED
+    return FailureCode.PARTITION_FAILURE
 
 
 def _graph_stage_state_ids(

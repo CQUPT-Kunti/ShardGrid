@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
+from shardgrid.common.enums import FailureCode
+
 GRAPH_IR_SCHEMA_VERSION = "shardgrid.canonical_graph.v1"
 
 
@@ -141,7 +143,7 @@ class GraphCaptureResult:
 class GraphCaptureUnsupported(ValueError):
     def __init__(
         self,
-        code: str,
+        code: FailureCode | str,
         message: str,
         *,
         diagnostics: Sequence[str] = (),
@@ -149,7 +151,7 @@ class GraphCaptureUnsupported(ValueError):
         fallback_allowed: bool = False,
     ) -> None:
         super().__init__(message)
-        self.code = code
+        self.code = FailureCode.from_value(str(code))
         self.diagnostics = tuple(diagnostics)
         self.backend = backend
         self.fallback_allowed = fallback_allowed
@@ -922,10 +924,10 @@ def _custom_op_diagnostics(graph_module: Any) -> tuple[str, ...]:
     )
 
 
-def _classify_capture_exception(exc: BaseException) -> str:
+def _classify_capture_exception(exc: BaseException) -> FailureCode:
     text = f"{exc.__class__.__name__}: {exc}".lower()
     if any(token in text for token in ("custom op", "custom_op", "no fake impl")):
-        return "CUSTOM_OP_UNSUPPORTED"
+        return FailureCode.CUSTOM_OP_UNSUPPORTED
     if any(
         token in text
         for token in (
@@ -936,10 +938,10 @@ def _classify_capture_exception(exc: BaseException) -> str:
             "symbolically traced variables cannot be used as inputs to control flow",
         )
     ):
-        return "DYNAMIC_CONTROL_FLOW_UNSUPPORTED"
+        return FailureCode.DYNAMIC_CONTROL_FLOW_UNSUPPORTED
     if any(token in text for token in ("graph break", "graph_break", "unsupported")):
-        return "GRAPH_BREAK_UNSUPPORTED"
-    return "MODEL_CAPTURE_UNSUPPORTED"
+        return FailureCode.GRAPH_BREAK_UNSUPPORTED
+    return FailureCode.MODEL_CAPTURE_UNSUPPORTED
 
 
 def _is_allowed_function(target: Any) -> bool:
