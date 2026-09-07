@@ -7,6 +7,7 @@ import json
 import os
 import random
 import shlex
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -390,6 +391,8 @@ class JobManager:
         self._last_planning_evidence: dict[str, object] = {}
         self._last_parallel_plan_candidates: tuple[ParallelPlan, ...] = ()
         self._data_test_cache: dict[tuple[str, str], tuple[float, bool, str | None]] = {}
+        self._captured_runtime_artifacts_ready = False
+        self._latest_captured_snapshot: JobSnapshot | None = None
 
     def run(
         self,
@@ -737,35 +740,136 @@ class JobManager:
                 snapshot_path=str(self._artifact_store.snapshot_paths(job.job_id).root),
             )
         )
-        create_code_snapshot(snapshot, source_root=self._source_root, secrets=self._secrets)
-        execution_plan = self._build_execution_plan(
+        return self._execute_planned_job(
             job=job,
             training_config=training_config,
-            parallel_plan=selected_engine.parallel_plan,
-            workers=selected_workers,
+            selected_engine=selected_engine,
+            selected_workers=selected_workers,
+            cluster_state=cluster_state,
+            network_state=network_state,
+            current=current,
             snapshot=snapshot,
-            rejected_engine_ids=selected_engine.rejected_engine_ids,
+            planning_evidence=planning_evidence,
+            dry_run=dry_run,
         )
-        if not dry_run:
-            try:
-                execution_plan, cluster_state, network_state = self._prepare_live_execution_plan(
-                    training_config=training_config,
+
+
+    def _execute_planned_job(
+        self,
+        *,
+        job: TrainingJob,
+        training_config: TrainingConfig,
+        selected_engine: SelectedEngine,
+        selected_workers: list[WorkerConfig],
+        cluster_state: ClusterState,
+        network_state: NetworkState,
+        current: JobStatus,
+        snapshot: JobSnapshot,
+        planning_evidence: dict[str, object] | None,
+        dry_run: bool,
+    ) -> JobRunResult:
+            snapshot = self._artifact_store.create_snapshot(
+                replace(
+                    job,
+                    snapshot_path=str(self._artifact_store.snapshot_paths(job.job_id).root),
+                )
+            )
+            create_code_snapshot(snapshot, source_root=self._source_root, secrets=self._secrets)
+            execution_plan = self._build_execution_plan(
+                job=job,
+                training_config=training_config,
+                parallel_plan=selected_engine.parallel_plan,
+                workers=selected_workers,
+                snapshot=snapshot,
+                rejected_engine_ids=selected_engine.rejected_engine_ids,
+            )
+            if not dry_run:
+                try:
+                    execution_plan, cluster_state, network_state = self._prepare_live_execution_plan(
+                        training_config=training_config,
+                        execution_plan=execution_plan,
+                        cluster_state=cluster_state,
+                        network_state=network_state,
+                    )
+                except Exception as exc:
+                    failure = make_failure_record(
+                        stage=FailureStage.LAUNCH,
+                        host=str(self.cluster_config.control.hostname),
+                        message=f"live execution preflight failed: {exc}",
+                        recommended_action=(
+                            "repair the selected workers or rerun planning before launch"
+                        ),
+                        secrets=self._secrets,
+                    )
+                    current = self._failed_status(current, phase="launch", failure=failure)
+                    self._status_store.save_path(self._status_store.status_path(job.job_id), current)
+                    return self._failed_run_result(
+                        job,
+                        current,
+                        snapshot=snapshot,
+                        execution_plan=execution_plan,
+                        parallel_plan=selected_engine.parallel_plan,
+                        cluster_state=cluster_state,
+                        network_state=network_state,
+                    )
+            current = self._persist_status(
+                replace(
+                    current,
+                    workers=[assignment.worker_id for assignment in execution_plan.workers],
+                    assignments=list(execution_plan.workers),
+                    runtime_environment_refs=self._runtime_refs(execution_plan),
+                    backend=execution_plan.backend,
+                ),
+                snapshot=snapshot,
+                state=JobState.SNAPSHOTTING,
+                phase="plan",
+            )
+            launch_metadata = self._launch_metadata(
+                selected_engine,
+                planning_evidence=planning_evidence,
+            )
+            probe_selection = (planning_evidence or {}).get("memory_probe_selection")
+            if isinstance(probe_selection, dict):
+                launch_metadata["memory_probe_selection_ref"] = str(
+                    self._write_memory_probe_selection_artifact(
+                        snapshot=snapshot,
+                        selection=probe_selection,
+                    )
+                )
+
+            self._write_snapshot_metadata(
+                snapshot=snapshot,
+                job=job,
+                training_config=training_config,
+                parallel_plan=selected_engine.parallel_plan,
+                execution_plan=execution_plan,
+                network_state=network_state,
+                job_status=current,
+                launch_metadata=launch_metadata,
+                dry_run=dry_run,
+            )
+            if dry_run:
+                return JobRunResult(
+                    job=job,
+                    status=current,
+                    snapshot=snapshot,
                     execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
                     cluster_state=cluster_state,
                     network_state=network_state,
                 )
-            except Exception as exc:
+
+            preparation = selected_engine.engine.prepare(snapshot, execution_plan)
+            if preparation.status not in (BackendStatus.AVAILABLE, BackendStatus.EXPERIMENTAL):
                 failure = make_failure_record(
-                    stage=FailureStage.LAUNCH,
+                    stage=FailureStage.PLAN,
                     host=str(self.cluster_config.control.hostname),
-                    message=f"live execution preflight failed: {exc}",
-                    recommended_action=(
-                        "repair the selected workers or rerun planning before launch"
-                    ),
+                    message="engine preparation did not produce an available runtime",
+                    recommended_action="inspect engine diagnostics and rerun planning",
                     secrets=self._secrets,
                 )
-                current = self._failed_status(current, phase="launch", failure=failure)
-                self._status_store.save_path(self._status_store.status_path(job.job_id), current)
+                current = self._failed_status(current, phase="plan", failure=failure)
+                self._save_status(current, snapshot=snapshot)
                 return self._failed_run_result(
                     job,
                     current,
@@ -775,43 +879,314 @@ class JobManager:
                     cluster_state=cluster_state,
                     network_state=network_state,
                 )
-        current = self._persist_status(
-            replace(
-                current,
-                workers=[assignment.worker_id for assignment in execution_plan.workers],
-                assignments=list(execution_plan.workers),
+            launcher = self._launcher_factory(training_config.job.backend)
+            context = LauncherContext(
+                job=job,
+                execution_plan=execution_plan,
+                cluster_state=cluster_state,
+                snapshot=snapshot,
+                job_status=current,
                 runtime_environment_refs=self._runtime_refs(execution_plan),
-                backend=execution_plan.backend,
-            ),
-            snapshot=snapshot,
-            state=JobState.SNAPSHOTTING,
-            phase="plan",
-        )
-        launch_metadata = self._launch_metadata(
-            selected_engine,
-            planning_evidence=planning_evidence,
-        )
-        probe_selection = (planning_evidence or {}).get("memory_probe_selection")
-        if isinstance(probe_selection, dict):
-            launch_metadata["memory_probe_selection_ref"] = str(
-                self._write_memory_probe_selection_artifact(
-                    snapshot=snapshot,
-                    selection=probe_selection,
-                )
             )
 
-        self._write_snapshot_metadata(
-            snapshot=snapshot,
-            job=job,
-            training_config=training_config,
-            parallel_plan=selected_engine.parallel_plan,
-            execution_plan=execution_plan,
-            network_state=network_state,
-            job_status=current,
-            launch_metadata=launch_metadata,
-            dry_run=dry_run,
-        )
-        if dry_run:
+            current = self._persist_status(
+                current,
+                snapshot=snapshot,
+                state=JobState.DISTRIBUTING,
+                phase="distribute",
+            )
+            context = replace(context, job_status=current)
+            prepare_result = launcher.prepare(context)
+            if prepare_result.status not in {LauncherResultStatus.SUCCESS, LauncherResultStatus.NOOP}:
+                current = self._failed_status(
+                    current,
+                    phase="distribute",
+                    failure=self._launcher_failure(
+                        prepare_result,
+                        FailureStage.DISTRIBUTE,
+                        "launcher prepare failed before distribution completed",
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=prepare_result,
+                )
+
+            context = replace(context, job_status=self._load_status(snapshot, current))
+            distribute_result = launcher.distribute(context)
+            if distribute_result.status not in {
+                LauncherResultStatus.SUCCESS,
+                LauncherResultStatus.NOOP,
+            }:
+                current = self._failed_status(
+                    self._load_status(snapshot, current),
+                    phase="distribute",
+                    failure=self._launcher_failure(
+                        distribute_result,
+                        FailureStage.DISTRIBUTE,
+                        "launcher distribute failed before launch",
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=distribute_result,
+                )
+
+            conflicts = self._status_store.reserve_resources(job.job_id, execution_plan.workers)
+            if conflicts:
+                current = self._failed_status(
+                    self._load_status(snapshot, current),
+                    phase="launch",
+                    failure=make_failure_record(
+                        stage=FailureStage.LAUNCH,
+                        host=str(self.cluster_config.control.hostname),
+                        message="GPU resource reservation conflict before launch",
+                        recommended_action=(
+                            "wait for the running job to finish or choose different workers"
+                        ),
+                        runtime_environment={
+                            "conflicts": json.dumps(conflicts, sort_keys=True),
+                        },
+                        secrets=self._secrets,
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=distribute_result,
+                )
+
+            current = self._persist_status(
+                self._load_status(snapshot, current),
+                snapshot=snapshot,
+                state=JobState.LAUNCHING,
+                phase="launch",
+            )
+            context = replace(context, job_status=current)
+            launch_result = launcher.launch(context)
+            if launch_result.status not in {LauncherResultStatus.SUCCESS, LauncherResultStatus.NOOP}:
+                current = self._failed_status(
+                    self._load_status(snapshot, current),
+                    phase="launch",
+                    failure=self._launcher_failure(
+                        launch_result,
+                        FailureStage.LAUNCH,
+                        "launcher launch failed before rendezvous",
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                self._status_store.release_resources(job.job_id)
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=launch_result,
+                )
+
+            context = replace(context, job_status=self._load_status(snapshot, current))
+            monitor_result, current = self._monitor_until_terminal(
+                launcher=launcher,
+                context=context,
+                snapshot=snapshot,
+                current=current,
+                training_config=training_config,
+            )
+            if monitor_result.status not in {
+                LauncherResultStatus.SUCCESS,
+                LauncherResultStatus.NOOP,
+            } or current.state is JobState.FAILED:
+                current = self._failed_status(
+                    current,
+                    phase=current.phase,
+                    failure=current.failure
+                    or self._launcher_failure(
+                        monitor_result,
+                        self._failure_stage_for_phase(current.phase),
+                        "launcher monitor observed a terminal failure",
+                    ),
+                )
+                self._stop_failed_job_ranks(
+                    launcher=launcher,
+                    context=replace(context, job_status=current),
+                )
+                current = self._load_status(snapshot, current)
+                self._status_store.release_resources(job.job_id)
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=monitor_result,
+                )
+
+            self._status_store.release_resources(job.job_id)
+            current = self._persist_status(
+                current,
+                snapshot=snapshot,
+                state=JobState.CHECKPOINTING,
+                phase="checkpoint",
+                preserve_metrics=True,
+            )
+            collection_result = self._collect_artifacts(
+                snapshot,
+                training_config,
+                execution_plan,
+                current,
+            )
+            self._write_collection_diagnostics(snapshot, collection_result)
+            if collection_result.status is not CollectionStatus.SUCCESS:
+                current = self._failed_status(
+                    current,
+                    phase="checkpoint",
+                    failure=self._artifact_collection_failure(collection_result),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    collection_result=collection_result,
+                    launcher_result=monitor_result,
+                )
+
+            try:
+                checkpoint_metadata = self._finalize_checkpoint_bundle(
+                    snapshot=snapshot,
+                    training_config=training_config,
+                    execution_plan=execution_plan,
+                    current=current,
+                    collection_result=collection_result,
+                )
+            except Exception as exc:
+                current = self._failed_status(
+                    current,
+                    phase="checkpoint",
+                    failure=make_failure_record(
+                        stage=FailureStage.CHECKPOINT,
+                        host=str(self.cluster_config.control.hostname),
+                        message=f"distributed checkpoint finalization failed: {exc}",
+                        recommended_action=(
+                            "inspect collected checkpoint shards and rerun the job"
+                        ),
+                        secrets=self._secrets,
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    collection_result=collection_result,
+                    launcher_result=monitor_result,
+                )
+
+            current = self._complete_status(
+                current,
+                checkpoint_ref=str(checkpoint_metadata["checkpoint_ref"]),
+            )
+            self._save_terminal_snapshot(
+                snapshot,
+                job,
+                training_config,
+                selected_engine.parallel_plan,
+                execution_plan,
+                network_state,
+                current,
+                checkpoint_metadata=checkpoint_metadata,
+                launch_metadata=launch_metadata,
+            )
             return JobRunResult(
                 job=job,
                 status=current,
@@ -820,354 +1195,19 @@ class JobManager:
                 parallel_plan=selected_engine.parallel_plan,
                 cluster_state=cluster_state,
                 network_state=network_state,
-            )
-
-        preparation = selected_engine.engine.prepare(snapshot, execution_plan)
-        if preparation.status not in (BackendStatus.AVAILABLE, BackendStatus.EXPERIMENTAL):
-            failure = make_failure_record(
-                stage=FailureStage.PLAN,
-                host=str(self.cluster_config.control.hostname),
-                message="engine preparation did not produce an available runtime",
-                recommended_action="inspect engine diagnostics and rerun planning",
-                secrets=self._secrets,
-            )
-            current = self._failed_status(current, phase="plan", failure=failure)
-            self._save_status(current, snapshot=snapshot)
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-            )
-        launcher = self._launcher_factory(training_config.job.backend)
-        context = LauncherContext(
-            job=job,
-            execution_plan=execution_plan,
-            cluster_state=cluster_state,
-            snapshot=snapshot,
-            job_status=current,
-            runtime_environment_refs=self._runtime_refs(execution_plan),
-        )
-
-        current = self._persist_status(
-            current,
-            snapshot=snapshot,
-            state=JobState.DISTRIBUTING,
-            phase="distribute",
-        )
-        context = replace(context, job_status=current)
-        prepare_result = launcher.prepare(context)
-        if prepare_result.status not in {LauncherResultStatus.SUCCESS, LauncherResultStatus.NOOP}:
-            current = self._failed_status(
-                current,
-                phase="distribute",
-                failure=self._launcher_failure(
-                    prepare_result,
-                    FailureStage.DISTRIBUTE,
-                    "launcher prepare failed before distribution completed",
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=prepare_result,
-            )
-
-        context = replace(context, job_status=self._load_status(snapshot, current))
-        distribute_result = launcher.distribute(context)
-        if distribute_result.status not in {
-            LauncherResultStatus.SUCCESS,
-            LauncherResultStatus.NOOP,
-        }:
-            current = self._failed_status(
-                self._load_status(snapshot, current),
-                phase="distribute",
-                failure=self._launcher_failure(
-                    distribute_result,
-                    FailureStage.DISTRIBUTE,
-                    "launcher distribute failed before launch",
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=distribute_result,
-            )
-
-        conflicts = self._status_store.reserve_resources(job.job_id, execution_plan.workers)
-        if conflicts:
-            current = self._failed_status(
-                self._load_status(snapshot, current),
-                phase="launch",
-                failure=make_failure_record(
-                    stage=FailureStage.LAUNCH,
-                    host=str(self.cluster_config.control.hostname),
-                    message="GPU resource reservation conflict before launch",
-                    recommended_action=(
-                        "wait for the running job to finish or choose different workers"
-                    ),
-                    runtime_environment={
-                        "conflicts": json.dumps(conflicts, sort_keys=True),
-                    },
-                    secrets=self._secrets,
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=distribute_result,
-            )
-
-        current = self._persist_status(
-            self._load_status(snapshot, current),
-            snapshot=snapshot,
-            state=JobState.LAUNCHING,
-            phase="launch",
-        )
-        context = replace(context, job_status=current)
-        launch_result = launcher.launch(context)
-        if launch_result.status not in {LauncherResultStatus.SUCCESS, LauncherResultStatus.NOOP}:
-            current = self._failed_status(
-                self._load_status(snapshot, current),
-                phase="launch",
-                failure=self._launcher_failure(
-                    launch_result,
-                    FailureStage.LAUNCH,
-                    "launcher launch failed before rendezvous",
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            self._status_store.release_resources(job.job_id)
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=launch_result,
-            )
-
-        context = replace(context, job_status=self._load_status(snapshot, current))
-        monitor_result, current = self._monitor_until_terminal(
-            launcher=launcher,
-            context=context,
-            snapshot=snapshot,
-            current=current,
-            training_config=training_config,
-        )
-        if monitor_result.status not in {
-            LauncherResultStatus.SUCCESS,
-            LauncherResultStatus.NOOP,
-        } or current.state is JobState.FAILED:
-            current = self._failed_status(
-                current,
-                phase=current.phase,
-                failure=current.failure
-                or self._launcher_failure(
-                    monitor_result,
-                    self._failure_stage_for_phase(current.phase),
-                    "launcher monitor observed a terminal failure",
-                ),
-            )
-            self._stop_failed_job_ranks(
-                launcher=launcher,
-                context=replace(context, job_status=current),
-            )
-            current = self._load_status(snapshot, current)
-            self._status_store.release_resources(job.job_id)
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=monitor_result,
-            )
-
-        self._status_store.release_resources(job.job_id)
-        current = self._persist_status(
-            current,
-            snapshot=snapshot,
-            state=JobState.CHECKPOINTING,
-            phase="checkpoint",
-            preserve_metrics=True,
-        )
-        collection_result = self._collect_artifacts(
-            snapshot,
-            training_config,
-            execution_plan,
-            current,
-        )
-        self._write_collection_diagnostics(snapshot, collection_result)
-        if collection_result.status is not CollectionStatus.SUCCESS:
-            current = self._failed_status(
-                current,
-                phase="checkpoint",
-                failure=self._artifact_collection_failure(collection_result),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
                 collection_result=collection_result,
                 launcher_result=monitor_result,
             )
-
-        try:
-            checkpoint_metadata = self._finalize_checkpoint_bundle(
-                snapshot=snapshot,
-                training_config=training_config,
-                execution_plan=execution_plan,
-                current=current,
-                collection_result=collection_result,
-            )
-        except Exception as exc:
-            current = self._failed_status(
-                current,
-                phase="checkpoint",
-                failure=make_failure_record(
-                    stage=FailureStage.CHECKPOINT,
-                    host=str(self.cluster_config.control.hostname),
-                    message=f"distributed checkpoint finalization failed: {exc}",
-                    recommended_action=(
-                        "inspect collected checkpoint shards and rerun the job"
-                    ),
-                    secrets=self._secrets,
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                collection_result=collection_result,
-                launcher_result=monitor_result,
-            )
-
-        current = self._complete_status(
-            current,
-            checkpoint_ref=str(checkpoint_metadata["checkpoint_ref"]),
-        )
-        self._save_terminal_snapshot(
-            snapshot,
-            job,
-            training_config,
-            selected_engine.parallel_plan,
-            execution_plan,
-            network_state,
-            current,
-            checkpoint_metadata=checkpoint_metadata,
-            launch_metadata=launch_metadata,
-        )
-        return JobRunResult(
-            job=job,
-            status=current,
-            snapshot=snapshot,
-            execution_plan=execution_plan,
-            parallel_plan=selected_engine.parallel_plan,
-            cluster_state=cluster_state,
-            network_state=network_state,
-            collection_result=collection_result,
-            launcher_result=monitor_result,
-        )
 
     def run_entrypoint(
         self,
         entrypoint: Any,
         *,
         job_id: JobId | None = None,
+        dry_run: bool | None = None,
     ) -> JobRunResult:
+        if dry_run is None:
+            dry_run = bool(getattr(entrypoint, "dry_run", False))
         self._last_planning_evidence = {}
         self._last_parallel_plan_candidates = ()
         training_config = self._entrypoint_training_config(entrypoint)
@@ -1309,26 +1349,176 @@ class JobManager:
         )
         planning_evidence = dict(self._last_planning_evidence)
         planning_evidence["capture_context_ref"] = "plan/capture-context.json"
-        self._write_snapshot_metadata(
+
+        selected_engine = SelectedEngine(
+            job_id=job.job_id,
+            engine=selected_engine.engine,
+            candidate=selected_engine.candidate,
+            parallel_plan=parallel_plan,
+            original_plan_path=parallel_plan.engine_plan_path,
+            rejected_engine_ids=tuple(
+                getattr(selected_engine, "rejected_engine_ids", ())
+            ),
+        )
+
+        if dry_run:
+            self._write_snapshot_metadata(
+                snapshot=snapshot,
+                job=job,
+                training_config=training_config,
+                parallel_plan=selected_engine.parallel_plan,
+                execution_plan=execution_plan,
+                network_state=network_state,
+                job_status=current,
+                launch_metadata={"capture_context_ref": "plan/capture-context.json"},
+                dry_run=True,
+            )
+            self._last_planning_evidence = planning_evidence
+            return JobRunResult(
+                job=job,
+                status=current,
+                snapshot=snapshot,
+                execution_plan=execution_plan,
+                parallel_plan=parallel_plan,
+                cluster_state=cluster_state,
+                network_state=network_state,
+            )
+
+        self._persist_captured_runtime_artifacts(
             snapshot=snapshot,
+            capture=capture,
+            parallel_plan=parallel_plan,
+        )
+        try:
+            selected_plan, probe_selection = self._select_memory_probe_candidate(
+                job=job,
+                training_config=training_config,
+                candidate_plans=self._last_parallel_plan_candidates
+                or (selected_engine.parallel_plan,),
+                selected_workers=selected_workers,
+                cluster_state=cluster_state,
+                network_state=network_state,
+                rejected_engine_ids=selected_engine.rejected_engine_ids,
+            )
+            planning_evidence["memory_probe_selection"] = probe_selection
+            selected_engine = SelectedEngine(
+                job_id=selected_engine.job_id,
+                engine=selected_engine.engine,
+                candidate=selected_engine.candidate,
+                parallel_plan=selected_plan,
+                original_plan_path=selected_plan.engine_plan_path,
+                rejected_engine_ids=selected_engine.rejected_engine_ids,
+            )
+        except MemoryProbeNoFeasiblePlan as exc:
+            failure = make_failure_record(
+                stage=FailureStage.PLAN,
+                host=str(self.cluster_config.control.hostname),
+                message=(
+                    "NO_FEASIBLE_PLAN: memory probe rejected all candidates: "
+                    f"{exc.result.message}"
+                ),
+                recommended_action=(
+                    "free GPU memory or reduce the model/batch size, then retry"
+                ),
+                runtime_environment={
+                    "probe_result": json.dumps(
+                        exc.result.to_dict(), sort_keys=True
+                    ),
+                },
+                code=FailureCode.MEMORY_REJECT,
+                producer="job_manager",
+                retryable=True,
+                secrets=self._secrets,
+            )
+            current = self._failed_status(current, phase="plan", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+        except MemoryProbeInfraFailure as exc:
+            failure = make_failure_record(
+                stage=FailureStage.RENDEZVOUS,
+                host=str(self.cluster_config.control.hostname),
+                message=(
+                    "PROBE_INFRA_FAILURE: "
+                    f"{exc.result.message}"
+                ),
+                recommended_action=(
+                    "inspect probe rendezvous/SSH/network diagnostics and retry; "
+                    "this is not a GPU memory capacity signal"
+                ),
+                runtime_environment={
+                    "probe_result": json.dumps(
+                        exc.result.to_dict(), sort_keys=True
+                    ),
+                },
+                code=_probe_infra_failure_code(exc),
+                producer="job_manager",
+                retryable=True,
+                secrets=self._secrets,
+            )
+            current = self._failed_status(current, phase="probe_infra", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+        except MemoryProbeRuntimeFailure as exc:
+            failure = make_failure_record(
+                stage=FailureStage.TRAIN,
+                host=str(self.cluster_config.control.hostname),
+                message=(
+                    "PROBE_RUNTIME_FAILURE: "
+                    f"{exc.result.message}"
+                ),
+                recommended_action=(
+                    "inspect probe phase diagnostics and rank logs; "
+                    "this is not a GPU memory capacity signal"
+                ),
+                runtime_environment={
+                    "probe_result": json.dumps(
+                        exc.result.to_dict(), sort_keys=True
+                    ),
+                },
+                code=FailureCode.RUNTIME_FAILURE,
+                producer="job_manager",
+                secrets=self._secrets,
+            )
+            current = self._failed_status(current, phase="memory_probe", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+        except MemoryProbeResourceChanged as exc:
+            failure = make_failure_record(
+                stage=FailureStage.LAUNCH,
+                host=str(self.cluster_config.control.hostname),
+                message=(
+                    "RESOURCE_CHANGED: probe resource revalidation failed "
+                    f"for captured entrypoint: {exc.result.message}"
+                ),
+                recommended_action=(
+                    "wait for active jobs to release GPU memory or add workers"
+                ),
+                runtime_environment={
+                    "probe_result": json.dumps(
+                        exc.result.to_dict(), sort_keys=True
+                    ),
+                },
+                code=FailureCode.RESOURCE_CHANGED,
+                producer="job_manager",
+                retryable=True,
+                secrets=self._secrets,
+            )
+            current = self._failed_status(current, phase="memory_probe", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+
+        self._last_planning_evidence = planning_evidence
+        return self._execute_planned_job(
             job=job,
             training_config=training_config,
-            parallel_plan=parallel_plan,
-            execution_plan=execution_plan,
-            network_state=network_state,
-            job_status=current,
-            launch_metadata={"capture_context_ref": "plan/capture-context.json"},
-            dry_run=True,
-        )
-        self._last_planning_evidence = planning_evidence
-        return JobRunResult(
-            job=job,
-            status=current,
-            snapshot=snapshot,
-            execution_plan=execution_plan,
-            parallel_plan=parallel_plan,
+            selected_engine=selected_engine,
+            selected_workers=selected_workers,
             cluster_state=cluster_state,
             network_state=network_state,
+            current=current,
+            snapshot=snapshot,
+            planning_evidence=planning_evidence,
+            dry_run=dry_run,
         )
 
     def _monitor_until_terminal(
@@ -2320,6 +2510,7 @@ class JobManager:
                 source_root=self._source_root,
                 secrets=self._secrets,
             )
+            self._copy_captured_runtime_artifacts(probe_snapshot)
             current = self._status_store.create_initial_status(probe_job)
             result = self._run_probe_candidate_with_live_preflight(
                 training_config=training_config,
@@ -3118,6 +3309,89 @@ class JobManager:
                 ),
             },
         )
+
+    def _persist_captured_runtime_artifacts(
+        self,
+        *,
+        snapshot: JobSnapshot,
+        capture: CapturedEntrypointWorkload,
+        parallel_plan: ParallelPlan,
+    ) -> None:
+        """Persist artifacts required by ``shardgrid.runtime.generic_bootstrap``.
+
+        The worker-side generic runtime must not rebuild the user model.  It
+        consumes the captured FX backend graph, the initial state values, the
+        canonical graph, and the input samples persisted here.
+        """
+        from shardgrid.planner.generic_graph import FXGraphCaptureAdapter
+
+        plan_root = Path(snapshot.plan_path).resolve()
+        plan_root.mkdir(parents=True, exist_ok=True)
+        context_path = plan_root / "capture-context.json"
+        if context_path.is_file():
+            shutil.copyfile(context_path, plan_root / "captured-context.json")
+        else:
+            (plan_root / "captured-context.json").write_text("{}", encoding="utf-8")
+        capture_result = FXGraphCaptureAdapter().capture(
+            capture.model,
+            sample_args=capture.sample_args,
+            sample_kwargs=dict(capture.sample_kwargs or {}),
+        )
+        graph = capture_result.canonical_graph
+        (plan_root / "captured-graph.json").write_text(
+            json.dumps(graph.to_dict(), sort_keys=True),
+            encoding="utf-8",
+        )
+        import torch
+        from torch.fx import GraphModule
+
+        backend_graph = capture_result.backend_graph
+        for node in backend_graph.graph.nodes:
+            node.type = None
+        backend_graph = GraphModule(backend_graph, backend_graph.graph)
+        torch.save(backend_graph, plan_root / "backend-graph.pt")
+        torch.save(capture.model.state_dict(), plan_root / "initial-state.pt")
+        for index, sample in enumerate(capture.sample_args):
+            torch.save(sample, plan_root / f"input-{index}.pt")
+        if parallel_plan.stage_metadata:
+            from shardgrid.runtime.dag import compile_runtime_plan
+            from shardgrid.runtime.generic_bootstrap import _decode_exact_plan
+
+            logical, placement = _decode_exact_plan(graph, parallel_plan, None)
+            runtime_plan = compile_runtime_plan(graph, logical, placement)
+            (plan_root / "runtime-plan.json").write_text(
+                json.dumps(runtime_plan.to_dict(), sort_keys=True),
+                encoding="utf-8",
+            )
+        self._latest_captured_snapshot = snapshot
+        self._captured_runtime_artifacts_ready = True
+
+    def _copy_captured_runtime_artifacts(self, target_snapshot: JobSnapshot) -> None:
+        """Copy persisted captured runtime artifacts into another snapshot.
+
+        Memory probe snapshots launch the same generic runtime bootstrap, so
+        they must receive the captured graph / backend / state artifacts.
+        """
+        if not getattr(self, "_captured_runtime_artifacts_ready", False):
+            return
+        main = self._latest_captured_snapshot
+        if main is None:
+            return
+        source_root = Path(main.plan_path).resolve()
+        target_root = Path(target_snapshot.plan_path).resolve()
+        target_root.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "captured-context.json",
+            "captured-graph.json",
+            "backend-graph.pt",
+            "initial-state.pt",
+            "runtime-plan.json",
+        ):
+            source = source_root / name
+            if source.is_file():
+                shutil.copyfile(source, target_root / name)
+        for path in sorted(source_root.glob("input-*.pt")):
+            shutil.copyfile(path, target_root / path.name)
 
     def _build_automatic_parallel_plan(
         self,

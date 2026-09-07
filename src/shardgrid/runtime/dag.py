@@ -105,6 +105,70 @@ class RuntimePlan:
             "placements": [placement.__dict__ for placement in self.placements],
         }
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RuntimePlan":
+        from shardgrid.planner.planning_contract import (
+            LogicalPartitionSpec,
+            PlacementSpec,
+        )
+
+        return cls(
+            graph_fingerprint=str(data.get("graph_fingerprint", "")),
+            ownership=WorkerOwnershipPlan(
+                tuple(
+                    WorkerOwnershipSpec(
+                        worker_id=str(worker["worker_id"]),
+                        gpu_index=int(worker["gpu_index"]),
+                        gpu_id=str(worker["gpu_id"]),
+                        owned_partitions=tuple(
+                            str(item) for item in worker.get("owned_partitions", ())
+                        ),
+                        local_parameter_ids=tuple(
+                            str(item) for item in worker.get("local_parameter_ids", ())
+                        ),
+                        local_buffer_ids=tuple(
+                            str(item) for item in worker.get("local_buffer_ids", ())
+                        ),
+                        read_only_state_ids=tuple(
+                            str(item) for item in worker.get("read_only_state_ids", ())
+                        ),
+                    )
+                    for worker in data.get("ownership", {}).get("workers", ())
+                )
+            ),
+            edges=tuple(
+                RuntimeEdgeSpec(
+                    producer_partition=str(edge["producer_partition"]),
+                    consumer_partition=str(edge["consumer_partition"]),
+                    value_id=str(edge["value_id"]),
+                    edge_kind=EdgeKind(str(edge["edge_kind"])),
+                    producer_worker_id=str(edge["producer_worker_id"]),
+                    consumer_worker_id=str(edge["consumer_worker_id"]),
+                    producer_gpu_id=str(edge["producer_gpu_id"]),
+                    consumer_gpu_id=str(edge["consumer_gpu_id"]),
+                    shape=tuple(edge.get("shape", ())),
+                    dtype=edge.get("dtype"),
+                    requires_grad=edge.get("requires_grad"),
+                    forward_transfer_bytes=int(edge.get("forward_transfer_bytes", 0)),
+                    backward_transfer_bytes=int(edge.get("backward_transfer_bytes", 0)),
+                )
+                for edge in data.get("edges", ())
+            ),
+            logical_partitions=tuple(
+                LogicalPartitionSpec(**dict(partition))
+                for partition in data.get("logical_partitions", ())
+            ),
+            placements=tuple(
+                PlacementSpec(
+                    partition_id=str(placement["partition_id"]),
+                    gpu_id=str(placement["gpu_id"]),
+                    worker_id=str(placement["worker_id"]),
+                    gpu_index=int(placement["gpu_index"]),
+                )
+                for placement in data.get("placements", ())
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class RuntimePartition:

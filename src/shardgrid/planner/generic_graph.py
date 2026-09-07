@@ -125,6 +125,45 @@ class GenericGraphIR:
             "states": [state.__dict__ for state in self.states],
         }
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "GenericGraphIR":
+        return cls(
+            nodes=tuple(
+                GraphNodeSpec(**dict(item))
+                for item in data.get("nodes", ())
+            ),
+            values=tuple(
+                GraphValueSpec(**dict(item))
+                for item in data.get("values", ())
+            ),
+            edges=tuple(
+                GraphEdgeSpec(**dict(item))
+                for item in data.get("edges", ())
+            ),
+            input_value_ids=tuple(str(item) for item in data.get("input_value_ids", ())),
+            output_value_ids=tuple(str(item) for item in data.get("output_value_ids", ())),
+            parameter_owners={
+                str(key): str(value)
+                for key, value in data.get("parameter_owners", {}).items()
+            },
+            capture_backend=str(data.get("capture_backend", "")),
+            schema_version=str(data.get("schema_version", GRAPH_IR_SCHEMA_VERSION)),
+            graph_fingerprint=str(data.get("graph_fingerprint", "")),
+            input_pytree_spec=str(data.get("input_pytree_spec", "tuple")),
+            output_pytree_spec=str(data.get("output_pytree_spec", "unknown")),
+            parameter_uses=tuple(
+                ParameterUseSpec(**dict(item))
+                for item in data.get("parameter_uses", ())
+            ),
+            shared_parameter_ids=tuple(
+                str(item) for item in data.get("shared_parameter_ids", ())
+            ),
+            states=tuple(
+                StateObjectSpec(**dict(item))
+                for item in data.get("states", ())
+            ),
+        )
+
 
 CanonicalGraphIR = GenericGraphIR
 
