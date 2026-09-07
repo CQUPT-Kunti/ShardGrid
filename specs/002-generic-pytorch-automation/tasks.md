@@ -455,7 +455,7 @@ T001-T008 regression baseline
 
 **Purpose**: Execute the exact planner output without runtime repartition, round-robin placement, or model-name reconstruction.
 
-- [ ] T038 [P] [US3] Add exact-plan runtime tests in `tests/unit/test_runtime_exact_plan.py`
+- [x] T038 [P] [US3] Add exact-plan runtime tests in `tests/unit/test_runtime_exact_plan.py`
   - Title: Test runtime consumes selected plan
   - Phase: Phase 4
   - Priority: P0 BLOCKING
@@ -466,7 +466,7 @@ T001-T008 regression baseline
   - Tests: `pytest tests/unit/test_runtime_exact_plan.py`
   - Acceptance Criteria: `PLAN_RUNTIME_CONSISTENCY_CHECK=PASS` for unit runtime fixtures.
 
-- [ ] T039 [US3] Update `compile_runtime_plan()` in `src/shardgrid/runtime/dag.py`
+- [x] T039 [US3] Update `compile_runtime_plan()` in `src/shardgrid/runtime/dag.py`
   - Title: Compile generic runtime plan from graph/ownership/placement
   - Phase: Phase 4
   - Priority: P0 BLOCKING
@@ -477,7 +477,7 @@ T001-T008 regression baseline
   - Tests: `pytest tests/unit/test_runtime_exact_plan.py tests/unit/test_dag_runtime.py`
   - Acceptance Criteria: Runtime plan carries exact partition, owner, placement, and edge metadata.
 
-- [ ] T040 [US3] Update worker materialization in `src/shardgrid/runtime/dag.py`
+- [x] T040 [US3] Update worker materialization in `src/shardgrid/runtime/dag.py`
   - Title: Materialize only owned state on workers
   - Phase: Phase 4
   - Priority: P0 BLOCKING
@@ -488,7 +488,7 @@ T001-T008 regression baseline
   - Tests: `pytest tests/unit/test_runtime_exact_plan.py`
   - Acceptance Criteria: Worker materialized parameter/buffer sets match `WorkerOwnershipPlan`.
 
-- [ ] T041 [US3] Add local runtime integration tests in `tests/integration/test_generic_runtime_local.py`
+- [x] T041 [US3] Add local runtime integration tests in `tests/integration/test_generic_runtime_local.py`
   - Title: Test local generic training step
   - Phase: Phase 4
   - Priority: P0 BLOCKING
@@ -499,7 +499,7 @@ T001-T008 regression baseline
   - Tests: `pytest tests/integration/test_generic_runtime_local.py`
   - Acceptance Criteria: Local runtime completes one supported generic step.
 
-- [ ] T042 [US3] Integrate generic runtime launch command in `src/shardgrid/launchers/ssh.py`
+- [x] T042 [US3] Integrate generic runtime launch command in `src/shardgrid/launchers/ssh.py`
   - Title: Launch runtime bootstrap with exact artifacts
   - Phase: Phase 4
   - Priority: P1
@@ -510,7 +510,7 @@ T001-T008 regression baseline
   - Tests: `pytest tests/contract/test_ssh_launcher.py tests/unit/test_memory_probe_launch.py`
   - Acceptance Criteria: SSH launch command references generic runtime bootstrap and exact plan artifacts.
 
-- [ ] T043 [US3] Preserve memory probe candidate flow for generic runtime in `src/shardgrid/control/job_manager.py`
+- [x] T043 [US3] Preserve memory probe candidate flow for generic runtime in `src/shardgrid/control/job_manager.py`
   - Title: Keep estimate-calibration-probe admission chain
   - Phase: Phase 4
   - Priority: P0 BLOCKING
@@ -521,7 +521,7 @@ T001-T008 regression baseline
   - Tests: `pytest tests/unit/test_memory_probe_launch.py tests/unit/test_job_manager_live_probe.py`
   - Acceptance Criteria: `MEMORY_REJECT` rejects candidates, not the whole job, until search is exhausted.
 
-- [ ] T044 [US3] Run Phase 4 runtime gate in `tests/integration/test_generic_runtime_local.py`
+- [x] T044 [US3] Run Phase 4 runtime gate in `tests/integration/test_generic_runtime_local.py`
   - Title: Phase 4 gate
   - Phase: Phase 4
   - Priority: P0 BLOCKING
@@ -531,6 +531,7 @@ T001-T008 regression baseline
   - Implementation Notes: Check runtime exact-plan evidence before checkpoint genericization.
   - Tests: `pytest tests/unit/test_runtime_exact_plan.py tests/integration/test_generic_runtime_local.py`
   - Acceptance Criteria: `GENERIC_RUNTIME_LOCAL=PASS` and `PLAN_RUNTIME_CONSISTENCY_CHECK=PASS`.
+  - Gate Evidence: `GENERIC_RUNTIME_LOCAL=PASS`; `PLAN_RUNTIME_CONSISTENCY_CHECK=PASS`; `pytest tests/unit/test_runtime_exact_plan.py tests/integration/test_generic_runtime_local.py` -> 10 passed, 1 skipped; `pytest --run-integration tests/unit/test_runtime_exact_plan.py tests/integration/test_generic_runtime_local.py` -> 11 passed.
 
 ## Phase 5: Generic Checkpoint
 
