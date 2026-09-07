@@ -10,15 +10,19 @@ from shardgrid.planner.generic_graph import (
     GenericGraphIR,
     GraphEdgeSpec,
     GraphNodeSpec,
+    StateObjectSpec,
     GraphValueSpec,
     ModelFactorySpec,
     capture_generic_graph,
 )
 from shardgrid.planner.planning_contract import (
     GPUResourceSpec,
+    LogicalPartitionPlan,
+    LogicalPartitionSpec,
     PlanningConstraints,
     ResourceSnapshot,
     RuntimeCapabilities,
+    build_logical_partition_plan,
     generate_logical_partition_candidates,
     generate_placement_candidates,
     plan,
@@ -329,6 +333,77 @@ def test_fresh_free_memory_changes_selected_plan() -> None:
     assert before.placement_plan.to_dict() != after.placement_plan.to_dict()
 
 
+def test_logical_partition_old_constructor_remains_compatible() -> None:
+    partition = LogicalPartitionSpec(
+        "P0",
+        ("n0000",),
+        ("v-input",),
+        ("v-output",),
+        ("p0000",),
+        ("b0000",),
+        7,
+        11,
+        ("e0000",),
+    )
+
+    assert partition.node_ids == ("n0000",)
+    assert partition.parameter_ids == ("p0000",)
+    assert partition.buffer_ids == ("b0000",)
+    assert partition.owned_state_ids == ()
+    assert partition.read_only_state_ids == ()
+    assert partition.validation_evidence is None
+
+
+def test_logical_partition_records_nodes_values_state_and_evidence() -> None:
+    logical = build_logical_partition_plan(
+        _shared_state_graph(),
+        max_partitions=2,
+    )
+    first, second = logical.partitions
+
+    assert first.node_ids == ("n0000",)
+    assert first.output_value_ids == ("v0000",)
+    assert first.owned_state_ids == ("p0000",)
+    assert first.read_only_state_ids == ()
+    assert first.estimated_transfer_bytes == 10
+    assert first.validation_evidence == {
+        "node_count": 1,
+        "input_value_count": 0,
+        "output_value_count": 1,
+        "boundary_edge_count": 1,
+    }
+    assert second.node_ids == ("n0001",)
+    assert second.input_value_ids == ("v0000",)
+    assert second.owned_state_ids == ()
+    assert second.read_only_state_ids == ("p0000",)
+
+
+def test_logical_partition_serialization_round_trip_keeps_explicit_fields() -> None:
+    logical = build_logical_partition_plan(_shared_state_graph(), max_partitions=2)
+
+    restored = LogicalPartitionPlan.from_dict(logical.to_dict())
+
+    assert restored == logical
+    assert restored.to_dict()["partitions"][1]["read_only_state_ids"] == ["p0000"]
+
+
+def test_logical_partition_state_coverage_does_not_depend_on_module_order() -> None:
+    graph = capture_generic_graph(
+        SharedParameterModel(),
+        sample_args=(torch.ones(1, 4),),
+    )
+    logical = build_logical_partition_plan(graph, max_partitions=2)
+    first, second = logical.partitions
+
+    assert [node.module_path for node in graph.nodes if node.module_path] == [
+        "shared",
+        "shared",
+    ]
+    assert first.owned_state_ids == ("p0000", "p0001")
+    assert second.read_only_state_ids == ("p0000", "p0001")
+    assert set(second.parameter_ids) == {"p0000", "p0001"}
+
+
 def _weighted_graph(weights: list[int]):
     nodes = tuple(
         GraphNodeSpec(
@@ -375,4 +450,57 @@ def _weighted_graph(weights: list[int]):
         },
         capture_backend="test",
         graph_fingerprint="",
+    )
+
+
+def _shared_state_graph() -> GenericGraphIR:
+    nodes = (
+        GraphNodeSpec(
+            node_id="n0000",
+            op_kind="call_function",
+            target="linear",
+            module_path=None,
+            output_value_ids=("v0000",),
+            parameter_ids=("p0000",),
+            estimated_peak_memory_contribution=5,
+        ),
+        GraphNodeSpec(
+            node_id="n0001",
+            op_kind="call_function",
+            target="linear",
+            module_path=None,
+            input_value_ids=("v0000",),
+            output_value_ids=("v0001",),
+            parameter_ids=("p0000",),
+            estimated_peak_memory_contribution=5,
+        ),
+    )
+    return GenericGraphIR(
+        nodes=nodes,
+        values=(
+            GraphValueSpec("v0000", "n0000", ("n0001",), estimated_bytes=5),
+            GraphValueSpec("v0001", "n0001", (), estimated_bytes=5),
+        ),
+        edges=(
+            GraphEdgeSpec(
+                "n0000",
+                "n0001",
+                "v0000",
+                edge_id="e0000",
+                communication_weight=10,
+            ),
+        ),
+        input_value_ids=("v-input",),
+        output_value_ids=("v0001",),
+        parameter_owners={"p0000": "n0000"},
+        capture_backend="test",
+        states=(
+            StateObjectSpec(
+                canonical_state_id="p0000",
+                kind="parameter",
+                state_dict_key="weight",
+                owner_node_ids=("n0000",),
+                use_node_ids=("n0000", "n0001"),
+            ),
+        ),
     )

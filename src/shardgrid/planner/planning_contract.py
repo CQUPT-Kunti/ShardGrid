@@ -67,6 +67,51 @@ class LogicalPartitionSpec:
     estimated_compute: int
     estimated_memory: int
     boundary_edges: tuple[str, ...]
+    owned_state_ids: tuple[str, ...] = ()
+    read_only_state_ids: tuple[str, ...] = ()
+    estimated_transfer_bytes: int = 0
+    validation_evidence: Mapping[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "partition_id": self.partition_id,
+            "node_ids": list(self.node_ids),
+            "input_value_ids": list(self.input_value_ids),
+            "output_value_ids": list(self.output_value_ids),
+            "parameter_ids": list(self.parameter_ids),
+            "buffer_ids": list(self.buffer_ids),
+            "estimated_compute": self.estimated_compute,
+            "estimated_memory": self.estimated_memory,
+            "boundary_edges": list(self.boundary_edges),
+            "owned_state_ids": list(self.owned_state_ids),
+            "read_only_state_ids": list(self.read_only_state_ids),
+            "estimated_transfer_bytes": self.estimated_transfer_bytes,
+            "validation_evidence": dict(self.validation_evidence or {}),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LogicalPartitionSpec":
+        return cls(
+            partition_id=str(data["partition_id"]),
+            node_ids=tuple(str(item) for item in data.get("node_ids", ())),
+            input_value_ids=tuple(str(item) for item in data.get("input_value_ids", ())),
+            output_value_ids=tuple(str(item) for item in data.get("output_value_ids", ())),
+            parameter_ids=tuple(str(item) for item in data.get("parameter_ids", ())),
+            buffer_ids=tuple(str(item) for item in data.get("buffer_ids", ())),
+            estimated_compute=int(data.get("estimated_compute", 0)),
+            estimated_memory=int(data.get("estimated_memory", 0)),
+            boundary_edges=tuple(str(item) for item in data.get("boundary_edges", ())),
+            owned_state_ids=tuple(str(item) for item in data.get("owned_state_ids", ())),
+            read_only_state_ids=tuple(
+                str(item) for item in data.get("read_only_state_ids", ())
+            ),
+            estimated_transfer_bytes=int(data.get("estimated_transfer_bytes", 0)),
+            validation_evidence=(
+                None
+                if data.get("validation_evidence") is None
+                else dict(data.get("validation_evidence", {}))
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -79,8 +124,19 @@ class LogicalPartitionPlan:
         return {
             "schema_version": self.schema_version,
             "graph_fingerprint": self.graph_fingerprint,
-            "partitions": [partition.__dict__ for partition in self.partitions],
+            "partitions": [partition.to_dict() for partition in self.partitions],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LogicalPartitionPlan":
+        return cls(
+            graph_fingerprint=str(data["graph_fingerprint"]),
+            partitions=tuple(
+                LogicalPartitionSpec.from_dict(item)
+                for item in data.get("partitions", ())
+            ),
+            schema_version=str(data.get("schema_version", CONTRACT_SCHEMA_VERSION)),
+        )
 
 
 @dataclass(frozen=True)
@@ -294,6 +350,7 @@ def build_logical_partition_plan(
             for edge in graph.edges
             if edge.source_node_id in node_set and edge.target_node_id not in node_set
         )
+        owned_state_ids, read_only_state_ids = _partition_state_ids(graph, node_set, chunk)
         partitions.append(
             LogicalPartitionSpec(
                 partition_id=f"P{index}",
@@ -305,12 +362,51 @@ def build_logical_partition_plan(
                 estimated_compute=sum(node.estimated_compute_cost for node in chunk),
                 estimated_memory=sum(_node_memory(node) for node in chunk),
                 boundary_edges=tuple(boundary_edges),
+                owned_state_ids=owned_state_ids,
+                read_only_state_ids=read_only_state_ids,
+                estimated_transfer_bytes=sum(
+                    edge.communication_weight
+                    for edge in graph.edges
+                    if edge.source_node_id in node_set
+                    and edge.target_node_id not in node_set
+                ),
+                validation_evidence={
+                    "node_count": len(node_ids),
+                    "input_value_count": len(input_values),
+                    "output_value_count": len(output_values),
+                    "boundary_edge_count": len(boundary_edges),
+                },
             )
         )
     return LogicalPartitionPlan(
         graph_fingerprint=graph.graph_fingerprint,
         partitions=tuple(partitions),
     )
+
+
+def _partition_state_ids(
+    graph: CanonicalGraphIR,
+    node_ids: set[str],
+    nodes: Sequence[Any],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if not graph.states:
+        legacy = sorted(
+            {state_id for node in nodes for state_id in node.parameter_ids + node.buffer_ids}
+        )
+        return tuple(legacy), ()
+
+    owned: set[str] = set()
+    read_only: set[str] = set()
+    for state in graph.states:
+        use_nodes = set(state.use_node_ids)
+        if not use_nodes & node_ids:
+            continue
+        owner_nodes = set(state.owner_node_ids)
+        if owner_nodes & node_ids:
+            owned.add(state.canonical_state_id)
+        else:
+            read_only.add(state.canonical_state_id)
+    return tuple(sorted(owned)), tuple(sorted(read_only - owned))
 
 
 def build_placement_plan(
