@@ -1,2 +1,1 @@
-"""Bootstrap helpers."""
-
+"""ShardGrid user-entrypoint bootstrap helpers."""

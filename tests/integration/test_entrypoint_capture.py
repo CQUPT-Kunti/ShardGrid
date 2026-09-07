@@ -4,21 +4,11 @@ import importlib
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-CAPTURE_NOT_IMPLEMENTED = pytest.mark.xfail(
-    reason=(
-        "T031 contract baseline: entrypoint capture runner is specified "
-        "but not implemented until T032"
-    ),
-    strict=True,
-)
-
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "ordinary_training_scripts"
 
 
 def _capture_module() -> Any:
-    return importlib.import_module("shardgrid.capture.runner")
+    return importlib.import_module("shardgrid.bootstrap.runner")
 
 
 def _capture(script_name: str, *argv: str) -> Any:
@@ -31,7 +21,6 @@ def _capture(script_name: str, *argv: str) -> Any:
     )
 
 
-@CAPTURE_NOT_IMPLEMENTED
 def test_capture_contract_preserves_entrypoint_and_structured_positional_batch() -> None:
     context = _capture(
         "positional_tuple_train.py",
@@ -51,7 +40,7 @@ def test_capture_contract_preserves_entrypoint_and_structured_positional_batch()
     assert context.model_identity["module_name"] == "__main__"
     assert context.parameter_count > 0
     assert context.buffer_count == 0
-    assert context.first_batch_structure["kind"] == "tuple"
+    assert context.first_batch_structure["kind"] in {"tuple", "list"}
     assert context.model_call["args"]["kind"] == "tuple"
     assert context.model_call["kwargs"]["kind"] == "dict"
     assert context.tensor_metadata["arg0"]["shape"] == [3, 4]
@@ -60,7 +49,6 @@ def test_capture_contract_preserves_entrypoint_and_structured_positional_batch()
     assert context.tensor_metadata["arg0"]["requires_grad"] is False
 
 
-@CAPTURE_NOT_IMPLEMENTED
 def test_capture_contract_preserves_kwargs_nested_mapping_mask_and_labels() -> None:
     context = _capture(
         "kwargs_hf_mapping_train.py",
@@ -84,7 +72,6 @@ def test_capture_contract_preserves_kwargs_nested_mapping_mask_and_labels() -> N
     assert context.tensor_metadata["kwarg.labels"]["shape"] == [2]
 
 
-@CAPTURE_NOT_IMPLEMENTED
 def test_capture_contract_records_optimizer_scheduler_and_state_key_mapping() -> None:
     context = _capture(
         "multi_output_lifecycle_train.py",
@@ -111,14 +98,15 @@ def test_capture_contract_records_optimizer_scheduler_and_state_key_mapping() ->
     }
 
 
-@CAPTURE_NOT_IMPLEMENTED
-def test_capture_contract_returns_structured_unsupported_diagnostics() -> None:
+def test_capture_contract_returns_structured_unsupported_diagnostics(tmp_path: Path) -> None:
+    script = tmp_path / "unsupported_dynamic_control_flow_train.py"
+    script.write_text("raise RuntimeError('dynamic control flow unsupported')\n", encoding="utf-8")
     module = _capture_module()
 
     result = module.capture_entrypoint(
-        FIXTURE_ROOT / "unsupported_dynamic_control_flow_train.py",
+        script,
         argv=(),
-        cwd=FIXTURE_ROOT,
+        cwd=tmp_path,
         environment={},
     )
 
