@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -12,7 +13,12 @@ from shardgrid.common.models import as_hostname, as_machine_id, as_worker_id
 from shardgrid.control.resource_manager import ResourceManager
 from shardgrid.planner.memory import MemoryEstimationConfig, build_model_profile
 from shardgrid.planner.partitioning import build_partition_profile
-from shardgrid.planner.placement import _worker_subsets, search_joint_partition_placement
+from shardgrid.planner.placement import (
+    _stage_required_bytes,
+    _usable_memory_bytes,
+    _worker_subsets,
+    search_joint_partition_placement,
+)
 from shardgrid.planner.requirements import FeasibilityStatus
 from shardgrid.resources.models import NetworkLink, NetworkState, WorkerResource
 
@@ -265,7 +271,7 @@ def test_capacity_aware_heterogeneous_workers_allow_uneven_partition() -> None:
     cluster = _cluster_state(
         [
             _worker("worker-a", machine_id="machine-a", free_memory_mb=20),
-            _worker("worker-b", machine_id="machine-b", free_memory_mb=8),
+            _worker("worker-b", machine_id="machine-b", free_memory_mb=9),
         ]
     )
 
@@ -280,6 +286,11 @@ def test_capacity_aware_heterogeneous_workers_allow_uneven_partition() -> None:
 
     assert plan.status == FeasibilityStatus.FEASIBLE
     assert plan.selected_worker_count == 2
+    assert plan.partition_candidate is not None
+    assert tuple(placement.stage_required_bytes for placement in plan.stage_placements) == tuple(
+        _stage_required_bytes(stage) for stage in plan.partition_candidate.stages
+    )
+    assert any(stage.owned_state_ids for stage in plan.partition_candidate.stages)
     assert (
         plan.stage_placements[0].stage_required_bytes
         > plan.stage_placements[1].stage_required_bytes
@@ -447,3 +458,10 @@ def test_worker_subset_search_honors_budget(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("SHARDGRID_PLACEMENT_CANDIDATE_BUDGET", "3")
 
     assert len(_worker_subsets(workers, 8)) <= 3
+
+
+def test_usable_memory_prefers_fresh_free_memory_over_total() -> None:
+    worker = _worker("worker-a", machine_id="machine-a", free_memory_mb=7)
+    worker = replace(worker, gpu_total_memory=99)
+
+    assert _usable_memory_bytes(worker) == 7 * 1024 * 1024
