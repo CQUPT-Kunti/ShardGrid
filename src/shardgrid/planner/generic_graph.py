@@ -138,6 +138,23 @@ class GraphCaptureResult:
     graph_fingerprint: str
 
 
+class GraphCaptureUnsupported(ValueError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        diagnostics: Sequence[str] = (),
+        backend: str | None = None,
+        fallback_allowed: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.diagnostics = tuple(diagnostics)
+        self.backend = backend
+        self.fallback_allowed = fallback_allowed
+
+
 @dataclass(frozen=True)
 class ModelFactorySpec:
     model_factory: Any
@@ -235,6 +252,130 @@ class FXGraphCaptureAdapter:
             },
             diagnostics=result.diagnostics,
             graph_fingerprint=result.graph_fingerprint,
+        )
+
+
+class TorchExportGraphCaptureAdapter:
+    backend_name = "torch.export"
+
+    def capture(
+        self,
+        model: Any,
+        *,
+        sample_args: Sequence[Any] = (),
+        sample_kwargs: Mapping[str, Any] | None = None,
+    ) -> GraphCaptureResult:
+        import torch
+
+        sample_kwargs = dict(sample_kwargs or {})
+        try:
+            exported = torch.export.export(
+                model,
+                args=tuple(sample_args),
+                kwargs=sample_kwargs,
+                strict=False,
+            )
+        except Exception as exc:
+            code = _classify_capture_exception(exc)
+            raise GraphCaptureUnsupported(
+                code,
+                str(exc),
+                diagnostics=(f"{code}: {exc}",),
+                backend=self.backend_name,
+                fallback_allowed=code == "MODEL_CAPTURE_UNSUPPORTED",
+            ) from exc
+        graph_module = exported.module()
+        graph = _graph_from_fx(
+            model,
+            graph_module,
+            capture_backend=self.backend_name,
+            input_pytree_spec=_pytree_name(sample_args),
+            output_pytree_spec="unknown",
+        )
+        diagnostics = _custom_op_diagnostics(graph_module)
+        if diagnostics:
+            raise GraphCaptureUnsupported(
+                "CUSTOM_OP_UNSUPPORTED",
+                "; ".join(diagnostics),
+                diagnostics=diagnostics,
+                backend=self.backend_name,
+            )
+        return GraphCaptureResult(
+            canonical_graph=graph,
+            backend_graph=exported,
+            input_pytree_spec=graph.input_pytree_spec,
+            output_pytree_spec=graph.output_pytree_spec,
+            metadata={
+                "backend": self.backend_name,
+                "node_count": len(graph.nodes),
+                "edge_count": len(graph.edges),
+                "control_plane_parameter_real_storage_bytes": _real_parameter_storage_bytes(
+                    model
+                ),
+                "control_plane_full_real_model_materialized": (
+                    _real_parameter_storage_bytes(model) > 0
+                ),
+            },
+            diagnostics=diagnostics,
+            graph_fingerprint=graph.graph_fingerprint,
+        )
+
+    def capture_factory(self, spec: ModelFactorySpec) -> GraphCaptureResult:
+        return FXGraphCaptureAdapter().capture_factory(spec)
+
+
+def capture_generic_graph_with_backend_fallback(
+    model: Any,
+    *,
+    sample_args: Sequence[Any] = (),
+    sample_kwargs: Mapping[str, Any] | None = None,
+) -> GraphCaptureResult:
+    try:
+        return TorchExportGraphCaptureAdapter().capture(
+            model,
+            sample_args=sample_args,
+            sample_kwargs=sample_kwargs,
+        )
+    except GraphCaptureUnsupported as export_failure:
+        if not export_failure.fallback_allowed:
+            raise
+        try:
+            fx_result = FXGraphCaptureAdapter().capture(
+                model,
+                sample_args=sample_args,
+                sample_kwargs=sample_kwargs,
+            )
+        except Exception as exc:
+            code = _classify_capture_exception(exc)
+            raise GraphCaptureUnsupported(
+                code,
+                str(exc),
+                diagnostics=(*export_failure.diagnostics, f"{code}: {exc}"),
+                backend=FXGraphCaptureAdapter.backend_name,
+            ) from exc
+        if fx_result.diagnostics:
+            raise GraphCaptureUnsupported(
+                "CUSTOM_OP_UNSUPPORTED",
+                "; ".join(fx_result.diagnostics),
+                diagnostics=(*export_failure.diagnostics, *fx_result.diagnostics),
+                backend=fx_result.canonical_graph.capture_backend,
+            )
+        return GraphCaptureResult(
+            canonical_graph=fx_result.canonical_graph,
+            backend_graph=fx_result.backend_graph,
+            input_pytree_spec=fx_result.input_pytree_spec,
+            output_pytree_spec=fx_result.output_pytree_spec,
+            metadata={
+                **dict(fx_result.metadata),
+                "export_failure_code": export_failure.code,
+                "fallback_from": TorchExportGraphCaptureAdapter.backend_name,
+            },
+            diagnostics=(
+                f"FX_FALLBACK_FROM:{export_failure.code}",
+                *export_failure.diagnostics,
+                *fx_result.diagnostics,
+            ),
+            graph_fingerprint=fx_result.graph_fingerprint,
         )
 
 
@@ -779,6 +920,26 @@ def _custom_op_diagnostics(graph_module: Any) -> tuple[str, ...]:
         for node in graph_module.graph.nodes
         if node.op == "call_function" and not _is_allowed_function(node.target)
     )
+
+
+def _classify_capture_exception(exc: BaseException) -> str:
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    if any(token in text for token in ("custom op", "custom_op", "no fake impl")):
+        return "CUSTOM_OP_UNSUPPORTED"
+    if any(
+        token in text
+        for token in (
+            "data dependent",
+            "data-dependent",
+            "control flow",
+            "could not guard on data-dependent expression",
+            "symbolically traced variables cannot be used as inputs to control flow",
+        )
+    ):
+        return "DYNAMIC_CONTROL_FLOW_UNSUPPORTED"
+    if any(token in text for token in ("graph break", "graph_break", "unsupported")):
+        return "GRAPH_BREAK_UNSUPPORTED"
+    return "MODEL_CAPTURE_UNSUPPORTED"
 
 
 def _is_allowed_function(target: Any) -> bool:

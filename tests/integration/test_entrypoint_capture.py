@@ -183,6 +183,44 @@ def test_unsupported_capture_diagnostics_are_persisted_without_live_objects(
     assert payload["context"] is None
 
 
+def test_graph_capture_unsupported_fails_before_distributed_mutation(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "dynamic_then_distributed.py"
+    script.write_text(
+        """
+import torch
+import torch.distributed as dist
+from torch import nn
+
+
+class DynamicModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.positive = nn.Linear(2, 2)
+        self.negative = nn.Linear(2, 2)
+
+    def forward(self, x):
+        if x.sum() > 0:
+            return self.positive(x)
+        return self.negative(x)
+
+
+model = DynamicModel()
+model(torch.ones(1, 2))
+dist.init_process_group("gloo")
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = _capture_module().capture_entrypoint(script, cwd=tmp_path, environment={})
+
+    assert result.ok is False
+    assert result.failure.stage == "graph_capture"
+    assert result.failure.code == "DYNAMIC_CONTROL_FLOW_UNSUPPORTED"
+    assert result.failure.artifact_log_ref == "diagnostics/capture.json"
+
+
 def test_ordinary_training_script_fixtures_do_not_import_shardgrid_user_api() -> None:
     forbidden = ("shardgrid", "ModelProvider", "sample_inputs", "compute_loss", "build_model")
     offenders: list[str] = []

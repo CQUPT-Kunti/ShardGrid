@@ -8,6 +8,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
 import torch
 from torch import nn
 
@@ -20,7 +21,10 @@ from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_samp
 
 from shardgrid.planner.generic_graph import (  # noqa: E402
     CanonicalGraphIR,
+    GraphCaptureUnsupported,
+    TorchExportGraphCaptureAdapter,
     capture_generic_graph,
+    capture_generic_graph_with_backend_fallback,
     infer_boundary_values,
     module_dependencies_from_graph,
 )
@@ -114,6 +118,27 @@ class FunctionalBufferModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(x * self.scale)
 
+
+class ExportFriendlyModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(self.proj(x))
+
+
+class DynamicControlFlowModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.positive = nn.Linear(4, 2)
+        self.negative = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.sum() > 0:
+            return self.positive(x)
+        return self.negative(x)
+
 ZOO_MODELS = (
     "mini_resnet",
     "mini_unet",
@@ -122,6 +147,101 @@ ZOO_MODELS = (
     "mini_vit",
     "mini_encoder_decoder",
 )
+
+
+def test_torch_export_is_primary_backend_for_supported_model() -> None:
+    result = TorchExportGraphCaptureAdapter().capture(
+        ExportFriendlyModel().eval(),
+        sample_args=(torch.randn(2, 4),),
+    )
+
+    assert result.canonical_graph.capture_backend == "torch.export"
+    assert result.metadata["backend"] == "torch.export"
+    assert result.canonical_graph.nodes
+
+
+def test_fx_fallback_is_used_when_export_cannot_prove_simple_model_semantics(
+    monkeypatch,
+) -> None:
+    def fail_export(self, model, *, sample_args=(), sample_kwargs=None):
+        del self, model, sample_args, sample_kwargs
+        raise GraphCaptureUnsupported(
+            "MODEL_CAPTURE_UNSUPPORTED",
+            "export did not produce safe proof",
+            diagnostics=("MODEL_CAPTURE_UNSUPPORTED: export did not produce safe proof",),
+            backend="torch.export",
+            fallback_allowed=True,
+        )
+
+    monkeypatch.setattr(TorchExportGraphCaptureAdapter, "capture", fail_export)
+
+    result = capture_generic_graph_with_backend_fallback(
+        ExportFriendlyModel().eval(),
+        sample_args=(torch.randn(2, 4),),
+    )
+
+    assert result.canonical_graph.capture_backend == "torch.fx.symbolic_trace"
+    assert result.metadata["fallback_from"] == "torch.export"
+    assert result.metadata["export_failure_code"] == "MODEL_CAPTURE_UNSUPPORTED"
+    assert result.diagnostics[0] == "FX_FALLBACK_FROM:MODEL_CAPTURE_UNSUPPORTED"
+
+
+def test_graph_break_failure_is_classified_without_incomplete_graph(monkeypatch) -> None:
+    def fail_export(self, model, *, sample_args=(), sample_kwargs=None):
+        del self, model, sample_args, sample_kwargs
+        raise GraphCaptureUnsupported(
+            "GRAPH_BREAK_UNSUPPORTED",
+            "graph break at Python boundary",
+            diagnostics=("GRAPH_BREAK_UNSUPPORTED: graph break at Python boundary",),
+            backend="torch.export",
+        )
+
+    monkeypatch.setattr(TorchExportGraphCaptureAdapter, "capture", fail_export)
+
+    with pytest.raises(GraphCaptureUnsupported) as error:
+        capture_generic_graph_with_backend_fallback(
+            ExportFriendlyModel().eval(),
+            sample_args=(torch.randn(2, 4),),
+        )
+
+    assert error.value.code == "GRAPH_BREAK_UNSUPPORTED"
+    assert error.value.backend == "torch.export"
+    assert error.value.diagnostics
+
+
+def test_dynamic_control_flow_failure_is_classified_without_incomplete_graph() -> None:
+    with pytest.raises(GraphCaptureUnsupported) as error:
+        capture_generic_graph_with_backend_fallback(
+            DynamicControlFlowModel().eval(),
+            sample_args=(torch.randn(2, 4),),
+        )
+
+    assert error.value.code == "DYNAMIC_CONTROL_FLOW_UNSUPPORTED"
+    assert error.value.diagnostics
+
+
+def test_custom_op_failure_is_classified_without_incomplete_graph(monkeypatch) -> None:
+    def fail_export(self, model, *, sample_args=(), sample_kwargs=None):
+        del self, model, sample_args, sample_kwargs
+        raise GraphCaptureUnsupported(
+            "CUSTOM_OP_UNSUPPORTED",
+            "custom op shardgrid_test::opaque has no safe schema",
+            diagnostics=(
+                "CUSTOM_OP_UNSUPPORTED: custom op shardgrid_test::opaque has no safe schema",
+            ),
+            backend="torch.export",
+        )
+
+    monkeypatch.setattr(TorchExportGraphCaptureAdapter, "capture", fail_export)
+
+    with pytest.raises(GraphCaptureUnsupported) as error:
+        capture_generic_graph_with_backend_fallback(
+            ExportFriendlyModel().eval(),
+            sample_args=(torch.randn(2, 4),),
+        )
+
+    assert error.value.code == "CUSTOM_OP_UNSUPPORTED"
+    assert error.value.diagnostics
 
 
 def _capture(name: str):

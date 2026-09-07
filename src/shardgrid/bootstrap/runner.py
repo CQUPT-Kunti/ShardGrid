@@ -40,6 +40,7 @@ class CapturedTrainingContext:
     model_output_structure: dict[str, Any]
     state_dict_key_to_canonical_state_id: dict[str, str]
     distributed_mutation_observed_before_capture: bool = False
+    graph_capture: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -74,9 +75,16 @@ class _CaptureState:
     optimizer_step_called: bool = False
     scheduler_step_called: bool = False
     distributed_mutation: bool = False
+    graph_capture_backend: str | None = None
+    graph_capture_diagnostics: tuple[str, ...] = ()
+    failure: CaptureFailure | None = None
 
 
 class _CaptureComplete(RuntimeError):
+    pass
+
+
+class _CaptureFailed(RuntimeError):
     pass
 
 
@@ -159,6 +167,8 @@ def _capture_entrypoint_state(
                 runpy.run_path(str(path), run_name="__main__")
     except _CaptureComplete:
         return state
+    except _CaptureFailed:
+        return CaptureResult(ok=False, failure=state.failure)
     except BaseException as exc:
         if state.model is not None:
             return state
@@ -231,6 +241,7 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
             state.args = tuple(args)
             state.kwargs = dict(kwargs)
             state.output = output
+            _capture_graph_or_fail(state)
         return output
 
     def dataloader_iter(loader: torch.utils.data.DataLoader) -> Any:
@@ -356,7 +367,35 @@ def _build_context(state: _CaptureState) -> CapturedTrainingContext:
             for index, key in enumerate(state.model.state_dict().keys())
         },
         distributed_mutation_observed_before_capture=state.distributed_mutation,
+        graph_capture={
+            "backend": state.graph_capture_backend,
+            "diagnostics": list(state.graph_capture_diagnostics),
+        },
     )
+
+
+def _capture_graph_or_fail(state: _CaptureState) -> None:
+    from shardgrid.planner.generic_graph import (
+        GraphCaptureUnsupported,
+        capture_generic_graph_with_backend_fallback,
+    )
+
+    try:
+        result = capture_generic_graph_with_backend_fallback(
+            state.model,
+            sample_args=state.args,
+            sample_kwargs=state.kwargs,
+        )
+    except GraphCaptureUnsupported as exc:
+        state.failure = CaptureFailure(
+            stage="graph_capture",
+            code=exc.code,
+            message=str(exc),
+            artifact_log_ref="diagnostics/capture.json",
+        )
+        raise _CaptureFailed from exc
+    state.graph_capture_backend = result.canonical_graph.capture_backend
+    state.graph_capture_diagnostics = tuple(result.diagnostics)
 
 
 def _optimizer_metadata(optimizer: Any) -> dict[str, Any]:
