@@ -629,13 +629,16 @@ def test_memory_reject_falls_back_to_next_probe_passing_plan(
         runtime_environment_ref="env:cluster/shardgrid",
         job_id=as_job_id("job-mem-fallback"),
     )
-    plan_a = _plan("candidate-A")
-    plan_b = _plan("candidate-B")
+    plan_a = _captured_plan("candidate-A")
+    plan_b = _captured_plan("candidate-B")
     calls: list[str | None] = []
+    commands_by_candidate: dict[str, list[str]] = {}
 
     def memory_probe(probe_plan, execution) -> MemoryProbeResult:
-        del execution
         calls.append(probe_plan.selected_candidate_id)
+        commands_by_candidate[str(probe_plan.selected_candidate_id)] = [
+            assignment.launch_command for assignment in execution.workers
+        ]
         if probe_plan.selected_candidate_id == "candidate-A":
             return MemoryProbeResult(
                 PROBE_MEMORY_REJECT,
@@ -672,6 +675,15 @@ def test_memory_reject_falls_back_to_next_probe_passing_plan(
         PROBE_MEMORY_REJECT,
         PROBE_PASS,
     ]
+    for command in commands_by_candidate["candidate-A"]:
+        assert command.startswith("python -m shardgrid.runtime.generic_bootstrap")
+        assert "--memory-probe" in command
+        assert "--plan-artifact" in command
+        assert "--context-artifact" in command
+    assert all(
+        "python -m shardgrid.runtime.generic_bootstrap" in command
+        for command in commands_by_candidate["candidate-B"]
+    )
     assert selection["selected_candidate_id"] == "candidate-B"
     assert manager._status_store.active_reservations() == []
 
