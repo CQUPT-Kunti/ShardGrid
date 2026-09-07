@@ -52,6 +52,18 @@ class WorkerOwnershipPlan:
 
 
 @dataclass(frozen=True)
+class WorkerMaterializedState:
+    worker: WorkerOwnershipSpec
+    parameters: Mapping[str, Any]
+    buffers: Mapping[str, Any]
+    read_only_state_ids: tuple[str, ...]
+
+    @property
+    def materialized_state_ids(self) -> tuple[str, ...]:
+        return tuple(self.parameters) + tuple(self.buffers)
+
+
+@dataclass(frozen=True)
 class RuntimeEdgeSpec:
     producer_partition: str
     consumer_partition: str
@@ -344,6 +356,48 @@ def compile_runtime_plan(
         logical_partitions=tuple(logical.partitions),
         placements=tuple(placement.placements),
     )
+
+
+def materialize_worker_owned_state(
+    runtime_plan: RuntimePlan,
+    *,
+    worker_id: str,
+    state_objects: Mapping[str, Any],
+    gpu_index: int | None = None,
+    gpu_id: str | None = None,
+) -> WorkerMaterializedState:
+    worker = _select_worker(runtime_plan.ownership, worker_id, gpu_index, gpu_id)
+    missing = [
+        state_id
+        for state_id in worker.local_parameter_ids + worker.local_buffer_ids
+        if state_id not in state_objects
+    ]
+    if missing:
+        raise ValueError(f"missing owned worker state: {missing!r}")
+    return WorkerMaterializedState(
+        worker=worker,
+        parameters={state_id: state_objects[state_id] for state_id in worker.local_parameter_ids},
+        buffers={state_id: state_objects[state_id] for state_id in worker.local_buffer_ids},
+        read_only_state_ids=worker.read_only_state_ids,
+    )
+
+
+def _select_worker(
+    ownership: WorkerOwnershipPlan,
+    worker_id: str,
+    gpu_index: int | None,
+    gpu_id: str | None,
+) -> WorkerOwnershipSpec:
+    matches = [
+        worker
+        for worker in ownership.workers
+        if worker.worker_id == worker_id
+        and (gpu_index is None or worker.gpu_index == gpu_index)
+        and (gpu_id is None or worker.gpu_id == gpu_id)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one worker ownership match, found {len(matches)}")
+    return matches[0]
 
 
 def _owned_state_ids(

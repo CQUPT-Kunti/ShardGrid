@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+import torch
 
 from shardgrid.planner.generic_graph import (
     GenericGraphIR,
@@ -17,7 +18,7 @@ from shardgrid.planner.planning_contract import (
     PlacementPlan,
     PlacementSpec,
 )
-from shardgrid.runtime.dag import EdgeKind, compile_runtime_plan
+from shardgrid.runtime.dag import EdgeKind, compile_runtime_plan, materialize_worker_owned_state
 
 
 def test_runtime_compiles_exact_planner_ownership_and_placement() -> None:
@@ -108,12 +109,112 @@ def test_runtime_rejects_non_exact_placement_coverage() -> None:
         compile_runtime_plan(graph, logical, placement)
 
 
+def test_worker_materializes_only_explicitly_owned_parameter_and_buffer_state() -> None:
+    graph, logical, placement = _exact_plan_fixture()
+    runtime_plan = compile_runtime_plan(graph, logical, placement)
+    state_objects = {
+        "p0": torch.nn.Parameter(torch.ones(2, 2)),
+        "p1": torch.nn.Parameter(torch.ones(2, 2)),
+        "p2": torch.nn.Parameter(torch.ones(2, 2)),
+        "b0": torch.ones(2),
+        "unused": torch.nn.Parameter(torch.zeros(1)),
+    }
+
+    materialized = materialize_worker_owned_state(
+        runtime_plan,
+        worker_id="worker-a",
+        gpu_index=1,
+        state_objects=state_objects,
+    )
+
+    assert materialized.worker.owned_partitions == ("partition-b",)
+    assert materialized.parameters == {"p1": state_objects["p1"]}
+    assert materialized.buffers == {"b0": state_objects["b0"]}
+    assert materialized.read_only_state_ids == ("p0",)
+    assert materialized.materialized_state_ids == ("p1", "b0")
+    assert "p0" not in materialized.parameters
+    assert "p0" not in materialized.buffers
+    assert "p2" not in materialized.parameters
+    assert "unused" not in materialized.parameters
+
+
+def test_worker_materialization_preserves_canonical_owner_for_shared_state() -> None:
+    graph, logical, placement = _exact_plan_fixture()
+    runtime_plan = compile_runtime_plan(graph, logical, placement)
+    state_objects = {
+        "p0": torch.nn.Parameter(torch.ones(2, 2)),
+        "p1": torch.nn.Parameter(torch.ones(2, 2)),
+        "p2": torch.nn.Parameter(torch.ones(2, 2)),
+        "b0": torch.ones(2),
+    }
+
+    worker_a = materialize_worker_owned_state(
+        runtime_plan,
+        worker_id="worker-a",
+        gpu_index=1,
+        state_objects=state_objects,
+    )
+    worker_b = materialize_worker_owned_state(
+        runtime_plan,
+        worker_id="worker-b",
+        gpu_index=0,
+        state_objects=state_objects,
+    )
+
+    assert worker_a.read_only_state_ids == ("p0",)
+    assert "p0" not in worker_a.materialized_state_ids
+    assert worker_b.worker.owned_partitions == ("partition-a", "partition-c")
+    assert worker_b.parameters == {"p0": state_objects["p0"], "p2": state_objects["p2"]}
+    assert worker_b.buffers == {}
+
+
+def test_worker_materialization_keeps_parameterless_execution_nodes_state_free() -> None:
+    graph, logical, placement = _exact_plan_fixture()
+    runtime_plan = compile_runtime_plan(graph, logical, placement)
+
+    worker_b = materialize_worker_owned_state(
+        runtime_plan,
+        worker_id="worker-b",
+        gpu_index=0,
+        state_objects={
+            "p0": torch.nn.Parameter(torch.ones(2, 2)),
+            "p1": torch.nn.Parameter(torch.ones(2, 2)),
+            "p2": torch.nn.Parameter(torch.ones(2, 2)),
+            "b0": torch.ones(2),
+        },
+    )
+
+    partition_c = next(
+        partition
+        for partition in runtime_plan.logical_partitions
+        if partition.partition_id == "partition-c"
+    )
+    parameterless = next(node for node in graph.nodes if node.node_id == "n3")
+    assert partition_c.node_ids == ("n2", "n3")
+    assert parameterless.parameter_ids == ()
+    assert parameterless.buffer_ids == ()
+    assert worker_b.materialized_state_ids == ("p0", "p2")
+
+
+def test_worker_materialization_rejects_missing_owned_state() -> None:
+    graph, logical, placement = _exact_plan_fixture()
+    runtime_plan = compile_runtime_plan(graph, logical, placement)
+
+    with pytest.raises(ValueError, match="missing owned worker state.*p1"):
+        materialize_worker_owned_state(
+            runtime_plan,
+            worker_id="worker-a",
+            gpu_index=1,
+            state_objects={"b0": torch.ones(2)},
+        )
+
+
 def _exact_plan_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, PlacementPlan]:
     graph = GenericGraphIR(
         graph_fingerprint="graph-exact",
         capture_backend="unit",
         input_value_ids=("input",),
-        output_value_ids=("v2",),
+        output_value_ids=("v3",),
         parameter_owners={},
         nodes=(
             GraphNodeSpec(
@@ -144,6 +245,14 @@ def _exact_plan_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, Placeme
                 output_value_ids=("v2",),
                 parameter_ids=("p2",),
             ),
+            GraphNodeSpec(
+                node_id="n3",
+                op_kind="call_function",
+                target="torch.relu",
+                module_path=None,
+                input_value_ids=("v2",),
+                output_value_ids=("v3",),
+            ),
         ),
         values=(
             GraphValueSpec("input", None, ("n0",)),
@@ -165,7 +274,8 @@ def _exact_plan_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, Placeme
                 requires_grad=True,
                 estimated_bytes=128,
             ),
-            GraphValueSpec("v2", "n2", (), shape=(4, 2), dtype="float32"),
+            GraphValueSpec("v2", "n2", ("n3",), shape=(4, 2), dtype="float32"),
+            GraphValueSpec("v3", "n3", (), shape=(4, 2), dtype="float32"),
         ),
         edges=(
             GraphEdgeSpec(
@@ -189,6 +299,7 @@ def _exact_plan_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, Placeme
                 forward_transfer_bytes=128,
                 backward_transfer_bytes=128,
             ),
+            GraphEdgeSpec("n2", "n3", "v2"),
         ),
         states=(
             StateObjectSpec("p0", "parameter", "encoder.weight"),
@@ -227,9 +338,9 @@ def _exact_plan_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, Placeme
             ),
             LogicalPartitionSpec(
                 partition_id="partition-c",
-                node_ids=("n2",),
+                node_ids=("n2", "n3"),
                 input_value_ids=("v1", "v0"),
-                output_value_ids=("v2",),
+                output_value_ids=("v3",),
                 parameter_ids=("p2",),
                 buffer_ids=(),
                 estimated_compute=1,
