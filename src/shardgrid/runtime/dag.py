@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from shardgrid.planner.generic_graph import CanonicalGraphIR
 from shardgrid.planner.planning_contract import (
@@ -223,6 +223,10 @@ def compile_runtime_plan(
     logical: LogicalPartitionPlan,
     placement: PlacementPlan,
 ) -> RuntimePlan:
+    if logical.graph_fingerprint != graph.graph_fingerprint:
+        raise ValueError("PLAN_VALIDATION_FAILURE: logical plan graph fingerprint mismatch")
+    if placement.graph_fingerprint != graph.graph_fingerprint:
+        raise ValueError("PLAN_VALIDATION_FAILURE: placement plan graph fingerprint mismatch")
     partition_by_id = {partition.partition_id: partition for partition in logical.partitions}
     partition_by_node = {
         node_id: partition.partition_id
