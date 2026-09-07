@@ -144,6 +144,10 @@ def test_checkpoint_shards_preserve_original_parameter_state_dict_keys(tmp_path)
         shard_paths,
         tmp_path / "model-state.pt",
         expected_state_keys=tuple(case.module.state_dict()),
+        expected_graph_fingerprint=graph.graph_fingerprint,
+        expected_plan_id="plan-test",
+        expected_training_step=7,
+        runtime_plan=runtime_plan,
     )
 
     assert set(consolidated["state_dict"]) == set(case.module.state_dict())
@@ -330,9 +334,78 @@ def test_consolidated_checkpoint_supports_strict_reload_for_plain_pytorch_model(
     assert load_result.missing_keys == []
     assert load_result.unexpected_keys == []
     loaded = torch.load(tmp_path / "model-state.pt", map_location="cpu", weights_only=False)
-    file_load_result = target.module.load_state_dict(loaded["state_dict"], strict=True)
+    assert set(loaded) == set(source.module.state_dict())
+    file_load_result = target.module.load_state_dict(loaded, strict=True)
     assert file_load_result.missing_keys == []
     assert file_load_result.unexpected_keys == []
+
+
+def test_checkpoint_merge_rejects_stale_metadata_and_ownership_mismatch(tmp_path) -> None:
+    case = _ordinary_case("sequential")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    parameter_ids = _parameter_ids(graph)
+    runtime_plan = _runtime_plan(
+        graph,
+        worker0_parameters=parameter_ids[:2],
+        worker1_parameters=parameter_ids[2:],
+    )
+    shard_paths = _save_shards(tmp_path, graph, runtime_plan, case.module.state_dict())
+
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*graph_fingerprint mismatch",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths,
+            tmp_path / "stale-graph.pt",
+            expected_graph_fingerprint="old-graph",
+        )
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*plan_id mismatch",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths,
+            tmp_path / "stale-plan.pt",
+            expected_plan_id="old-plan",
+        )
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*training_step mismatch",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths,
+            tmp_path / "stale-step.pt",
+            expected_training_step=999,
+        )
+
+    tampered = torch.load(shard_paths[0], map_location="cpu", weights_only=False)
+    tampered["ownership"] = {**tampered["ownership"], "local_parameter_ids": ()}
+    torch.save(tampered, shard_paths[0])
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*ownership mismatch",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths,
+            tmp_path / "ownership-bad.pt",
+            runtime_plan=runtime_plan,
+        )
+    shard_paths = _save_shards(tmp_path / "fresh", graph, runtime_plan, case.module.state_dict())
+    with pytest.raises(
+        CheckpointContractError,
+        match="CHECKPOINT_CONTRACT_FAILURE.*missing worker shards",
+    ):
+        consolidate_worker_state_shards(
+            shard_paths[:1],
+            tmp_path / "missing-worker.pt",
+            runtime_plan=runtime_plan,
+        )
+    assert not (tmp_path / "stale-graph.pt").exists()
+    assert not (tmp_path / "stale-plan.pt").exists()
+    assert not (tmp_path / "stale-step.pt").exists()
+    assert not (tmp_path / "ownership-bad.pt").exists()
+    assert not (tmp_path / "missing-worker.pt").exists()
 
 
 def test_tied_parameter_checkpoint_currently_keeps_only_canonical_state_key(

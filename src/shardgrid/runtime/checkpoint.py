@@ -85,11 +85,17 @@ def consolidate_worker_state_shards(
     output_path: Path,
     *,
     expected_state_keys: Sequence[str] | None = None,
+    expected_graph_fingerprint: str | None = None,
+    expected_plan_id: str | None = None,
+    expected_training_step: int | None = None,
+    runtime_plan: RuntimePlan | None = None,
 ) -> dict[str, Any]:
     state_dict: dict[str, Any] = {}
     seen_ids: set[str] = set()
     shards = []
     expected_metadata: dict[str, Any] | None = None
+    expected_workers = _expected_workers(runtime_plan)
+    seen_workers: set[tuple[str, int]] = set()
     for shard_path in shard_paths:
         shard = torch.load(shard_path, map_location="cpu", weights_only=False)
         if shard.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -104,6 +110,18 @@ def consolidate_worker_state_shards(
             expected_metadata = metadata
         elif metadata != expected_metadata:
             raise _checkpoint_failure(f"{shard_path} checkpoint metadata disagrees")
+        _validate_expected_metadata(
+            shard_path,
+            metadata,
+            graph_fingerprint=expected_graph_fingerprint,
+            plan_id=expected_plan_id,
+            training_step=expected_training_step,
+        )
+        worker_key = (str(shard["worker_id"]), int(shard["gpu_index"]))
+        if expected_workers and worker_key not in expected_workers:
+            raise _checkpoint_failure(f"{shard_path} checkpoint ownership mismatch")
+        seen_workers.add(worker_key)
+        _validate_ownership(shard_path, shard, expected_workers.get(worker_key))
         shards.append(
             {
                 "path": str(shard_path),
@@ -137,6 +155,11 @@ def consolidate_worker_state_shards(
         raise _checkpoint_failure(
             f"consolidated checkpoint missing keys: {sorted(missing)!r}"
         )
+    missing_workers = set(expected_workers) - seen_workers
+    if missing_workers:
+        raise _checkpoint_failure(
+            f"consolidated checkpoint missing worker shards: {sorted(missing_workers)!r}"
+        )
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         **(expected_metadata or {}),
@@ -145,7 +168,7 @@ def consolidate_worker_state_shards(
         "training_evidence": _training_evidence(shards),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, output_path)
+    torch.save(state_dict, output_path)
     _fsync_file(output_path)
     return payload
 
@@ -182,6 +205,59 @@ def _validate_entry_tensor(path: Path, item: Mapping[str, Any], tensor: Any) -> 
         raise _checkpoint_failure(
             f"{path} checkpoint dtype mismatch for {item['state_dict_key']!r}"
         )
+
+
+def _validate_expected_metadata(
+    path: Path,
+    metadata: Mapping[str, Any],
+    *,
+    graph_fingerprint: str | None,
+    plan_id: str | None,
+    training_step: int | None,
+) -> None:
+    expected = {
+        "graph_fingerprint": graph_fingerprint,
+        "plan_id": plan_id,
+        "training_step": training_step,
+    }
+    for key, value in expected.items():
+        if value is not None and metadata.get(key) != value:
+            raise _checkpoint_failure(f"{path} checkpoint {key} mismatch")
+
+
+def _expected_workers(
+    runtime_plan: RuntimePlan | None,
+) -> dict[tuple[str, int], dict[str, Any]]:
+    if runtime_plan is None:
+        return {}
+    return {
+        (worker.worker_id, worker.gpu_index): {
+            "gpu_id": worker.gpu_id,
+            "owned_partitions": worker.owned_partitions,
+            "local_parameter_ids": worker.local_parameter_ids,
+            "local_buffer_ids": worker.local_buffer_ids,
+            "read_only_state_ids": worker.read_only_state_ids,
+        }
+        for worker in runtime_plan.ownership.workers
+    }
+
+
+def _validate_ownership(
+    path: Path,
+    shard: Mapping[str, Any],
+    expected: Mapping[str, Any] | None,
+) -> None:
+    if expected is None:
+        return
+    actual = dict(shard.get("ownership") or {})
+    actual["gpu_id"] = shard.get("gpu_id")
+    for key, value in expected.items():
+        if isinstance(value, tuple):
+            mismatch = tuple(actual.get(key, ())) != value
+        else:
+            mismatch = actual.get(key) != value
+        if mismatch:
+            raise _checkpoint_failure(f"{path} checkpoint ownership mismatch")
 
 
 def _training_evidence(shards: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
