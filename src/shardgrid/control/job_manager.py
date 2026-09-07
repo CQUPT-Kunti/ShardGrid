@@ -3750,7 +3750,7 @@ class JobManager:
 
     def _generic_dag_runtime_requested(self, training_config: TrainingConfig) -> bool:
         return (
-            training_config.model.type == "generic_dag"
+            training_config.model.type in {"generic_dag", "captured_entrypoint"}
             or str(training_config.model.parameters.get("generic_dag_runtime", "false")).lower()
             == "true"
         )
