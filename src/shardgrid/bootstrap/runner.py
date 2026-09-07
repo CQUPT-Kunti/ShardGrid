@@ -36,7 +36,7 @@ class CapturedTrainingContext:
     tensor_metadata: dict[str, dict[str, Any]]
     optimizer: dict[str, Any] | None
     scheduler: dict[str, Any] | None
-    lifecycle: dict[str, bool]
+    lifecycle: dict[str, Any]
     model_output_structure: dict[str, Any]
     state_dict_key_to_canonical_state_id: dict[str, str]
     distributed_mutation_observed_before_capture: bool = False
@@ -69,15 +69,18 @@ class _CaptureState:
     kwargs: dict[str, Any] = field(default_factory=dict)
     first_batch: Any = None
     output: Any = None
+    optimizer_ref: Any | None = None
     optimizer: dict[str, Any] | None = None
     scheduler: dict[str, Any] | None = None
-    backward_called: bool = False
+    backward_call_count: int = 0
     optimizer_step_called: bool = False
     scheduler_step_called: bool = False
     distributed_mutation: bool = False
     graph_capture_backend: str | None = None
     graph_capture_diagnostics: tuple[str, ...] = ()
     failure: CaptureFailure | None = None
+    amp_autocast_observed: bool = False
+    amp_scaler_observed: bool = False
 
 
 class _CaptureComplete(RuntimeError):
@@ -181,6 +184,8 @@ def _capture_entrypoint_state(
                 artifact_log_ref="diagnostics/capture.json",
             ),
         )
+    if state.model is not None:
+        return state
     return CaptureResult(
         ok=False,
         failure=CaptureFailure(
@@ -229,6 +234,10 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
     original_scheduler_step = LRScheduler.step
     original_backward = torch.Tensor.backward
     original_init_process_group = dist.init_process_group
+    original_amp_autocast = torch.amp.autocast
+    original_cuda_amp_autocast = torch.cuda.amp.autocast
+    original_amp_grad_scaler_init = torch.amp.GradScaler.__init__
+    original_cuda_amp_grad_scaler_init = torch.cuda.amp.GradScaler.__init__
     optimizer_step_methods = {
         cls: cls.step
         for cls in (Optimizer, torch.optim.SGD, torch.optim.Adam, torch.optim.AdamW)
@@ -248,12 +257,25 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
         return _CaptureIterator(original_dataloader_iter(loader), state)
 
     def optimizer_init(optimizer: Optimizer, params: Any, defaults: dict[str, Any]) -> None:
+        if not optimizer.__class__.__module__.startswith("torch.optim"):
+            state.failure = CaptureFailure(
+                stage="lifecycle_capture",
+                code="HIDDEN_OPTIMIZER_MUTATION_UNSUPPORTED",
+                message=(
+                    "custom optimizer step semantics cannot be safely captured before "
+                    "distributed mutation"
+                ),
+                artifact_log_ref="diagnostics/capture.json",
+            )
+            raise _CaptureFailed
         original_optimizer_init(optimizer, params, defaults)
-        state.optimizer = _optimizer_metadata(optimizer)
+        state.optimizer_ref = optimizer
+        state.optimizer = _optimizer_metadata(optimizer, state.model)
 
     def optimizer_step(optimizer: Optimizer, *args: Any, **kwargs: Any) -> Any:
         state.optimizer_step_called = True
-        state.optimizer = _optimizer_metadata(optimizer)
+        state.optimizer_ref = optimizer
+        state.optimizer = _optimizer_metadata(optimizer, state.model)
         if dry_run:
             return None
         original_step = optimizer_step_methods.get(optimizer.__class__)
@@ -263,17 +285,17 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
 
     def scheduler_init(scheduler: LRScheduler, *args: Any, **kwargs: Any) -> None:
         original_scheduler_init(scheduler, *args, **kwargs)
-        state.scheduler = {"class_name": scheduler.__class__.__name__}
+        state.scheduler = _scheduler_metadata(scheduler)
 
     def scheduler_step(scheduler: LRScheduler, *args: Any, **kwargs: Any) -> Any:
         state.scheduler_step_called = True
-        state.scheduler = {"class_name": scheduler.__class__.__name__}
+        state.scheduler = _scheduler_metadata(scheduler)
         if dry_run and state.model is not None and state.optimizer_step_called:
             raise _CaptureComplete
         return original_scheduler_step(scheduler, *args, **kwargs)
 
     def backward(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        state.backward_called = True
+        state.backward_call_count += 1
         return original_backward(tensor, *args, **kwargs)
 
     def init_process_group(*args: Any, **kwargs: Any) -> Any:
@@ -281,6 +303,22 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
         if dry_run:
             raise _CaptureComplete
         return original_init_process_group(*args, **kwargs)
+
+    def amp_autocast(*args: Any, **kwargs: Any) -> Any:
+        state.amp_autocast_observed = True
+        return original_amp_autocast(*args, **kwargs)
+
+    def cuda_amp_autocast(*args: Any, **kwargs: Any) -> Any:
+        state.amp_autocast_observed = True
+        return original_cuda_amp_autocast(*args, **kwargs)
+
+    def amp_grad_scaler_init(scaler: Any, *args: Any, **kwargs: Any) -> None:
+        state.amp_scaler_observed = True
+        original_amp_grad_scaler_init(scaler, *args, **kwargs)
+
+    def cuda_amp_grad_scaler_init(scaler: Any, *args: Any, **kwargs: Any) -> None:
+        state.amp_scaler_observed = True
+        original_cuda_amp_grad_scaler_init(scaler, *args, **kwargs)
 
     nn.Module.__call__ = module_call
     torch.utils.data.DataLoader.__iter__ = dataloader_iter
@@ -291,6 +329,10 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
     LRScheduler.step = scheduler_step
     torch.Tensor.backward = backward
     dist.init_process_group = init_process_group
+    torch.amp.autocast = amp_autocast
+    torch.cuda.amp.autocast = cuda_amp_autocast
+    torch.amp.GradScaler.__init__ = amp_grad_scaler_init
+    torch.cuda.amp.GradScaler.__init__ = cuda_amp_grad_scaler_init
     try:
         yield
     finally:
@@ -303,6 +345,10 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
         LRScheduler.step = original_scheduler_step
         torch.Tensor.backward = original_backward
         dist.init_process_group = original_init_process_group
+        torch.amp.autocast = original_amp_autocast
+        torch.cuda.amp.autocast = original_cuda_amp_autocast
+        torch.amp.GradScaler.__init__ = original_amp_grad_scaler_init
+        torch.cuda.amp.GradScaler.__init__ = original_cuda_amp_grad_scaler_init
 
 
 class _CaptureIterator:
@@ -352,14 +398,22 @@ def _build_context(state: _CaptureState) -> CapturedTrainingContext:
             "kwargs": _structure(state.kwargs),
         },
         tensor_metadata=_tensor_metadata(state.args, state.kwargs),
-        optimizer=state.optimizer,
+        optimizer=(
+            _optimizer_metadata(state.optimizer_ref, state.model)
+            if state.optimizer_ref is not None
+            else state.optimizer
+        ),
         scheduler=state.scheduler,
         lifecycle={
-            "loss_computed_before_backward": state.backward_called,
+            "loss_computed_before_backward": state.backward_call_count > 0,
             "backward_called_before_optimizer_step": (
-                state.backward_called and state.optimizer_step_called
+                state.backward_call_count > 0 and state.optimizer_step_called
             ),
             "scheduler_step_observed": state.scheduler_step_called,
+            "gradient_accumulation_observed": state.backward_call_count > 1,
+            "backward_call_count": state.backward_call_count,
+            "amp_autocast_observed": state.amp_autocast_observed,
+            "amp_scaler_observed": state.amp_scaler_observed,
         },
         model_output_structure=_structure(state.output),
         state_dict_key_to_canonical_state_id={
@@ -398,12 +452,25 @@ def _capture_graph_or_fail(state: _CaptureState) -> None:
     state.graph_capture_diagnostics = tuple(result.diagnostics)
 
 
-def _optimizer_metadata(optimizer: Any) -> dict[str, Any]:
+def _optimizer_metadata(optimizer: Any, model: Any | None = None) -> dict[str, Any]:
+    parameter_keys_by_object = _parameter_keys_by_object(model)
+    state_ids_by_key = _state_ids_by_key(model)
     groups = []
     for group in optimizer.param_groups:
+        parameter_keys = [
+            key
+            for parameter in group.get("params", ())
+            for key in parameter_keys_by_object.get(id(parameter), ())
+        ]
         groups.append(
             {
                 "parameter_count": len(group.get("params", ())),
+                "parameter_keys": parameter_keys,
+                "canonical_state_ids": [
+                    state_ids_by_key[key]
+                    for key in parameter_keys
+                    if key in state_ids_by_key
+                ],
                 "hyperparameters": {
                     key: value
                     for key, value in group.items()
@@ -412,6 +479,35 @@ def _optimizer_metadata(optimizer: Any) -> dict[str, Any]:
             }
         )
     return {"class_name": optimizer.__class__.__name__, "param_groups": groups}
+
+
+def _scheduler_metadata(scheduler: Any) -> dict[str, Any]:
+    return {
+        "class_name": scheduler.__class__.__name__,
+        "last_epoch": getattr(scheduler, "last_epoch", None),
+    }
+
+
+def _parameter_keys_by_object(model: Any | None) -> dict[int, list[str]]:
+    if model is None:
+        return {}
+    keys: dict[int, list[str]] = {}
+    try:
+        named_parameters = model.named_parameters(remove_duplicate=False)
+    except TypeError:
+        named_parameters = model.named_parameters()
+    for key, parameter in named_parameters:
+        keys.setdefault(id(parameter), []).append(str(key))
+    return keys
+
+
+def _state_ids_by_key(model: Any | None) -> dict[str, str]:
+    if model is None:
+        return {}
+    return {
+        key: f"state:{index:04d}"
+        for index, key in enumerate(model.state_dict().keys())
+    }
 
 
 def _structure(value: Any) -> dict[str, Any]:

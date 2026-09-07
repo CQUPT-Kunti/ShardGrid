@@ -104,10 +104,17 @@ def test_capture_contract_records_optimizer_scheduler_and_state_key_mapping() ->
     assert context.optimizer["class_name"] == "Adam"
     assert context.optimizer["param_groups"]
     assert context.optimizer["param_groups"][0]["hyperparameters"]["lr"] == 0.02
+    assert set(context.optimizer["param_groups"][0]["parameter_keys"]) >= {
+        "left.weight",
+        "right.weight",
+        "head.weight",
+    }
+    assert "state:0000" in context.optimizer["param_groups"][0]["canonical_state_ids"]
     assert context.scheduler["class_name"] == "StepLR"
     assert context.lifecycle["loss_computed_before_backward"] is True
     assert context.lifecycle["backward_called_before_optimizer_step"] is True
     assert context.lifecycle["scheduler_step_observed"] is True
+    assert context.lifecycle["backward_call_count"] == 1
     assert context.distributed_mutation_observed_before_capture is False
     assert context.state_dict_key_to_canonical_state_id
     assert set(context.state_dict_key_to_canonical_state_id) >= {
@@ -219,6 +226,118 @@ dist.init_process_group("gloo")
     assert result.failure.stage == "graph_capture"
     assert result.failure.code == "DYNAMIC_CONTROL_FLOW_UNSUPPORTED"
     assert result.failure.artifact_log_ref == "diagnostics/capture.json"
+
+
+def test_gradient_accumulation_boundary_is_captured(tmp_path: Path) -> None:
+    script = tmp_path / "gradient_accumulation_train.py"
+    script.write_text(
+        """
+import torch
+from torch import nn
+
+
+class AccumulationModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(2, 1)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+model = AccumulationModel()
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.005, weight_decay=0.01)
+for value in (1.0, 2.0):
+    loss = model(torch.full((2, 2), value)).sum() / 2
+    loss.backward()
+optimizer.step()
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    context = _capture_module().capture_entrypoint(script, cwd=tmp_path, environment={})
+
+    assert context.optimizer["class_name"] == "AdamW"
+    assert context.optimizer["param_groups"][0]["hyperparameters"]["lr"] == 0.005
+    assert context.optimizer["param_groups"][0]["parameter_keys"] == [
+        "proj.weight",
+        "proj.bias",
+    ]
+    assert context.lifecycle["backward_call_count"] == 2
+    assert context.lifecycle["gradient_accumulation_observed"] is True
+    assert context.lifecycle["backward_called_before_optimizer_step"] is True
+
+
+def test_amp_autocast_and_scaler_intent_are_captured(tmp_path: Path) -> None:
+    script = tmp_path / "amp_train.py"
+    script.write_text(
+        """
+import torch
+from torch import nn
+
+
+class AmpModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(2, 1)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+model = AmpModel()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+scaler = torch.amp.GradScaler("cpu", enabled=False)
+with torch.amp.autocast("cpu"):
+    loss = model(torch.ones(2, 2)).sum()
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+scaler.update()
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    context = _capture_module().capture_entrypoint(script, cwd=tmp_path, environment={})
+
+    assert context.optimizer["class_name"] == "Adam"
+    assert context.lifecycle["amp_autocast_observed"] is True
+    assert context.lifecycle["amp_scaler_observed"] is True
+    assert context.lifecycle["backward_called_before_optimizer_step"] is True
+
+
+def test_hidden_custom_optimizer_mutation_is_rejected_before_training(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "custom_optimizer_train.py"
+    script.write_text(
+        """
+import torch
+from torch import nn
+
+
+class HiddenMutationOptimizer(torch.optim.Optimizer):
+    def __init__(self, params):
+        super().__init__(params, {"lr": 0.1})
+
+    def step(self, closure=None):
+        for group in self.param_groups:
+            for param in group["params"]:
+                param.data.add_(1.0)
+
+
+model = nn.Linear(2, 1)
+optimizer = HiddenMutationOptimizer(model.parameters())
+model(torch.ones(1, 2)).sum().backward()
+optimizer.step()
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = _capture_module().capture_entrypoint(script, cwd=tmp_path, environment={})
+
+    assert result.ok is False
+    assert result.failure.stage == "lifecycle_capture"
+    assert result.failure.code == "HIDDEN_OPTIMIZER_MUTATION_UNSUPPORTED"
 
 
 def test_ordinary_training_script_fixtures_do_not_import_shardgrid_user_api() -> None:
