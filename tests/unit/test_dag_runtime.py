@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 from examples.models import train_generic_dag
@@ -214,6 +216,41 @@ def test_extract_partition_graph_unet_matches_full_backward_optimizer() -> None:
 
 def test_extract_partition_graph_densenet_matches_full_backward_optimizer() -> None:
     _assert_extracted_partitions_match_full("mini_densenet", partition_count=4)
+
+
+def test_extract_partition_graph_rejects_unknown_stable_node_id() -> None:
+    capture, logical = _captured_logical_partition("residual_mlp_dag", 3)
+    partition = replace(
+        logical.partitions[0],
+        node_ids=logical.partitions[0].node_ids + ("missing-node",),
+    )
+
+    with pytest.raises(ValueError, match="PLAN_VALIDATION_FAILURE.*unknown node ids"):
+        extract_partition_graph(capture.canonical_graph, capture.backend_graph, partition)
+
+
+def test_extract_partition_graph_rejects_unknown_value_id() -> None:
+    capture, logical = _captured_logical_partition("residual_mlp_dag", 3)
+    partition = replace(
+        logical.partitions[0],
+        output_value_ids=logical.partitions[0].output_value_ids + ("missing-value",),
+    )
+
+    with pytest.raises(ValueError, match="PLAN_VALIDATION_FAILURE.*unknown value ids"):
+        extract_partition_graph(capture.canonical_graph, capture.backend_graph, partition)
+
+
+def test_extract_partition_graph_rejects_backend_node_identity_mismatch() -> None:
+    capture, logical = _captured_logical_partition("residual_mlp_dag", 3)
+    changed = next(node for node in capture.backend_graph.graph.nodes if node.op == "call_module")
+    changed.target = f"{changed.target}_mismatch"
+
+    with pytest.raises(ValueError, match="PLAN_VALIDATION_FAILURE.*backend graph mismatch"):
+        extract_partition_graph(
+            capture.canonical_graph,
+            capture.backend_graph,
+            logical.partitions[0],
+        )
 
 
 def test_checkpoint_shards_consolidate_complete_state_dict(tmp_path) -> None:
@@ -486,6 +523,15 @@ def _assert_extracted_partitions_match_full(name: str, *, partition_count: int) 
         not torch.equal(old, parameter)
         for old, parameter in zip(before, model.parameters(), strict=True)
     )
+
+
+def _captured_logical_partition(name: str, partition_count: int):
+    model = build_zoo_model(name)
+    args, kwargs = make_zoo_sample(name)
+    if kwargs:
+        raise AssertionError("partition extractor tests only use positional zoo samples")
+    capture = FXGraphCaptureAdapter().capture(model, sample_args=args)
+    return capture, _logical_plan_for_extractor(capture.canonical_graph, partition_count)
 
 
 def _logical_plan_for_extractor(
