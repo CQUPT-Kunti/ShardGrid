@@ -102,6 +102,16 @@ class TinySequenceMLP(nn.Module):
         return self.net(x)
 
 
+class BufferMemoryModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bn = nn.BatchNorm1d(4)
+        self.proj = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.bn(x))
+
+
 def test_minimal_transformer_profile_captures_reusable_memory_breakdown() -> None:
     torch.manual_seed(42)
     model = TinyTransformerModel()
@@ -299,9 +309,18 @@ def test_model_profile_has_no_slot_for_parameterless_functional_execution_nodes(
     assert all("avg_pool2d" not in path for path in profile_paths)
     assert all("interpolate" not in path for path in profile_paths)
     assert all("cat" not in path for path in profile_paths)
+    assert any(
+        node.module_path is None
+        and "cat" in node.target
+        and node.state_ids == ()
+        and node.activation_bytes > 0
+        for node in profile.execution_costs
+    )
+    assert profile.graph_value_activation_bytes is not None
+    assert profile.graph_value_activation_bytes > 0
 
 
-def test_model_profile_omits_root_owned_state_without_standalone_module_entry() -> None:
+def test_model_profile_tracks_root_owned_state_without_standalone_module_entry() -> None:
     case = _ordinary_case("transformer")
     profile = _profile_ordinary_case("transformer")
 
@@ -309,11 +328,15 @@ def test_model_profile_omits_root_owned_state_without_standalone_module_entry() 
         parameter.numel() * parameter.element_size()
         for parameter in case.module.parameters()
     )
+    state_by_key = {state.state_dict_key: state for state in profile.state_memory}
 
     assert "position" in dict(case.module.named_parameters())
     assert "position" not in _parameter_names(profile)
     assert "" not in [module.module_path for module in profile.modules]
     assert profile.total_memory.parameter_bytes < model_parameter_bytes
+    assert state_by_key["position"].kind == "parameter"
+    assert state_by_key["position"].bytes == case.module.position.numel() * 4
+    assert profile.state_parameter_bytes == model_parameter_bytes
 
 
 def test_model_profile_currently_counts_tied_parameters_per_module_owner() -> None:
@@ -329,7 +352,38 @@ def test_model_profile_currently_counts_tied_parameters_per_module_owner() -> No
     assert profile.shared_parameter_groups == (("embedding.weight", "decoder.weight"),)
     assert _parameter_names(profile) == {"embedding.weight", "decoder.weight"}
     assert profile.total_memory.parameter_bytes == unique_model_parameter_bytes * 2
+    assert profile.state_parameter_bytes == unique_model_parameter_bytes
+    assert {
+        state.checkpoint_owner_key
+        for state in profile.state_memory
+        if state.shared_group_id is not None
+    } == {"embedding.weight"}
     assert "shared/tied parameters detected in model profile" in profile.diagnostics
+
+
+def test_model_profile_tracks_buffer_state_memory_separately() -> None:
+    model = BufferMemoryModel().eval()
+    profile = build_model_profile(
+        model,
+        engine_id="pytorch_pipeline",
+        model_name="buffer-memory-model",
+        sample_args=(torch.randn(3, 4),),
+    )
+    state_by_key = {state.state_dict_key: state for state in profile.state_memory}
+
+    expected_buffer_bytes = sum(
+        buffer.numel() * buffer.element_size() for buffer in model.buffers()
+    )
+
+    assert {"bn.running_mean", "bn.running_var", "bn.num_batches_tracked"} <= set(
+        state_by_key
+    )
+    assert state_by_key["bn.running_mean"].kind == "buffer"
+    assert profile.state_buffer_bytes == expected_buffer_bytes
+    assert profile.state_parameter_bytes == sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in model.parameters()
+    )
 
 
 def test_unsupported_optimizer_stays_explicitly_unsupported() -> None:

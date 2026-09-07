@@ -288,6 +288,94 @@ class TrainingMemoryEstimate:
 
 
 @dataclass(frozen=True)
+class ExecutionCostProfile:
+    node_id: str
+    op_kind: str
+    target: str
+    module_path: str | None = None
+    state_ids: tuple[str, ...] = ()
+    input_value_ids: tuple[str, ...] = ()
+    output_value_ids: tuple[str, ...] = ()
+    activation_bytes: int = 0
+    temporary_bytes: int = 0
+    estimated_compute_cost: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExecutionCostProfile":
+        return cls(
+            node_id=str(data["node_id"]),
+            op_kind=str(data["op_kind"]),
+            target=str(data["target"]),
+            module_path=data.get("module_path"),
+            state_ids=tuple(str(item) for item in data.get("state_ids", ())),
+            input_value_ids=tuple(
+                str(item) for item in data.get("input_value_ids", ())
+            ),
+            output_value_ids=tuple(
+                str(item) for item in data.get("output_value_ids", ())
+            ),
+            activation_bytes=int(data.get("activation_bytes", 0)),
+            temporary_bytes=int(data.get("temporary_bytes", 0)),
+            estimated_compute_cost=int(data.get("estimated_compute_cost", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class GraphValueCostProfile:
+    value_id: str
+    producer_node_id: str | None
+    consumer_node_ids: tuple[str, ...] = ()
+    estimated_bytes: int = 0
+    dtype: str | None = None
+    shape: tuple[int | str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GraphValueCostProfile":
+        return cls(
+            value_id=str(data["value_id"]),
+            producer_node_id=data.get("producer_node_id"),
+            consumer_node_ids=tuple(
+                str(item) for item in data.get("consumer_node_ids", ())
+            ),
+            estimated_bytes=int(data.get("estimated_bytes", 0)),
+            dtype=data.get("dtype"),
+            shape=tuple(data.get("shape", ())),
+        )
+
+
+@dataclass(frozen=True)
+class StateMemoryProfile:
+    canonical_state_id: str
+    kind: str
+    state_dict_key: str
+    bytes: int = 0
+    requires_grad: bool | None = None
+    shared_group_id: str | None = None
+    checkpoint_owner_key: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "StateMemoryProfile":
+        return cls(
+            canonical_state_id=str(data["canonical_state_id"]),
+            kind=str(data["kind"]),
+            state_dict_key=str(data["state_dict_key"]),
+            bytes=int(data.get("bytes", 0)),
+            requires_grad=data.get("requires_grad"),
+            shared_group_id=data.get("shared_group_id"),
+            checkpoint_owner_key=data.get("checkpoint_owner_key"),
+        )
+
+
+@dataclass(frozen=True)
 class ModuleProfile:
     module_id: str
     module_path: str
@@ -394,6 +482,14 @@ class ModelProfile:
     required_runtime: str | None = None
     required_backends: tuple[str, ...] = ()
     total_memory: TrainingMemoryEstimate = TrainingMemoryEstimate()
+    execution_costs: tuple[ExecutionCostProfile, ...] = ()
+    graph_value_costs: tuple[GraphValueCostProfile, ...] = ()
+    state_memory: tuple[StateMemoryProfile, ...] = ()
+    state_parameter_bytes: int = 0
+    state_buffer_bytes: int = 0
+    graph_value_activation_bytes: int | None = None
+    execution_activation_bytes: int | None = None
+    execution_temporary_bytes: int | None = None
     evidence_paths: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
 
@@ -442,6 +538,27 @@ class ModelProfile:
             total_memory=TrainingMemoryEstimate.from_dict(
                 data.get("total_memory", {})
             ),
+            execution_costs=tuple(
+                ExecutionCostProfile.from_dict(item)
+                for item in data.get("execution_costs", ())
+            ),
+            graph_value_costs=tuple(
+                GraphValueCostProfile.from_dict(item)
+                for item in data.get("graph_value_costs", ())
+            ),
+            state_memory=tuple(
+                StateMemoryProfile.from_dict(item)
+                for item in data.get("state_memory", ())
+            ),
+            state_parameter_bytes=int(data.get("state_parameter_bytes", 0)),
+            state_buffer_bytes=int(data.get("state_buffer_bytes", 0)),
+            graph_value_activation_bytes=_optional_int(
+                data, "graph_value_activation_bytes"
+            ),
+            execution_activation_bytes=_optional_int(
+                data, "execution_activation_bytes"
+            ),
+            execution_temporary_bytes=_optional_int(data, "execution_temporary_bytes"),
             evidence_paths=tuple(str(item) for item in data.get("evidence_paths", ())),
             diagnostics=tuple(str(item) for item in data.get("diagnostics", ())),
         )

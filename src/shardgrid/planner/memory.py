@@ -15,9 +15,12 @@ from shardgrid.engines.models import (
     AutomaticPartitionSupport,
     CommunicationEdge,
     EstimateKind,
+    ExecutionCostProfile,
+    GraphValueCostProfile,
     ModelProfile,
     ModuleProfile,
     ProfileResult,
+    StateMemoryProfile,
     TensorMetadata,
     TrainingMemoryEstimate,
 )
@@ -142,6 +145,18 @@ def build_model_profile(
     if profile_result is not None:
         diagnostics.extend(profile_result.diagnostics)
         diagnostics.extend(profile_result.notes)
+    (
+        execution_costs,
+        graph_value_costs,
+        state_memory,
+        graph_diagnostics,
+    ) = _graph_memory_profiles(
+        model,
+        sample_args=sample_args,
+        sample_kwargs=sample_kwargs,
+        config=config,
+    )
+    diagnostics.extend(graph_diagnostics)
 
     shared_groups = _shared_parameter_groups(model)
     if shared_groups:
@@ -178,6 +193,20 @@ def build_model_profile(
         required_runtime=required_runtime,
         required_backends=tuple(required_backends),
         total_memory=total_memory,
+        execution_costs=execution_costs,
+        graph_value_costs=graph_value_costs,
+        state_memory=state_memory,
+        state_parameter_bytes=_state_bytes(state_memory, kind="parameter"),
+        state_buffer_bytes=_state_bytes(state_memory, kind="buffer"),
+        graph_value_activation_bytes=_sum_known(
+            value.estimated_bytes for value in graph_value_costs
+        ),
+        execution_activation_bytes=_sum_known(
+            item.activation_bytes for item in execution_costs
+        ),
+        execution_temporary_bytes=_sum_known(
+            item.temporary_bytes for item in execution_costs
+        ),
         evidence_paths=tuple(profile_result.evidence_paths) if profile_result else (),
         diagnostics=tuple(diagnostics),
     )
@@ -320,6 +349,71 @@ def evaluate_stage_memory_fit(
     )
 
 
+def _graph_memory_profiles(
+    model: "nn.Module",
+    *,
+    sample_args: Sequence[Any],
+    sample_kwargs: Mapping[str, Any],
+    config: MemoryEstimationConfig,
+) -> tuple[
+    tuple[ExecutionCostProfile, ...],
+    tuple[GraphValueCostProfile, ...],
+    tuple[StateMemoryProfile, ...],
+    tuple[str, ...],
+]:
+    try:
+        from shardgrid.planner.generic_graph import capture_generic_graph
+
+        graph = capture_generic_graph(
+            model,
+            sample_args=sample_args,
+            sample_kwargs=sample_kwargs,
+        )
+    except Exception as exc:
+        return (), (), (), (f"graph memory profile unavailable: {type(exc).__name__}: {exc}",)
+
+    execution_costs = tuple(
+        ExecutionCostProfile(
+            node_id=node.node_id,
+            op_kind=node.op_kind,
+            target=node.target,
+            module_path=node.module_path,
+            state_ids=tuple(dict.fromkeys(node.parameter_ids + node.buffer_ids)),
+            input_value_ids=node.input_value_ids,
+            output_value_ids=node.output_value_ids,
+            activation_bytes=node.activation_bytes,
+            temporary_bytes=int(node.activation_bytes * config.temporary_buffer_factor),
+            estimated_compute_cost=node.estimated_compute_cost,
+        )
+        for node in graph.nodes
+        if node.op_kind != "output"
+    )
+    graph_value_costs = tuple(
+        GraphValueCostProfile(
+            value_id=value.value_id,
+            producer_node_id=value.producer_node_id,
+            consumer_node_ids=value.consumer_node_ids,
+            estimated_bytes=value.estimated_bytes or 0,
+            dtype=value.dtype,
+            shape=value.shape,
+        )
+        for value in graph.values
+    )
+    state_memory = tuple(
+        StateMemoryProfile(
+            canonical_state_id=state.canonical_state_id,
+            kind=state.kind,
+            state_dict_key=state.state_dict_key,
+            bytes=_state_item_bytes(model.state_dict().get(state.state_dict_key)),
+            requires_grad=state.requires_grad,
+            shared_group_id=state.shared_group_id,
+            checkpoint_owner_key=state.checkpoint_owner_key,
+        )
+        for state in graph.states
+    )
+    return execution_costs, graph_value_costs, state_memory, ()
+
+
 def _profile_modules(
     model: "nn.Module",
     *,
@@ -434,6 +528,34 @@ def _profile_modules(
             )
         )
     return tuple(modules), tuple(edges)
+
+
+def _state_item_bytes(item: Any) -> int:
+    numel = getattr(item, "numel", None)
+    element_size = getattr(item, "element_size", None)
+    if callable(numel) and callable(element_size):
+        return int(numel() * element_size())
+    return 0
+
+
+def _state_bytes(states: Sequence[StateMemoryProfile], *, kind: str) -> int:
+    seen: set[str] = set()
+    total = 0
+    for state in states:
+        if state.kind != kind or state.canonical_state_id in seen:
+            continue
+        seen.add(state.canonical_state_id)
+        total += state.bytes
+    return total
+
+
+def _sum_known(values: Sequence[int | None]) -> int | None:
+    total = 0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return total
 
 
 def _iter_target_modules(model: "nn.Module") -> Sequence[tuple[str, "nn.Module"]]:
