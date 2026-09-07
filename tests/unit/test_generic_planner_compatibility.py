@@ -3,13 +3,17 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from shardgrid.common.enums import Health, PhysicalOS, RuntimeOS
+from shardgrid.common.models import as_hostname, as_machine_id, as_worker_id
+from shardgrid.control.job_manager import JobManager, PlannerWorkload
+from shardgrid.control.resource_manager import ResourceManager
 from shardgrid.planner.generic_graph import capture_generic_graph
 from shardgrid.planner.memory import MemoryEstimationConfig, build_model_profile
 from shardgrid.planner.partitioning import generate_partition_candidates
@@ -23,7 +27,7 @@ from shardgrid.planner.planning_contract import (
     validate_final_plan,
 )
 from shardgrid.planner.requirements import FeasibilityStatus
-
+from shardgrid.resources.models import WorkerResource
 
 FAMILIES = (
     "sequential",
@@ -99,6 +103,40 @@ def test_cpu_planner_pipeline_supports_ordinary_pytorch_family(family: str) -> N
     assert validation.valid, validation.diagnostics
 
 
+def test_job_manager_plans_from_non_zoo_captured_workload_without_model_name() -> None:
+    case = _fixtures().generic_training_case("sequential")
+    manager = object.__new__(JobManager)
+
+    def fail_legacy_workload(_training_config: object) -> object:
+        raise AssertionError("captured planning fell back to legacy model-type workload")
+
+    manager._planner_workload = fail_legacy_workload
+    training_config = SimpleNamespace(
+        model=SimpleNamespace(type="ordinary_user_module", name="", parameters={}),
+        job=SimpleNamespace(communication_backend="gloo"),
+    )
+
+    plan = manager._build_automatic_parallel_plan(
+        training_config=training_config,
+        cluster_state=ResourceManager().build_cluster_state(
+            [_worker_resource(0), _worker_resource(1)],
+            require_network=False,
+        ),
+        selected_engine=SimpleNamespace(engine_id="pytorch_pipeline"),
+        captured_workload=PlannerWorkload(
+            model=case.module,
+            sample_args=case.args,
+            sample_kwargs=dict(case.kwargs or {}),
+            model_name="",
+        ),
+    )
+
+    assert plan.partition_source == "automatic"
+    assert plan.requirements["workload_source"] == "captured_context"
+    assert plan.model_name == case.module.__class__.__name__
+    assert manager._last_planning_evidence["planner_workload_source"] == "captured_context"
+
+
 def _memory_config() -> MemoryEstimationConfig:
     return MemoryEstimationConfig(
         optimizer_type="adamw",
@@ -123,6 +161,28 @@ def _resources(count: int) -> ResourceSnapshot:
             )
             for index in range(max(count, 2))
         )
+    )
+
+
+def _worker_resource(index: int) -> WorkerResource:
+    return WorkerResource(
+        worker_id=as_worker_id(f"worker{index}"),
+        hostname=as_hostname(f"worker{index}.local"),
+        physical_os=PhysicalOS.LINUX,
+        runtime_os=RuntimeOS.LINUX,
+        machine_id=as_machine_id(f"host{index}"),
+        conda_environment="shardgrid-test",
+        python_executable="python",
+        gpu_name="cpu-fixture-gpu",
+        gpu_total_memory=4096,
+        gpu_free_memory=4096,
+        gpu_utilization=0.0,
+        cuda_version="12.1",
+        torch_version="2.5",
+        nccl_available=True,
+        gloo_available=True,
+        health=Health.HEALTHY,
+        last_probe_at="2026-09-07T00:00:00+00:00",
     )
 
 

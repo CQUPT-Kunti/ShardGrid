@@ -32,12 +32,19 @@ from shardgrid.common.config import (
 )
 from shardgrid.common.enums import BackendStatus, FailureStage, Health, JobState, PhysicalOS
 from shardgrid.common.errors import make_failure_record
-from shardgrid.common.models import BackendName, JobId, WorkerId, as_job_id
+from shardgrid.common.models import BackendName, JobId, WorkerId, as_engine_name, as_job_id
 from shardgrid.control.resource_manager import ClusterState, ResourceManager
 from shardgrid.control.status_store import StatusStore
 from shardgrid.distributed.backend import select_backend
 from shardgrid.engines.base import registered_engine_registry
-from shardgrid.engines.models import ParallelPlan
+from shardgrid.engines.models import (
+    ParallelPlan,
+    ParallelPlanAttempt,
+    ParallelPlanCommunicationEdge,
+    ParallelPlanPlacement,
+    ParallelPlanProvenance,
+    ParallelPlanStage,
+)
 from shardgrid.engines.selected import SelectedEngine, select_with_fallback
 from shardgrid.jobs.models import FailureRecord, JobSnapshot, JobStatus, TrainingJob
 from shardgrid.launchers.base import (
@@ -2824,10 +2831,16 @@ class JobManager:
                 and item.partition_candidate.candidate_id
                 != selected_joint.partition_candidate.candidate_id
             )
-            plans = tuple(
-                build_automatic_parallel_plan(profile, candidate)
-                for candidate in ordered_joints
-            )
+            if captured_workload is None:
+                plans = tuple(
+                    build_automatic_parallel_plan(profile, candidate)
+                    for candidate in ordered_joints
+                )
+            else:
+                plans = tuple(
+                    self._build_captured_parallel_plan(profile, candidate)
+                    for candidate in ordered_joints
+                )
             if self._generic_dag_runtime_requested(training_config):
                 for plan in plans:
                     plan.requirements["generic_dag_runtime"] = "true"
@@ -2864,6 +2877,108 @@ class JobManager:
             sample_kwargs=dict(sample_kwargs),
             model_name=training_config.model.name,
             source="legacy_config_model_type",
+        )
+
+    def _build_captured_parallel_plan(
+        self,
+        profile: object,
+        selected_plan: object,
+    ) -> ParallelPlan:
+        if selected_plan.status is not FeasibilityStatus.FEASIBLE:
+            raise ValueError("captured planner requires a feasible placement plan")
+        candidate = selected_plan.partition_candidate
+        if candidate is None:
+            raise ValueError("captured planner requires partition candidate metadata")
+        placements = {
+            placement.stage_id: placement for placement in selected_plan.stage_placements
+        }
+        stages = [
+            ParallelPlanStage(
+                stage_id=stage.stage_id,
+                rank=placements[stage.stage_id].rank,
+                module_ids=stage.module_ids,
+                module_paths=stage.module_paths,
+                start_index=stage.start_index,
+                stop_index=stage.stop_index,
+                boundary_before_id=stage.boundary_before_id,
+                boundary_after_id=stage.boundary_after_id,
+                parameter_names_or_ranges=stage.parameter_names_or_ranges,
+                parameter_bytes=stage.parameter_bytes,
+                gradient_bytes=stage.gradient_bytes,
+                activation_bytes=stage.activation_bytes,
+                estimated_compute_units=stage.estimated_compute_units,
+                estimated_peak_training_memory=stage.estimated_peak_training_memory,
+                required_runtime=stage.required_runtime,
+                required_backends=stage.required_backends,
+                placement=ParallelPlanPlacement(
+                    worker_id=placements[stage.stage_id].worker_id,
+                    rank=placements[stage.stage_id].rank,
+                    machine_id=placements[stage.stage_id].machine_id,
+                    gpu_index=0,
+                    usable_memory_before_bytes=placements[
+                        stage.stage_id
+                    ].usable_memory_before_bytes,
+                    remaining_memory_bytes=placements[stage.stage_id].remaining_memory_bytes,
+                    utilization_ratio=placements[stage.stage_id].utilization_ratio,
+                ),
+            )
+            for stage in candidate.stages
+        ]
+        return ParallelPlan(
+            parallel_plan_id=f"{profile.profile_id}:{candidate.candidate_id}",
+            engine=as_engine_name(profile.engine_id),
+            engine_plan_path=candidate.original_engine_plan_ref,
+            model_name=profile.model_name,
+            world_size=len(stages),
+            stages=[stage.stage_id for stage in stages],
+            partition_source="automatic",
+            model_profile_id=profile.profile_id,
+            selected_candidate_id=candidate.candidate_id,
+            stage_metadata=stages,
+            communication_edges=[
+                ParallelPlanCommunicationEdge(
+                    source_stage_id=edge.source_stage_id,
+                    target_stage_id=edge.target_stage_id,
+                    source_module_id=edge.source_module_id,
+                    target_module_id=edge.target_module_id,
+                    activation=edge.activation,
+                    gradient=edge.gradient,
+                    estimated_bytes_per_step=edge.estimated_bytes_per_step,
+                    estimate_kind=edge.estimate_kind,
+                )
+                for edge in candidate.communication_edges
+            ],
+            planning_provenance=ParallelPlanProvenance(
+                partition_source="automatic",
+                model_profile_id=profile.profile_id,
+                selected_candidate_id=candidate.candidate_id,
+                selected_worker_count=selected_plan.selected_worker_count,
+                attempted_worker_counts=selected_plan.attempted_worker_counts,
+                attempts=tuple(
+                    ParallelPlanAttempt(
+                        worker_count=attempt.worker_count,
+                        worker_ids=attempt.worker_ids,
+                        candidate_id=attempt.candidate_id,
+                        status=attempt.status.value,
+                        reasons=attempt.reasons,
+                    )
+                    for attempt in selected_plan.attempts
+                ),
+                partition_algorithm="execution_graph_partition",
+                total_cross_worker_communication_bytes=candidate.estimated_bytes_per_step,
+                selected_reason=selected_plan.selected_reason,
+                fallback_reason=selected_plan.fallback_reason,
+                rejection_reasons=selected_plan.reasons,
+            ),
+            requirements={
+                "plan_mode": "automatic",
+                "partition_source": "automatic",
+                "workload_source": "captured_context",
+                "required_runtime": profile.required_runtime or "",
+                "required_backends": ",".join(profile.required_backends),
+                "selected_worker_count": str(selected_plan.selected_worker_count),
+            },
+            limitations=[],
         )
 
     def _automatic_worker_count_bounds(

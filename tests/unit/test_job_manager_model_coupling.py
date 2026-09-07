@@ -48,8 +48,18 @@ def test_automatic_plan_builder_has_generic_captured_workload_entrypoint() -> No
 
     assert "captured_workload: PlannerWorkload | None = None" in source
     assert "_automatic_planner_workload" in source
+    assert "_build_captured_parallel_plan" in source
     assert "planner_workload_source" in source
     assert "model_name=workload.model_name" in source
+
+
+def test_captured_parallel_plan_builder_has_no_zoo_workload_dependency() -> None:
+    source = inspect.getsource(JobManager._build_captured_parallel_plan)
+
+    assert "training_config.model.type" not in source
+    assert "build_zoo_model" not in source
+    assert "make_zoo_sample" not in source
+    assert "zoo_model" not in source
 
 
 def test_launch_command_currently_dispatches_to_example_model_runtimes() -> None:
