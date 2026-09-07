@@ -773,10 +773,11 @@ def graph_fingerprint(graph: CanonicalGraphIR) -> str:
         "schema_version": graph.schema_version,
         "nodes": [
             {
+                "node_id": node.node_id,
                 "op_kind": node.op_kind,
                 "canonical_target": node.canonical_target,
-                "input_count": len(node.input_value_ids),
-                "output_count": len(node.output_value_ids),
+                "input_value_ids": list(node.input_value_ids),
+                "output_value_ids": list(node.output_value_ids),
                 "parameter_ids": list(node.parameter_ids),
                 "buffer_ids": list(node.buffer_ids),
             }
@@ -784,12 +785,17 @@ def graph_fingerprint(graph: CanonicalGraphIR) -> str:
         ],
         "values": [
             {
+                "value_id": value.value_id,
+                "producer_node_id": value.producer_node_id,
+                "consumer_node_ids": list(value.consumer_node_ids),
                 "shape": list(value.shape),
                 "dtype": value.dtype,
                 "requires_grad": value.requires_grad,
             }
             for value in graph.values
         ],
+        "input_value_ids": list(graph.input_value_ids),
+        "output_value_ids": list(graph.output_value_ids),
         "edges": [
             {
                 "source_node_id": edge.source_node_id,

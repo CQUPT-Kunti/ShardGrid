@@ -19,6 +19,7 @@ from examples.models import generic_partition_zoo  # noqa: E402
 from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_sample  # noqa: E402
 
 from shardgrid.planner.generic_graph import (  # noqa: E402
+    CanonicalGraphIR,
     capture_generic_graph,
     infer_boundary_values,
     module_dependencies_from_graph,
@@ -82,6 +83,16 @@ class BufferStateModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.bn(x))
+
+
+class ReverseRegisteredChain(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.second = nn.Linear(4, 4)
+        self.first = nn.Linear(4, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.second(torch.relu(self.first(x)))
 
 ZOO_MODELS = (
     "mini_resnet",
@@ -363,3 +374,58 @@ def test_state_owner_and_use_records_follow_graph_nodes_not_registration_order()
     assert states["right.weight"].use_node_ids == (right_node.node_id,)
     assert states["gate.weight"].use_node_ids == (gate_node.node_id,)
     assert int(gate_node.node_id[1:]) < int(right_node.node_id[1:])
+
+
+def test_execution_node_and_value_ids_are_unique_and_addressable() -> None:
+    _case, graph = _capture_ordinary_case("dense")
+    nodes_by_id = {node.node_id: node for node in graph.nodes}
+    values_by_id = {value.value_id: value for value in graph.values}
+
+    assert isinstance(graph, CanonicalGraphIR)
+    assert len(nodes_by_id) == len(graph.nodes)
+    assert len(values_by_id) == len(graph.values)
+    assert set(graph.input_value_ids) <= set(values_by_id)
+    assert set(graph.output_value_ids) <= set(values_by_id)
+    assert all(edge.source_node_id in nodes_by_id for edge in graph.edges)
+    assert all(edge.target_node_id in nodes_by_id for edge in graph.edges)
+    assert all(edge.value_id in values_by_id for edge in graph.edges)
+
+
+def test_multi_consumer_values_preserve_all_consumers() -> None:
+    _case, graph = _capture_ordinary_case("dense")
+    value = next(value for value in graph.values if len(set(value.consumer_node_ids)) >= 3)
+    edge_consumers = {
+        edge.target_node_id for edge in graph.edges if edge.value_id == value.value_id
+    }
+
+    assert value.producer_node_id is not None
+    assert set(value.consumer_node_ids) == edge_consumers
+    assert len(edge_consumers) >= 3
+
+
+def test_functional_ops_receive_execution_node_ids_and_values() -> None:
+    _case, graph = _capture_ordinary_case("unet_like")
+    cat_node = next(
+        node
+        for node in graph.nodes
+        if node.op_kind == "call_function" and "cat" in node.target
+    )
+
+    assert cat_node.module_path is None
+    assert cat_node.node_id.startswith("n")
+    assert cat_node.input_value_ids
+    assert cat_node.output_value_ids
+    assert graph.to_dict()["nodes"][int(cat_node.node_id[1:])]["node_id"] == cat_node.node_id
+
+
+def test_execution_dependencies_ignore_module_registration_order() -> None:
+    model = ReverseRegisteredChain().eval()
+    graph = capture_generic_graph(model, sample_args=(torch.randn(2, 4),))
+    registered = _registered_module_order(model)
+    executed = _executed_module_order(graph)
+    dependencies, ordered = module_dependencies_from_graph(graph)
+
+    assert registered == ["second", "first"]
+    assert executed[:2] == ["first", "second"]
+    assert ordered[:2] == ("first", "second")
+    assert ("first", "second") in dependencies
