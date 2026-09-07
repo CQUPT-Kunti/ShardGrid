@@ -265,6 +265,17 @@ def main() -> int:
             samples=args.steady_samples,
             interval=args.sample_interval,
         )
+        steady_progress = steady_state_progress_check(
+            report["steady_state_samples"],
+            active_jobs,
+        )
+        if steady_progress:
+            report["saturation"] = {
+                "stress_safety_failure": True,
+                "reason": "STEADY_STATE_NO_PROGRESS_OR_REGRESSION",
+                "steady_state_progress": steady_progress,
+            }
+            return exit_code
         report["gpu_sharing_matrix"] = sharing_matrix(jobs_root, cluster_path, active_jobs)
         report["model_instance_counts"] = dict(Counter(job["model"] for job in active_jobs))
         report["observed_stable_max_concurrent_models"] = len(active_jobs)
@@ -956,12 +967,26 @@ def active_job_step_counts(
     }
 
 
+def classify_step_progress(before: int, after: int) -> str:
+    """Classify optimizer-step progress between two observations.
+
+    after > before  -> progress
+    after == before -> no progress / stall
+    after < before  -> regression / failure
+    """
+    if after > before:
+        return "progress"
+    if after == before:
+        return "no_progress"
+    return "regression"
+
+
 def probe_isolation_check(
     jobs: list[dict[str, Any]],
     before: dict[str, int],
     after: dict[str, int],
 ) -> dict[str, Any] | None:
-    stalled = [
+    no_progress = [
         {
             "job_id": str(job["job_id"]),
             "instance": job.get("instance"),
@@ -969,12 +994,83 @@ def probe_isolation_check(
             "after_steps": after.get(str(job["job_id"]), 0),
         }
         for job in jobs
-        if after.get(str(job["job_id"]), 0) < before.get(str(job["job_id"]), 0)
+        if classify_step_progress(
+            int(before.get(str(job["job_id"]), 0)),
+            int(after.get(str(job["job_id"]), 0)),
+        )
+        == "no_progress"
     ]
+    regression = [
+        {
+            "job_id": str(job["job_id"]),
+            "instance": job.get("instance"),
+            "before_steps": before.get(str(job["job_id"]), 0),
+            "after_steps": after.get(str(job["job_id"]), 0),
+        }
+        for job in jobs
+        if classify_step_progress(
+            int(before.get(str(job["job_id"]), 0)),
+            int(after.get(str(job["job_id"]), 0)),
+        )
+        == "regression"
+    ]
+    if no_progress:
+        return {
+            "reason": "existing active job optimizer steps stalled (no progress) during probe/launch",
+            "no_progress": no_progress,
+            "stalled": no_progress,
+        }
+    if regression:
+        return {
+            "reason": "existing active job optimizer steps regressed during probe/launch",
+            "regression": regression,
+        }
+    return None
+
+
+def steady_state_progress_check(
+    samples: list[dict[str, Any]],
+    jobs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Compare optimizer steps across steady-state samples.
+
+    A job whose optimizer step count does not increase between consecutive
+    samples is stalled; equal step counts must never be treated as healthy.
+    """
+    stalled: list[dict[str, Any]] = []
+    for job in jobs:
+        job_id = str(job["job_id"])
+        steps = [
+            int((sample.get("jobs") or {}).get(job_id, {}).get("min_steps") or 0)
+            for sample in samples
+        ]
+        if len(steps) < 2:
+            continue
+        if all(step == steps[0] for step in steps):
+            stalled.append(
+                {
+                    "job_id": job_id,
+                    "instance": job.get("instance"),
+                    "sample_steps": steps,
+                    "progress": "no_progress",
+                }
+            )
+        elif any(
+            step < steps[index]
+            for index, step in enumerate(steps[1:], start=0)
+        ):
+            stalled.append(
+                {
+                    "job_id": job_id,
+                    "instance": job.get("instance"),
+                    "sample_steps": steps,
+                    "progress": "regression",
+                }
+            )
     if not stalled:
         return None
     return {
-        "reason": "existing active job optimizer steps stalled during probe/launch",
+        "reason": "steady-state optimizer step evidence shows stall or regression",
         "stalled": stalled,
     }
 

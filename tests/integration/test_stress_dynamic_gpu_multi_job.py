@@ -288,3 +288,86 @@ def test_stress_runner_preserves_evidence_references(stress_module) -> None:
     assert classification["producer"] == "ssh_launcher"
     assert classification["log_refs"] == ["logs/train.rank1.stdout"]
     assert classification["artifact_refs"] == ["checkpoint/model-state.pt"]
+
+
+def test_equal_step_count_is_stall_not_progress(stress_module) -> None:
+    assert stress_module.classify_step_progress(10, 10) == "no_progress"
+    assert stress_module.classify_step_progress(10, 11) == "progress"
+    assert stress_module.classify_step_progress(11, 10) == "regression"
+
+
+def test_probe_isolation_check_flags_equal_steps_as_stall(stress_module) -> None:
+    jobs = [
+        {"job_id": "job-a", "instance": "MiniUNet-1"},
+        {"job_id": "job-b", "instance": "MiniDenseNet-1"},
+    ]
+    before = {"job-a": 10, "job-b": 10}
+    after = {"job-a": 10, "job-b": 12}
+
+    result = stress_module.probe_isolation_check(jobs, before, after)
+
+    assert result is not None
+    assert result["reason"].startswith("existing active job optimizer steps stalled")
+    assert [item["job_id"] for item in result["no_progress"]] == ["job-a"]
+    assert result["no_progress"][0]["before_steps"] == 10
+    assert result["no_progress"][0]["after_steps"] == 10
+
+
+def test_probe_isolation_check_flags_step_regression(stress_module) -> None:
+    jobs = [{"job_id": "job-a", "instance": "MiniUNet-1"}]
+    before = {"job-a": 10}
+    after = {"job-a": 7}
+
+    result = stress_module.probe_isolation_check(jobs, before, after)
+
+    assert result is not None
+    assert result["reason"].startswith("existing active job optimizer steps regressed")
+    assert [item["job_id"] for item in result["regression"]] == ["job-a"]
+
+
+def test_probe_isolation_check_passes_on_real_progress(stress_module) -> None:
+    jobs = [{"job_id": "job-a", "instance": "MiniUNet-1"}]
+    before = {"job-a": 10}
+    after = {"job-a": 12}
+
+    assert stress_module.probe_isolation_check(jobs, before, after) is None
+
+
+def test_steady_state_equal_steps_across_samples_is_stall(stress_module) -> None:
+    jobs = [{"job_id": "job-a", "instance": "MiniUNet-1"}]
+    samples = [
+        {"jobs": {"job-a": {"min_steps": 10}}},
+        {"jobs": {"job-a": {"min_steps": 10}}},
+        {"jobs": {"job-a": {"min_steps": 10}}},
+    ]
+
+    result = stress_module.steady_state_progress_check(samples, jobs)
+
+    assert result is not None
+    assert result["stalled"][0]["progress"] == "no_progress"
+    assert result["stalled"][0]["sample_steps"] == [10, 10, 10]
+
+
+def test_steady_state_step_regression_is_detected(stress_module) -> None:
+    jobs = [{"job_id": "job-a", "instance": "MiniUNet-1"}]
+    samples = [
+        {"jobs": {"job-a": {"min_steps": 10}}},
+        {"jobs": {"job-a": {"min_steps": 8}}},
+    ]
+
+    result = stress_module.steady_state_progress_check(samples, jobs)
+
+    assert result is not None
+    assert result["stalled"][0]["progress"] == "regression"
+    assert result["stalled"][0]["sample_steps"] == [10, 8]
+
+
+def test_steady_state_increasing_steps_is_not_stalled(stress_module) -> None:
+    jobs = [{"job_id": "job-a", "instance": "MiniUNet-1"}]
+    samples = [
+        {"jobs": {"job-a": {"min_steps": 10}}},
+        {"jobs": {"job-a": {"min_steps": 14}}},
+        {"jobs": {"job-a": {"min_steps": 19}}},
+    ]
+
+    assert stress_module.steady_state_progress_check(samples, jobs) is None
