@@ -29,7 +29,7 @@ from shardgrid.artifacts.transport import (
     select_artifact_transport,
 )
 from shardgrid.common.config import ClusterConfig, WorkerConfig
-from shardgrid.common.enums import BackendStatus, FailureStage, JobState
+from shardgrid.common.enums import BackendStatus, FailureCode, FailureStage, JobState
 from shardgrid.common.errors import make_failure_record
 from shardgrid.common.process import ProcessResult, redact_text
 from shardgrid.control.status_store import StatusStore
@@ -123,6 +123,19 @@ def _serialize(value: Any) -> Any:
 
 def _now() -> str:
     return datetime.now(tz=UTC).isoformat()
+
+
+def _log_has_formal_oom(text: str | None) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "cuda out of memory",
+            "cuda error: out of memory",
+            "cuda oom",
+            "out of memory",
+        )
+    )
 
 
 def _clip_marker_payload(text: str, *, limit: int = 160) -> tuple[str, str]:
@@ -492,6 +505,9 @@ class SSHLauncher(Launcher):
                     command=assignment.launch_command,
                     message=f"runtime wrapper failure during launch: {exc}",
                     recommended_action=("repair the SSH -> WSL runtime chain and retry launch"),
+                    code=FailureCode.INFRA_FAILURE,
+                    rank=assignment.rank,
+                    gpu_id=str(worker.labels.get("gpu") or worker.worker_id),
                 )
                 results.append(
                     WorkerResult(
@@ -511,6 +527,10 @@ class SSHLauncher(Launcher):
                     recommended_action=(
                         "inspect SSH stderr and the WSL runtime logs, then retry launch"
                     ),
+                    code=FailureCode.PROCESS_LAUNCH_FAILURE,
+                    rank=assignment.rank,
+                    gpu_id=str(worker.labels.get("gpu") or worker.worker_id),
+                    log_refs=(self._launch_log_path(context, worker, assignment, remote_root),),
                 )
                 results.append(
                     WorkerResult(
@@ -654,6 +674,10 @@ class SSHLauncher(Launcher):
                     command=f"monitor rank={assignment.rank} pid={record.pid}",
                     message=f"monitor lost connection to remote runtime: {exc}",
                     recommended_action="restore SSH/WSL runtime access, then retry monitor",
+                    code=FailureCode.NETWORK_FAILURE,
+                    rank=assignment.rank,
+                    gpu_id=str(worker.labels.get("gpu") or worker.worker_id),
+                    log_refs=(str(record.log_path),),
                 )
                 payload = {
                     "observed_at": observed_at,
@@ -1526,6 +1550,11 @@ class SSHLauncher(Launcher):
         result: ProcessResult,
         message: str,
         recommended_action: str,
+        code: FailureCode | None = None,
+        rank: int | None = None,
+        gpu_id: str | None = None,
+        log_refs: Sequence[str] = (),
+        artifact_refs: Sequence[str] = (),
     ) -> FailureRecord:
         return make_failure_record(
             stage=stage,
@@ -1542,6 +1571,12 @@ class SSHLauncher(Launcher):
             retryable=not self._is_auth_problem(result.stderr),
             manual_action_required=self._is_auth_problem(result.stderr),
             secrets=self._secrets,
+            code=code,
+            producer="ssh_launcher",
+            rank=rank,
+            gpu_id=gpu_id,
+            log_refs=log_refs,
+            artifact_refs=artifact_refs,
         )
 
     def _launcher_failure(
@@ -1554,6 +1589,11 @@ class SSHLauncher(Launcher):
         worker_id: str | None = None,
         command: str | None = None,
         exit_code: int | None = None,
+        code: FailureCode | None = None,
+        rank: int | None = None,
+        gpu_id: str | None = None,
+        log_refs: Sequence[str] = (),
+        artifact_refs: Sequence[str] = (),
     ) -> FailureRecord:
         return make_failure_record(
             stage=stage,
@@ -1567,6 +1607,12 @@ class SSHLauncher(Launcher):
             message=message,
             recommended_action=recommended_action,
             secrets=self._secrets,
+            code=code,
+            producer="ssh_launcher",
+            rank=rank,
+            gpu_id=gpu_id,
+            log_refs=log_refs,
+            artifact_refs=artifact_refs,
         )
 
     def _transport_failure(
@@ -1588,6 +1634,8 @@ class SSHLauncher(Launcher):
             retryable=item.retryable,
             manual_action_required=self._is_auth_problem(item.stderr),
             secrets=self._secrets,
+            code=FailureCode.NETWORK_FAILURE,
+            producer="ssh_launcher",
         )
 
     def _distribute_worker(
@@ -3103,6 +3151,12 @@ class SSHLauncher(Launcher):
         timeout_stage = payload.get("timeout_stage")
         if timeout_stage is not None:
             stage = FailureStage(timeout_stage)
+            if stage is FailureStage.RENDEZVOUS:
+                code = FailureCode.RENDEZVOUS_FAILURE
+            elif stage is FailureStage.LAUNCH:
+                code = FailureCode.PROCESS_LAUNCH_FAILURE
+            else:
+                code = FailureCode.RUNTIME_FAILURE
             return make_failure_record(
                 stage=stage,
                 host=str(worker.host),
@@ -3122,12 +3176,51 @@ class SSHLauncher(Launcher):
                 },
                 stdout_path=record.log_path,
                 secrets=self._secrets,
+                code=code,
+                producer="ssh_launcher",
+                rank=assignment.rank,
+                gpu_id=str(worker.labels.get("gpu") or worker.worker_id),
+                log_refs=(str(record.log_path),),
             )
         if payload.get("process_state") == "unknown":
             return None
         if payload.get("running"):
             return None
         stage = self._rank_failure_stage(payload)
+        if stage is FailureStage.TRAIN and _log_has_formal_oom(
+            str(payload.get("log_tail") or "")
+        ):
+            return make_failure_record(
+                stage=stage,
+                host=str(worker.host),
+                worker_id=str(worker.worker_id),
+                command=f"monitor rank={assignment.rank} pid={record.pid}",
+                python_executable=self._python_executable(worker),
+                conda_environment=worker.conda_environment,
+                conda_prefix=worker.conda_prefix,
+                message=(
+                    f"rank {assignment.rank} exited from a formal training OOM; "
+                    "this is a runtime safety failure, not a memory probe candidate reject"
+                ),
+                recommended_action=(
+                    "reduce the batch size or model footprint and rerun with fresh "
+                    "memory probing; do not interpret this as probe admission feedback"
+                ),
+                runtime_environment={
+                    "rank": str(assignment.rank),
+                    "stage": assignment.stage or "",
+                    "pid": str(record.pid),
+                    "last_progress": str(payload["last_progress"]),
+                },
+                stdout_path=record.log_path,
+                secrets=self._secrets,
+                code=FailureCode.FORMAL_TRAINING_OOM,
+                producer="ssh_launcher",
+                rank=assignment.rank,
+                gpu_id=str(worker.labels.get("gpu") or worker.worker_id),
+                log_refs=(str(record.log_path),),
+            )
+        code = self._rank_failure_code(stage)
         return make_failure_record(
             stage=stage,
             host=str(worker.host),
@@ -3149,7 +3242,19 @@ class SSHLauncher(Launcher):
             },
             stdout_path=record.log_path,
             secrets=self._secrets,
+            code=code,
+            producer="ssh_launcher",
+            rank=assignment.rank,
+            gpu_id=str(worker.labels.get("gpu") or worker.worker_id),
+            log_refs=(str(record.log_path),),
         )
+
+    def _rank_failure_code(self, stage: FailureStage) -> FailureCode:
+        if stage is FailureStage.RENDEZVOUS:
+            return FailureCode.RENDEZVOUS_FAILURE
+        if stage is FailureStage.LAUNCH:
+            return FailureCode.PROCESS_LAUNCH_FAILURE
+        return FailureCode.RUNTIME_FAILURE
 
     def _rank_failure_stage(self, payload: dict[str, Any]) -> FailureStage:
         if payload.get("training_started"):

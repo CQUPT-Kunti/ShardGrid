@@ -760,6 +760,189 @@ def test_artifact_transport_failure_is_structured() -> None:
     assert "secret-token" not in result.failure.message
 
 
+def test_ssh_launch_failure_records_carry_structured_codes_and_context() -> None:
+    from shardgrid.common.enums import FailureCode
+
+    launcher = SSHLauncher(
+        replace(_cluster_config(), workers=_cluster_config().workers[:1]),
+        artifact_transport=FakeArtifactTransport(_success_transfer()),
+        runtime_factory=lambda worker: FakeRuntime(
+            script_results=[_ok_result("launch", stderr="boom", exit_code=1)]
+        ),
+        secrets=("publickey",),
+    )
+    context = _single_worker_context("gpu4060")
+    pass_distribution = {
+        (str(context.job.job_id), "gpu4060"): _distribution_result("gpu4060")
+    }
+    launcher._distribution_records = dict(pass_distribution)
+
+    result = launcher.launch(context)
+
+    assert result.failure is not None
+    assert result.failure.code is FailureCode.PROCESS_LAUNCH_FAILURE
+    assert result.failure.producer == "ssh_launcher"
+    assert result.failure.rank is not None
+    assert result.failure.gpu_id is not None
+    assert result.failure.log_refs
+    assert result.failure.stage is FailureStage.LAUNCH
+
+
+def test_ssh_runtime_wrapper_failure_is_infra_not_memory() -> None:
+    from shardgrid.common.enums import FailureCode
+
+    launcher = SSHLauncher(
+        replace(_cluster_config(), workers=_cluster_config().workers[:1]),
+        artifact_transport=FakeArtifactTransport(_success_transfer()),
+        runtime_factory=lambda worker: FakeRuntime(
+            script_error=ValueError("missing distro")
+        ),
+        secrets=("publickey",),
+    )
+    context = _single_worker_context("gpu4060")
+    pass_distribution = {
+        (str(context.job.job_id), "gpu4060"): _distribution_result("gpu4060")
+    }
+    launcher._distribution_records = dict(pass_distribution)
+
+    result = launcher.launch(context)
+
+    assert result.failure is not None
+    assert result.failure.code is FailureCode.INFRA_FAILURE
+    assert result.failure.code is not FailureCode.MEMORY_REJECT
+    assert result.failure.producer == "ssh_launcher"
+
+
+def test_ssh_transport_failure_is_network_failure_not_memory() -> None:
+    from shardgrid.common.enums import FailureCode
+
+    transport = FakeArtifactTransport(
+        ArtifactTransferResult(
+            transport="scp",
+            status=ArtifactTransferStatus.FAILED,
+            items=[
+                ArtifactTransferItemResult(
+                    label="snapshot",
+                    transport="scp",
+                    status=ArtifactTransferStatus.FAILED,
+                    source="jobs/job-0093",
+                    destination=".shardgrid/launchers/job-0093",
+                    recorded_command="scp jobs/job-0093",
+                    exit_code=255,
+                    stderr="Connection refused",
+                    retryable=True,
+                )
+            ],
+        )
+    )
+    launcher = SSHLauncher(
+        replace(_cluster_config(), workers=_cluster_config().workers[:1]),
+        artifact_transport=transport,
+        runtime_factory=lambda worker: FakeRuntime(),
+        secrets=(),
+    )
+    worker = _cluster_config().workers[0]
+    item = transport.result.items[0]
+
+    failure = launcher._transport_failure(worker, item)
+
+    assert failure.code is FailureCode.NETWORK_FAILURE
+    assert failure.code is not FailureCode.MEMORY_REJECT
+    assert failure.producer == "ssh_launcher"
+    assert failure.stage is FailureStage.DISTRIBUTE
+    assert failure.worker_id == as_worker_id("gpu4060")
+
+
+def test_rank_failure_formal_oom_is_not_memory_reject() -> None:
+    from shardgrid.common.enums import FailureCode
+
+    launcher = SSHLauncher(
+        replace(_cluster_config(), workers=_cluster_config().workers[:1]),
+        artifact_transport=FakeArtifactTransport(_success_transfer()),
+        runtime_factory=lambda worker: FakeRuntime(),
+    )
+    context = _single_worker_context("gpu4060")
+    assignment = context.execution_plan.workers[0]
+    record = type(
+        "Record",
+        (),
+        {"pid": 4100, "log_path": "logs/train.rank0.log", "launched_at": "2026-08-27T11:00:00+00:00"},
+    )()
+    payload = {
+        "terminal_success": False,
+        "timeout_stage": None,
+        "process_state": "exited",
+        "running": False,
+        "training_started": True,
+        "rendezvous_ready": True,
+        "last_progress": "T074_TRAIN_EVIDENCE",
+        "log_tail": (
+            "forward step 3\n"
+            "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+        ),
+    }
+
+    failure = launcher._rank_failure(
+        context,
+        _cluster_config().workers[0],
+        assignment,
+        record,
+        payload,
+    )
+
+    assert failure is not None
+    assert failure.code is FailureCode.FORMAL_TRAINING_OOM
+    assert failure.code is not FailureCode.MEMORY_REJECT
+    assert failure.stage is FailureStage.TRAIN
+    assert failure.retryable is False
+    assert failure.producer == "ssh_launcher"
+    assert failure.rank == 0
+    assert failure.gpu_id is not None
+    assert failure.log_refs == ("logs/train.rank0.log",)
+
+
+def test_rank_failure_rendezvous_timeout_is_not_memory_reject() -> None:
+    from shardgrid.common.enums import FailureCode
+
+    launcher = SSHLauncher(
+        replace(_cluster_config(), workers=_cluster_config().workers[:1]),
+        artifact_transport=FakeArtifactTransport(_success_transfer()),
+        runtime_factory=lambda worker: FakeRuntime(),
+    )
+    context = _single_worker_context("gpu4060")
+    assignment = context.execution_plan.workers[0]
+    record = type(
+        "Record",
+        (),
+        {"pid": 4100, "log_path": "logs/train.rank0.log", "launched_at": "2026-08-27T11:00:00+00:00"},
+    )()
+    payload = {
+        "terminal_success": False,
+        "timeout_stage": "RENDEZVOUS",
+        "process_state": "alive",
+        "running": True,
+        "training_started": False,
+        "rendezvous_ready": False,
+        "last_progress": "STAGE_PLACEMENT_EVIDENCE",
+        "log_tail": "waiting for master",
+    }
+
+    failure = launcher._rank_failure(
+        context,
+        _cluster_config().workers[0],
+        assignment,
+        record,
+        payload,
+    )
+
+    assert failure is not None
+    assert failure.code is FailureCode.RENDEZVOUS_FAILURE
+    assert failure.code is not FailureCode.MEMORY_REJECT
+    assert failure.stage is FailureStage.RENDEZVOUS
+    assert failure.producer == "ssh_launcher"
+    assert failure.rank == 0
+
+
 def test_malformed_pid_does_not_create_process_record() -> None:
     launcher = SSHLauncher(
         replace(_cluster_config(), workers=_cluster_config().workers[:1]),

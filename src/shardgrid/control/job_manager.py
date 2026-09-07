@@ -45,7 +45,14 @@ from shardgrid.common.config import (
     WorkerConfig,
     load_training_config,
 )
-from shardgrid.common.enums import BackendStatus, FailureStage, Health, JobState, PhysicalOS
+from shardgrid.common.enums import (
+    BackendStatus,
+    FailureCode,
+    FailureStage,
+    Health,
+    JobState,
+    PhysicalOS,
+)
 from shardgrid.common.errors import make_failure_record
 from shardgrid.common.models import (
     BackendName,
@@ -316,6 +323,17 @@ class MemoryProbeResult:
         }
 
 
+def _probe_infra_failure_code(exc: MemoryProbeInfraFailure) -> FailureCode:
+    subtype = str(exc.result.subtype or "").upper()
+    if subtype in {"RENDEZVOUS_TIMEOUT", "DISTRIBUTE_RENDEZVOUS"}:
+        return FailureCode.RENDEZVOUS_FAILURE
+    if subtype in {"SSH_FAILURE", "CONNECTION_FAILURE", "TRANSPORT_FAILURE"}:
+        return FailureCode.NETWORK_FAILURE
+    if subtype in {"LAUNCH_FAILURE", "DISTRIBUTE_FAILURE", "PROCESS_LAUNCH_FAILURE"}:
+        return FailureCode.PROCESS_LAUNCH_FAILURE
+    return FailureCode.INFRA_FAILURE
+
+
 class MemoryProbeSelectionError(ValueError):
     def __init__(self, result: MemoryProbeResult) -> None:
         super().__init__(result.message)
@@ -565,6 +583,9 @@ class JobManager:
                                 exc.result.to_dict(), sort_keys=True
                             ),
                         },
+                        code=FailureCode.MEMORY_REJECT,
+                        producer="job_manager",
+                        retryable=True,
                         secrets=self._secrets,
                     )
                     current = self._failed_status(current, phase="plan", failure=failure)
@@ -589,6 +610,9 @@ class JobManager:
                                     exc.result.to_dict(), sort_keys=True
                                 ),
                             },
+                            code=FailureCode.RESOURCE_CHANGED,
+                            producer="job_manager",
+                            retryable=True,
                             secrets=self._secrets,
                         )
                         current = self._failed_status(
@@ -612,6 +636,9 @@ class JobManager:
                                 "replanning after probe resource revalidation"
                             ),
                             recommended_action="add or repair workers, then retry",
+                            code=FailureCode.RESOURCE_CHANGED,
+                            producer="job_manager",
+                            retryable=True,
                             secrets=self._secrets,
                         )
                         current = self._failed_status(
@@ -646,6 +673,8 @@ class JobManager:
                                 exc.result.to_dict(), sort_keys=True
                             ),
                         },
+                        code=_probe_infra_failure_code(exc),
+                        producer="job_manager",
                         retryable=True,
                         secrets=self._secrets,
                     )
@@ -673,6 +702,8 @@ class JobManager:
                                 exc.result.to_dict(), sort_keys=True
                             ),
                         },
+                        code=FailureCode.RUNTIME_FAILURE,
+                        producer="job_manager",
                         secrets=self._secrets,
                     )
                     current = self._failed_status(
