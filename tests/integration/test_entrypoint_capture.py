@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from shardgrid.artifacts.snapshot import write_capture_context
 from shardgrid.jobs.models import JobSnapshot
 
@@ -122,6 +124,43 @@ def test_capture_contract_records_optimizer_scheduler_and_state_key_mapping() ->
         "right.weight",
         "head.weight",
     }
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "T068 expected-red: current dry-run capture enters real nn.Module.__call__ "
+        "and runs autograd backward on CPU before planning; T070 must replace this "
+        "with bounded metadata capture."
+    ),
+)
+def test_dry_run_capture_does_not_enter_real_cpu_forward_or_backward(
+    tmp_path: Path,
+) -> None:
+    context = _capture_module().capture_entrypoint(
+        FIXTURE_ROOT / "capture_execution_sentinel_train.py",
+        cwd=FIXTURE_ROOT,
+        environment={"SHARDGRID_CAPTURE_SENTINEL_DIR": str(tmp_path)},
+        dry_run=True,
+    )
+
+    assert not getattr(context, "ok", True) is False
+    assert not (tmp_path / "forward_entered").exists()
+    assert not (tmp_path / "backward_grad_computed").exists()
+
+
+def test_dry_run_capture_suppresses_real_cpu_optimizer_step_mutation(
+    tmp_path: Path,
+) -> None:
+    context = _capture_module().capture_entrypoint(
+        FIXTURE_ROOT / "capture_execution_sentinel_train.py",
+        cwd=FIXTURE_ROOT,
+        environment={"SHARDGRID_CAPTURE_SENTINEL_DIR": str(tmp_path)},
+        dry_run=True,
+    )
+
+    assert not getattr(context, "ok", True) is False
+    assert (tmp_path / "optimizer_changed").read_text(encoding="utf-8") == "False"
 
 
 def test_capture_contract_returns_structured_unsupported_diagnostics(tmp_path: Path) -> None:

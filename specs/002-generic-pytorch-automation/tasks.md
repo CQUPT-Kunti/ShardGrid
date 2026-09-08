@@ -825,7 +825,7 @@ T001-T065 completed historical implementation
     - Result: `1 passed, 1 xfailed`
     - Expected xfail reason: current ordinary entrypoint capture executes user model construction and requests complete CPU Parameter storage before planning; T069 must remove this full-materialization prerequisite.
 
-- [ ] T068 [P] [US2] Add no-real-CPU-capture-execution tests in `tests/integration/test_entrypoint_capture.py`
+- [x] T068 [P] [US2] Add no-real-CPU-capture-execution tests in `tests/integration/test_entrypoint_capture.py`
   - Title: Prove capture does not train on CPU
   - Phase: New Phase 8
   - Priority: P0 BLOCKING
@@ -835,6 +835,17 @@ T001-T065 completed historical implementation
   - Implementation Notes: Use counters or deterministic side-effect evidence inside ordinary fixtures; fail closed for unsupported behavior.
   - Tests: `pytest tests/integration/test_entrypoint_capture.py`
   - Acceptance Criteria: `CPU_REAL_FORWARD_BEFORE_PLAN=0`, `CPU_REAL_BACKWARD_BEFORE_PLAN=0`, and `CPU_REAL_OPTIMIZER_STEP_BEFORE_PLAN=0` are enforceable.
+  - Gate Evidence:
+    - `TASK=T068`
+    - `NO_REAL_CPU_CAPTURE_EXECUTION_CONTRACT_CREATED=true`
+    - `CPU_REAL_FORWARD_BEFORE_PLAN=0`
+    - `CPU_REAL_BACKWARD_BEFORE_PLAN=0`
+    - `CPU_REAL_OPTIMIZER_STEP_BEFORE_PLAN=0`
+    - `T069_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_entrypoint_capture.py -q`
+    - Result: `12 passed, 1 xfailed`
+    - Expected xfail reason: current dry-run capture enters real `nn.Module.__call__` and runs autograd backward on CPU before planning; T070 must replace this with bounded metadata capture.
+    - Passing evidence: dry-run capture currently suppresses the real optimizer parameter update, so optimizer mutation remains zero while forward/backward violations are explicitly captured.
 
 - [ ] T069 [US1] Implement metadata-first model/state capture in `src/shardgrid/bootstrap/runner.py`
   - Title: Avoid full control-plane state materialization
