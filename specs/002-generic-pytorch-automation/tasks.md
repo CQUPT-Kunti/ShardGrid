@@ -913,7 +913,7 @@ T001-T065 completed historical implementation
     - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_large_model_capture_safety.py -q`
     - Result: `5 passed`
 
-- [ ] T072 [US1] Add unsupported-safe-failure capture tests in `tests/integration/test_large_model_capture_safety.py`
+- [x] T072 [US1] Add unsupported-safe-failure capture tests in `tests/integration/test_large_model_capture_safety.py`
   - Title: Fail closed on unsafe capture fallback
   - Phase: New Phase 8
   - Priority: P1
@@ -923,6 +923,16 @@ T001-T065 completed historical implementation
   - Implementation Notes: Cover dynamic control flow, custom op, optimizer mutation, and missing metadata examples where practical.
   - Tests: `pytest tests/integration/test_large_model_capture_safety.py`
   - Acceptance Criteria: Unsupported capture produces structured failures before mutation.
+  - Gate Evidence:
+    - `TASK=T072`
+    - `UNSUPPORTED_CAPTURE_FAILS_CLOSED=PASS`
+    - `FULL_MATERIALIZATION_FALLBACK=0`
+    - `REAL_CPU_EXECUTION_FALLBACK=0`
+    - `MUTATION_BEFORE_UNSUPPORTED_FAILURE=0`
+    - `STRUCTURED_CAPTURE_DIAGNOSTICS=PASS`
+    - `T073_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_large_model_capture_safety.py tests/integration/test_entrypoint_capture.py -q`
+    - Result: `22 passed`
 
 - [ ] T073 Run New Phase 8 capture/planning safety gate in `specs/002-generic-pytorch-automation/tasks.md`
   - Title: Gate large-model metadata-first planning

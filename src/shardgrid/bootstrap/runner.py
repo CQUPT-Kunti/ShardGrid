@@ -794,6 +794,14 @@ def _build_context(state: _CaptureState) -> CapturedTrainingContext:
 def _capture_declared_graph_or_fail(state: _CaptureState) -> None:
     if state.model is None:
         raise ValueError("cannot capture graph metadata without a model")
+    if not _tensor_metadata(state.args, state.kwargs):
+        state.failure = CaptureFailure(
+            stage="capture",
+            code="MISSING_REQUIRED_METADATA",
+            message="model call did not expose tensor input metadata required for planning",
+            artifact_log_ref="diagnostics/capture.json",
+        )
+        raise _CaptureFailed
     if _forward_contains_python_control_flow(state.model):
         state.failure = CaptureFailure(
             stage="graph_capture",
@@ -801,6 +809,17 @@ def _capture_declared_graph_or_fail(state: _CaptureState) -> None:
             message=(
                 "model forward contains Python control flow that cannot be proven "
                 "safe without real CPU execution"
+            ),
+            artifact_log_ref="diagnostics/capture.json",
+        )
+        raise _CaptureFailed
+    if _forward_contains_custom_function_call(state.model):
+        state.failure = CaptureFailure(
+            stage="graph_capture",
+            code="CUSTOM_OP_UNSUPPORTED",
+            message=(
+                "model forward calls a non-module custom function that cannot be "
+                "proven safe without real CPU execution"
             ),
             artifact_log_ref="diagnostics/capture.json",
         )
@@ -834,6 +853,34 @@ def _forward_contains_python_control_flow(model: Any) -> bool:
         ):
             return True
     return False
+
+
+def _forward_contains_custom_function_call(model: Any) -> bool:
+    tree = _forward_ast(model)
+    if tree is None:
+        return True
+    allowed_names = {"getattr", "len", "max", "min", "range", "sum"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return):
+            continue
+        for child in ast.walk(node.value):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+                if child.func.id not in allowed_names:
+                    return True
+    return False
+
+
+def _forward_ast(model: Any) -> ast.AST | None:
+    import inspect
+
+    try:
+        source = inspect.getsource(model.forward)
+    except (OSError, TypeError):
+        return None
+    try:
+        return ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
 
 
 def _capture_graph_or_fail(state: _CaptureState) -> None:

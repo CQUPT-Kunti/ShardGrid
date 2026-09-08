@@ -116,3 +116,177 @@ def test_declared_state_larger_than_control_plane_ram_reaches_bounded_planning_c
         "diagnostics"
     ]
     assert not checkpoint_path.exists()
+
+
+def test_dynamic_control_flow_fails_closed_before_training_mutation(tmp_path: Path) -> None:
+    marker = tmp_path / "mutation"
+    script = tmp_path / "dynamic_control_flow.py"
+    script.write_text(
+        f"""
+from pathlib import Path
+
+import torch
+from torch import nn
+
+
+class DynamicModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.positive = nn.Linear(2, 1)
+        self.negative = nn.Linear(2, 1)
+
+    def forward(self, x):
+        if x.sum() > 0:
+            return self.positive(x)
+        return self.negative(x)
+
+
+model = DynamicModel()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+loss = model(torch.ones(1, 2)).sum()
+loss.backward()
+optimizer.step()
+Path({str(marker)!r}).write_text("mutated", encoding="utf-8")
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = runner.capture_entrypoint(script, cwd=tmp_path, environment={}, dry_run=True)
+
+    assert result.ok is False
+    assert result.failure.stage == "graph_capture"
+    assert result.failure.code == "DYNAMIC_CONTROL_FLOW_UNSUPPORTED"
+    assert "real CPU execution" in result.failure.message
+    assert not marker.exists()
+
+
+def test_custom_forward_function_fails_closed_without_cpu_fallback(tmp_path: Path) -> None:
+    marker = tmp_path / "mutation"
+    script = tmp_path / "custom_op.py"
+    script.write_text(
+        f"""
+from pathlib import Path
+
+import torch
+from torch import nn
+
+
+def user_custom_op(x):
+    Path({str(marker)!r}).write_text("forward-entered", encoding="utf-8")
+    return x.sin()
+
+
+class CustomOpModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(2, 2)
+
+    def forward(self, x):
+        return user_custom_op(self.proj(x))
+
+
+model = CustomOpModel()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+loss = model(torch.ones(1, 2)).sum()
+loss.backward()
+optimizer.step()
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = runner.capture_entrypoint(script, cwd=tmp_path, environment={}, dry_run=True)
+
+    assert result.ok is False
+    assert result.failure.stage == "graph_capture"
+    assert result.failure.code == "CUSTOM_OP_UNSUPPORTED"
+    assert "custom function" in result.failure.message
+    assert not marker.exists()
+
+
+def test_missing_tensor_metadata_fails_closed_before_forward(tmp_path: Path) -> None:
+    marker = tmp_path / "forward"
+    script = tmp_path / "missing_tensor_metadata.py"
+    script.write_text(
+        f"""
+from pathlib import Path
+
+import torch
+from torch import nn
+
+
+class MetadataModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(2, 1)
+
+    def forward(self, payload):
+        Path({str(marker)!r}).write_text("forward-entered", encoding="utf-8")
+        return self.proj(torch.ones(1, 2))
+
+
+model = MetadataModel()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+loss = model({{"not_tensor": "value"}}).sum()
+loss.backward()
+optimizer.step()
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = runner.capture_entrypoint(script, cwd=tmp_path, environment={}, dry_run=True)
+
+    assert result.ok is False
+    assert result.failure.stage == "capture"
+    assert result.failure.code == "MISSING_REQUIRED_METADATA"
+    assert "tensor input metadata" in result.failure.message
+    assert not marker.exists()
+
+
+def test_custom_optimizer_mutation_fails_closed_before_model_execution(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "forward"
+    script = tmp_path / "custom_optimizer.py"
+    script.write_text(
+        f"""
+from pathlib import Path
+
+import torch
+from torch import nn
+
+
+class HiddenMutationOptimizer(torch.optim.Optimizer):
+    def __init__(self, params):
+        super().__init__(params, {{"lr": 0.1}})
+
+    def step(self, closure=None):
+        for group in self.param_groups:
+            for param in group["params"]:
+                param.data.add_(1.0)
+
+
+class OptimizerModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(2, 1)
+
+    def forward(self, x):
+        Path({str(marker)!r}).write_text("forward-entered", encoding="utf-8")
+        return self.proj(x)
+
+
+model = OptimizerModel()
+optimizer = HiddenMutationOptimizer(model.parameters())
+loss = model(torch.ones(1, 2)).sum()
+loss.backward()
+optimizer.step()
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = runner.capture_entrypoint(script, cwd=tmp_path, environment={}, dry_run=True)
+
+    assert result.ok is False
+    assert result.failure.stage == "lifecycle_capture"
+    assert result.failure.code == "HIDDEN_OPTIMIZER_MUTATION_UNSUPPORTED"
+    assert not marker.exists()
