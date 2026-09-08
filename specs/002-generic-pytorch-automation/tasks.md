@@ -1178,7 +1178,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/unit/test_checkpoint_large_state.py tests/unit/test_checkpoint_generic_state.py tests/integration/test_generic_checkpoint_reload.py`
   - Acceptance Criteria: Large-state checkpoint finalization is memory-safe and standard-compatible.
 
-- [ ] T088 [P] [US5] Add corrected GPU-packing stress fixtures in `tests/fixtures/ordinary_training_scripts/`
+- [x] T088 [P] [US5] Add corrected GPU-packing stress fixtures in `tests/fixtures/ordinary_training_scripts/`
   - Title: Stress GPU memory without huge CPU artifacts
   - Phase: New Phase 11
   - Priority: P1

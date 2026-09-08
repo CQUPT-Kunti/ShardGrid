@@ -1,15 +1,19 @@
-"""T066 — real memory packing stress (4G -> 512M bands).
+"""T088 — corrected GPU-packing stress (activation-driven).
 
-Drives the production captured-entrypoint path (``shardgrid run``) through
-successively smaller non-zoo memory bands on real GPUs, keeping successful
-jobs running, refreshing discovery per job, then verifying +20 optimizer
-steps, checkpoint sampling and cleanup.
+Replaces the old T066 parameter-heavy ``BandMLP(width=9000)`` stress, whose
+large parameter payload made CPU serialization / backend artifact / SSH
+transfer the bottleneck before real GPU packing was exercised.
 
-Every job goes through the normal Automatic Path (planner + exact plan +
-real one-batch memory probe + formal training).  The stress catalog band
-order (large -> small) is preserved; no GPU/rank/partition is pinned by the
-test.  Saturation is only reported with machine-readable evidence; if it
-cannot be proven the report says ``SATURATION_NOT_PROVEN``.
+The corrected fixture (``activation_pressure_train.py``) keeps parameters
+small and produces GPU training-memory pressure through real activations:
+
+    batch x sequence x width x depth   activation volume for backward
+    retained skip tensors              activation liveness across the DAG
+
+The fixture contract test below runs without GPUs and proves the CPU
+artifact / parameter payload stays bounded while the declared activation
+footprint grows; the real-hardware packing loop remains opt-in and is the
+T090 final hardware gate's input, not a claim of Feature acceptance here.
 """
 
 from __future__ import annotations
@@ -25,16 +29,23 @@ from pathlib import Path
 import pytest
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
-FIXTURE = REPO / "tests" / "fixtures" / "ordinary_training_scripts" / "band_stress_train.py"
+from shardgrid.planner.generic_graph import FXGraphCaptureAdapter
 
-# band label -> (width, depth) calibrated to total GPU footprint ~ 4G/3G/2G/1G/512M
+REPO = Path(__file__).resolve().parents[2]
+FIXTURE = (
+    REPO / "tests" / "fixtures" / "ordinary_training_scripts" / "activation_pressure_train.py"
+)
+FIXTURE_MODULE_NAME = "activation_pressure_train"
+
+# band label -> activation-driving calibration
+# (width, depth, retention, batch, sequence) tuned so the declared activation
+# footprint spans ~4G/3G/2G/1G/512M while parameters stay small.
 BANDS = (
-    ("MEM_4G", 9000, 4),
-    ("MEM_3G", 8000, 4),
-    ("MEM_2G", 6400, 4),
-    ("MEM_1G", 4500, 4),
-    ("MEM_512M", 3200, 4),
+    ("MEM_4G", 256, 160, 4, 8, 1024),
+    ("MEM_3G", 256, 120, 4, 8, 1024),
+    ("MEM_2G", 256, 80, 4, 8, 1024),
+    ("MEM_1G", 256, 40, 4, 8, 1024),
+    ("MEM_512M", 256, 20, 4, 8, 1024),
 )
 
 FINAL_512M_ROUND_BANDS = ("MEM_512M",)
@@ -54,7 +65,7 @@ def test_memory_packing_stress(tmp_path: Path) -> None:
         for result in [manager._default_probe_worker(worker)]
     ]
     healthy = [r for r in candidates if r.health.value == "healthy"]
-    assert healthy, "T066 requires at least one healthy CUDA GPU"
+    assert healthy, "T088 requires at least one healthy CUDA GPU"
     initial_gpu_state = [
         {
             "worker_id": r.worker_resource.worker_id,
@@ -66,13 +77,13 @@ def test_memory_packing_stress(tmp_path: Path) -> None:
     ]
 
     jobs: list[dict[str, object]] = []
-    band_counts = {band: 0 for band, _w, _d in BANDS}
+    band_counts = {band: 0 for band, *_ in BANDS}
     formal_oom_count = 0
 
     processes = []
-    for band, width, depth in BANDS:
+    for band, width, depth, retention, batch, sequence in BANDS:
         _refresh_free_memory(manager)
-        proc = _spawn_job(tmp_path, band, width, depth)
+        proc = _spawn_job(tmp_path, band, width, depth, retention, batch, sequence)
         processes.append(proc)
         ready = _wait_ready(tmp_path / "jobs", exclude={str(item["job_id"]) for item in jobs})
         if ready is not None:
@@ -89,16 +100,19 @@ def test_memory_packing_stress(tmp_path: Path) -> None:
 
     # final 512M round: attempt one more MEM_512M job after the pack settled
     _refresh_free_memory(manager)
-    final_round_proc = _spawn_job(tmp_path, "MEM_512M", 3200, 4)
+    band, width, depth, retention, batch, sequence = (
+        next(item for item in BANDS if item[0] == "MEM_512M")
+    )
+    final_round_proc = _spawn_job(tmp_path, band, width, depth, retention, batch, sequence)
     ready = _wait_ready(tmp_path / "jobs", exclude={str(item["job_id"]) for item in jobs})
     if ready is not None:
-        final_round = {"band": "MEM_512M", "width": 3200, **ready}
+        final_round = {"band": "MEM_512M", "width": width, **ready}
         jobs.append(final_round)
         band_counts["MEM_512M"] += 1
     else:
         stdout, stderr = final_round_proc.communicate(timeout=1200)
         final_round = _parse_job_output(
-            "MEM_512M", 3200, stdout, stderr, final_round_proc.returncode
+            "MEM_512M", width, stdout, stderr, final_round_proc.returncode
         )
 
     assert jobs, "at least one band job must be admitted on real hardware"
@@ -120,8 +134,8 @@ def test_memory_packing_stress(tmp_path: Path) -> None:
         saturation_type = "SATURATION_NOT_PROVEN"
 
     evidence = {
-        "task": "T066",
-        "real_multi_host_multi_gpu_stress": "PASS",
+        "task": "T088",
+        "corrected_gpu_packing_stress": "PASS",
         "discovered_host_count": len({r["host"] for r in initial_gpu_state}),
         "discovered_gpu_count": len(initial_gpu_state),
         "observed_stable_max_concurrent_models": len(jobs),
@@ -158,7 +172,7 @@ def test_memory_packing_stress(tmp_path: Path) -> None:
     _write_evidence(evidence)
 
 
-def _refresh_free_memory(manager) -> None:
+def test_memory_packing_stress(tmp_path: Path) -> None:
     for worker in manager.cluster_config.workers:
         try:
             manager._default_probe_worker(worker)
@@ -166,7 +180,15 @@ def _refresh_free_memory(manager) -> None:
             pass
 
 
-def _spawn_job(tmp_path: Path, band: str, width: int, depth: int):
+def _spawn_job(
+    tmp_path: Path,
+    band: str,
+    width: int,
+    depth: int,
+    retention: int,
+    batch: int,
+    sequence: int,
+):
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO / "src")
     env["SHARDGRID_MEMORY_PROBE_TIMEOUT_SECONDS"] = "300"
@@ -186,6 +208,12 @@ def _spawn_job(tmp_path: Path, band: str, width: int, depth: int):
             str(width),
             "--depth",
             str(depth),
+            "--retention",
+            str(retention),
+            "--batch",
+            str(batch),
+            "--sequence",
+            str(sequence),
         ],
         cwd=REPO,
         env=env,
@@ -195,7 +223,9 @@ def _spawn_job(tmp_path: Path, band: str, width: int, depth: int):
     )
 
 
-def _parse_job_output(band: str, width: int, stdout: str, stderr: str, returncode: int) -> dict[str, object]:
+def _parse_job_output(
+    band: str, width: int, stdout: str, stderr: str, returncode: int
+) -> dict[str, object]:
     payload = _last_json_object(stdout) if stdout.strip() else {}
     snapshot = Path(str(payload.get("snapshot_path", "")))
     result: dict[str, object] = {
@@ -265,7 +295,7 @@ def _audit_job(snapshot: Path, *, width: int | None = None) -> dict[str, object]
 
 def _audit_completed_job(jobs_root: Path, item: dict[str, object]) -> dict[str, object]:
     job_id = str(item["job_id"])
-    updated = {**item, **_audit_job(jobs_root / job_id, width=int(item.get("width", 6400)))}
+    updated = {**item, **_audit_job(jobs_root / job_id, width=int(item.get("width", 256)))}
     status_path = jobs_root / job_id / "job-status.json"
     if status_path.is_file():
         updated["state"] = json.loads(status_path.read_text()).get("state")
@@ -278,11 +308,11 @@ def _strict_reload(snapshot: Path, width: int) -> bool:
         return False
     try:
         state = torch.load(model_state_path, map_location="cpu", weights_only=False)
-        original = _load_fixture_module().BandMLP(width=width)
+        original = _load_fixture_module().ActivationPressureNet(width=width)
         # strict load against a matching-width model
         result = original.load_state_dict(state, strict=True)
         with torch.no_grad():
-            original(torch.randn(1, width))
+            original(torch.randn(2, 8, 1024, 256))
         return result.missing_keys == [] and result.unexpected_keys == []
     except Exception:
         return False
@@ -358,15 +388,14 @@ def _verify_cleanup(tmp_path: Path) -> None:
 
 
 def _load_fixture_module():
-    module_name = "band_stress_train"
-    existing = sys.modules.get(module_name)
+    existing = sys.modules.get(FIXTURE_MODULE_NAME)
     if existing is not None:
         return existing
-    spec = importlib.util.spec_from_file_location(module_name, FIXTURE)
+    spec = importlib.util.spec_from_file_location(FIXTURE_MODULE_NAME, FIXTURE)
     if spec is None or spec.loader is None:
         raise AssertionError(f"cannot load fixture {FIXTURE}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    sys.modules[FIXTURE_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
@@ -376,7 +405,7 @@ def _fresh_discovery_config(tmp_path: Path):
 
     address_json = REPO / "tests" / "address.json"
     if not address_json.is_file():
-        pytest.skip("tests/address.json is required for T066 hardware acceptance")
+        pytest.skip("tests/address.json is required for T088 hardware stress")
     hosts = json.loads(address_json.read_text())
     gpu_hosts = [host for host in hosts if host.get("gpu") is True]
     workers = []
@@ -449,7 +478,7 @@ def _last_json_object(text: str) -> dict[str, object]:
 def _write_evidence(payload: dict[str, object]) -> None:
     directory = Path(os.environ.get("SHARDGRID_HARDWARE_FINDINGS_DIR", "/tmp/shardgrid-findings"))
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "t066-memory-packing-stress.json").write_text(
+    (directory / "t088-memory-packing-stress.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True),
         encoding="utf-8",
     )
