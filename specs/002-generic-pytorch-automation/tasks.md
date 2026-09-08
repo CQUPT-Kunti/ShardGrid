@@ -804,7 +804,7 @@ T001-T065 completed historical implementation
 
 **Purpose**: Remove full control-plane model materialization and real CPU training execution from planning prerequisites.
 
-- [ ] T067 [P] [US1] Add full-control-plane-model materialization regression tests in `tests/integration/test_large_model_capture_safety.py`
+- [x] T067 [P] [US1] Add full-control-plane-model materialization regression tests in `tests/integration/test_large_model_capture_safety.py`
   - Title: Prove planning starts without full CPU model
   - Phase: New Phase 8
   - Priority: P0 BLOCKING
@@ -814,6 +814,16 @@ T001-T065 completed historical implementation
   - Implementation Notes: Use normal user training scripts. Do not add ShardGrid user-facing model-provider APIs.
   - Tests: `pytest tests/integration/test_large_model_capture_safety.py`
   - Acceptance Criteria: Regression tests fail on current full-materialization behavior and define `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`.
+  - Gate Evidence:
+    - `TASK=T067`
+    - `REGRESSION_CONTRACT_CREATED=true`
+    - `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`
+    - `FULL_CPU_MATERIALIZATION_DETECTION=PASS`
+    - `USER_FACING_SHARDGRID_MODEL_API_ADDED=false`
+    - `T068_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_large_model_capture_safety.py -q`
+    - Result: `1 passed, 1 xfailed`
+    - Expected xfail reason: current ordinary entrypoint capture executes user model construction and requests complete CPU Parameter storage before planning; T069 must remove this full-materialization prerequisite.
 
 - [ ] T068 [P] [US2] Add no-real-CPU-capture-execution tests in `tests/integration/test_entrypoint_capture.py`
   - Title: Prove capture does not train on CPU
