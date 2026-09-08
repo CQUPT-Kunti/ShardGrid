@@ -426,12 +426,9 @@ def _candidate_attempt_reasons(candidates: Sequence[PartitionCandidate]) -> tupl
 
 
 def _usable_memory_bytes(worker: WorkerResource) -> int | None:
-    memory_mb = worker.gpu_free_memory
-    if memory_mb is None:
-        memory_mb = worker.gpu_total_memory
-    if memory_mb is None:
+    if worker.gpu_free_memory is None:
         return None
-    return int(memory_mb) * _BYTES_PER_MB
+    return int(worker.gpu_free_memory) * _BYTES_PER_MB
 
 
 def bytes_to_mb(value: int | None) -> int | None:

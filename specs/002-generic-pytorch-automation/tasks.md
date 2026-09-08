@@ -1025,7 +1025,7 @@ T001-T065 completed historical implementation
     - Command: `$CONDA_PYTHON_EXE -m pytest tests/unit/test_memory_probe_launch.py -q`
     - Result: `12 passed, 1 xfailed`
 
-- [ ] T077 [US3] Remove production memory-probe admission dependency in `src/shardgrid/control/job_manager.py`
+- [x] T077 [US3] Remove production memory-probe admission dependency in `src/shardgrid/control/job_manager.py`
   - Title: Admit from estimates and fresh resources
   - Phase: New Phase 9
   - Priority: P0 BLOCKING
@@ -1036,7 +1036,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/unit/test_memory_probe_launch.py tests/unit/test_joint_partition_placement.py`
   - Acceptance Criteria: Production admission records no GPU trial execution and still rejects infeasible plans safely.
 
-- [ ] T078 [US3] Add fresh-free-VRAM admission regression tests in `tests/integration/test_generic_resource_discovery.py`
+- [x] T078 [US3] Add fresh-free-VRAM admission regression tests in `tests/integration/test_generic_resource_discovery.py`
   - Title: Preserve fresh resource discovery
   - Phase: New Phase 9
   - Priority: P0 BLOCKING

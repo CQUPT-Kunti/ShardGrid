@@ -465,3 +465,71 @@ def test_usable_memory_prefers_fresh_free_memory_over_total() -> None:
     worker = replace(worker, gpu_total_memory=99)
 
     assert _usable_memory_bytes(worker) == 7 * 1024 * 1024
+
+
+def test_placement_does_not_admit_on_stale_total_memory_only() -> None:
+    model, sample, profile = _chain_profile(5)
+    cluster = _cluster_state(
+        [
+            _worker("worker-a", machine_id="machine-a", free_memory_mb=13),
+            _worker("worker-b", machine_id="machine-b", free_memory_mb=13),
+        ]
+    )
+    stale = replace(cluster.workers[1].resource, gpu_free_memory=None)
+
+    updated = ResourceManager().build_cluster_state(
+        [
+            cluster.workers[0].resource,
+            stale,
+        ],
+        network_state=_network([cluster.workers[0].resource, stale]),
+        now=datetime(2026, 9, 3, 0, 0, tzinfo=UTC),
+    )
+    assert updated.workers[0].eligible is True
+
+    plan = search_joint_partition_placement(
+        model,
+        profile,
+        updated,
+        sample_args=(sample,),
+        memory_config=_memory_config(),
+    )
+
+    assert plan.status == FeasibilityStatus.INFEASIBLE
+    assert any("no usable GPU memory" in reason for reason in plan.reasons)
+
+
+def test_multi_job_placement_uses_fresh_free_vram_per_admission() -> None:
+    model, sample, profile = _chain_profile(5)
+
+    job_a_cluster = _cluster_state(
+        [
+            _worker("worker-a", machine_id="machine-a", free_memory_mb=13),
+            _worker("worker-b", machine_id="machine-b", free_memory_mb=13),
+        ]
+    )
+    plan_a = search_joint_partition_placement(
+        model,
+        profile,
+        job_a_cluster,
+        sample_args=(sample,),
+        memory_config=_memory_config(),
+    )
+    assert plan_a.status == FeasibilityStatus.FEASIBLE
+
+    job_b_cluster = _cluster_state(
+        [
+            _worker("worker-a", machine_id="machine-a", free_memory_mb=13),
+            _worker("worker-b", machine_id="machine-b", free_memory_mb=4),
+        ]
+    )
+    plan_b = search_joint_partition_placement(
+        model,
+        profile,
+        job_b_cluster,
+        sample_args=(sample,),
+        memory_config=_memory_config(),
+    )
+    assert plan_b.status == FeasibilityStatus.INFEASIBLE
+    assert any("exceeds" in reason for reason in plan_b.reasons)
+    assert plan_b.attempted_worker_counts == (2,)

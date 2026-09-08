@@ -358,3 +358,38 @@ def test_resource_manager_retains_unreachable_worker_without_eligibility() -> No
         "worker-b",
     ]
     assert cluster.workers[1].eligible is False
+
+
+def test_admission_refreshes_free_vram_before_each_job() -> None:
+    manager = _manager(("worker-a", "worker-b"))
+    call_counts: dict[str, int] = {}
+
+    def probe(worker):
+        key = str(worker.worker_id)
+        count = call_counts.get(key, 0) + 1
+        call_counts[key] = count
+        return _probe(key, free_memory=8192 - count * 1024)
+
+    manager._probe_worker = probe
+
+    first = manager._refresh_planning_state(
+        training_config=None,
+        selected_workers=_cluster_config(("worker-a", "worker-b")).workers,
+        current_job_id=as_job_id("job-A-admitted"),
+    )
+    assert first is not None
+    second = manager._refresh_planning_state(
+        training_config=None,
+        selected_workers=_cluster_config(("worker-a", "worker-b")).workers,
+        current_job_id=as_job_id("job-B-admitted"),
+    )
+    assert second is not None
+
+    assert sum(call_counts.values()) == 4
+    job_a_free = {w.resource.gpu_free_memory for w in first[3].workers}
+    job_b_free = {w.resource.gpu_free_memory for w in second[3].workers}
+    assert job_a_free == {8192 - 1024}
+    assert job_b_free == {8192 - 2 * 1024}
+    assert first[3].workers[0].resource.gpu_free_memory != (
+        second[3].workers[0].resource.gpu_free_memory
+    )
