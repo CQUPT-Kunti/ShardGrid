@@ -429,12 +429,47 @@ def _load_captured_runtime_artifacts() -> tuple[CanonicalGraphIR, Any, Mapping[s
     if not backend_path.is_file():
         raise ValueError("CAPTURE_ARTIFACT_MISSING: plan/backend-graph.pt is required")
     backend_graph = torch.load(backend_path, map_location="cpu", weights_only=False)
+    initial_state = _load_initial_state(root)
+    return graph, backend_graph, initial_state
+
+
+def _load_initial_state(root: Path) -> Mapping[str, Any]:
+    """Load the captured initial state from manifest-addressed shards.
+
+    The state payload lives in per-owner bounded shards referenced by
+    ``state-manifest.json``.  Workers merge the shards they are allowed to
+    read; T084 restricts this to owned/read-only state ids only.
+    """
+    import torch
+
+    manifest_path = root / "plan" / "state-manifest.json"
+    shards_root = root / "plan" / "state-shards"
+    if manifest_path.is_file() and shards_root.is_dir():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        merged: dict[str, Any] = {}
+        for shard_path in sorted(shards_root.glob("*.pt")):
+            merged.update(
+                torch.load(shard_path, map_location="cpu", weights_only=False)
+            )
+        covered = {str(entry["state_id"]) for entry in manifest}
+        if set(merged) != covered:
+            raise ValueError(
+                "CAPTURE_ARTIFACT_MISMATCH: state shards do not cover manifest "
+                f"(manifest={len(covered)}, shards={len(merged)})"
+            )
+        return merged
     state_path = root / "plan" / "initial-state.pt"
     if state_path.is_file():
-        initial_state = torch.load(state_path, map_location="cpu", weights_only=False)
-    else:
-        initial_state = backend_graph.state_dict()
-    return graph, backend_graph, initial_state
+        return torch.load(state_path, map_location="cpu", weights_only=False)
+    return _legacy_backend_state(root)
+
+
+def _legacy_backend_state(root: Path) -> Mapping[str, Any]:
+    import torch
+
+    return torch.load(
+        root / "plan" / "backend-graph.pt", map_location="cpu", weights_only=False
+    ).state_dict()
 
 
 def _execution() -> ExecutionPlan:

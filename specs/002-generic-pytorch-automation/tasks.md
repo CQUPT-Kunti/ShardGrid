@@ -1096,7 +1096,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/unit/test_runtime_artifact_payloads.py`
   - Acceptance Criteria: `BACKEND_GRAPH_FULL_PARAMETER_PAYLOAD=0`.
 
-- [ ] T082 [US4] Split graph metadata from state payload artifacts in `src/shardgrid/control/job_manager.py`
+- [x] T082 [US4] Split graph metadata from state payload artifacts in `src/shardgrid/control/job_manager.py`
   - Title: Persist bounded runtime artifacts
   - Phase: New Phase 10
   - Priority: P0 BLOCKING

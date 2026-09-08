@@ -3292,12 +3292,31 @@ class JobManager:
             encoding="utf-8",
         )
         import torch
+        from torch import nn as _nn
         from torch.fx import GraphModule
 
         backend_graph = capture_result.backend_graph
         for node in backend_graph.graph.nodes:
             node.type = None
         backend_graph = GraphModule(backend_graph, backend_graph.graph)
+        state_manifest = _build_state_manifest(
+            backend_graph,
+            graph,
+            parallel_plan,
+            state_source=capture.model.state_dict(),
+        )
+        _materialize_state_shards(
+            plan_root=plan_root,
+            backend_graph=backend_graph,
+            state_manifest=state_manifest,
+            state_source=capture.model.state_dict(),
+        )
+        for name, parameter in list(backend_graph.named_parameters(remove_duplicate=False)):
+            if parameter.device.type != "meta":
+                _replace_parameter(backend_graph, name, parameter)
+        for name, buffer in list(backend_graph.named_buffers(remove_duplicate=False)):
+            if buffer.device.type != "meta":
+                _replace_buffer(backend_graph, name, buffer)
         torch.save(backend_graph, plan_root / "backend-graph.pt")
         for index, sample in enumerate(capture.sample_args):
             torch.save(sample, plan_root / f"input-{index}.pt")
@@ -3333,10 +3352,18 @@ class JobManager:
             "captured-graph.json",
             "backend-graph.pt",
             "runtime-plan.json",
+            "state-manifest.json",
         ):
             source = source_root / name
             if source.is_file():
                 shutil.copyfile(source, target_root / name)
+        shards_source = source_root / "state-shards"
+        if shards_source.is_dir():
+            shutil.copytree(
+                shards_source,
+                target_root / "state-shards",
+                dirs_exist_ok=True,
+            )
         for path in sorted(source_root.glob("input-*.pt")):
             shutil.copyfile(path, target_root / path.name)
 
@@ -4581,3 +4608,176 @@ def _covers_workers(network_state: NetworkState, worker_ids: list[WorkerId]) -> 
             ):
                 return False
     return True
+
+
+def _module_path_to_stage(
+    parallel_plan: Any,
+    graph: Any,
+) -> dict[str, str]:
+    """Map canonical module paths to owning stage ids from the exact plan."""
+    if not getattr(parallel_plan, "stage_metadata", None):
+        return {}
+    executable = tuple(
+        node for node in graph.nodes if node.op_kind not in {"placeholder", "output"}
+    )
+    node_index = {node.node_id: index for index, node in enumerate(executable)}
+    module_index = {
+        str(node.module_path): index
+        for index, node in enumerate(executable)
+        if node.module_path
+    }
+    path_to_stage: dict[str, str] = {}
+    for stage in parallel_plan.stage_metadata:
+        for path in getattr(stage, "module_paths", ()) or ():
+            if path in module_index:
+                path_to_stage.setdefault(path, stage.stage_id)
+        for module_id in getattr(stage, "module_ids", ()) or ():
+            if module_id in node_index:
+                node = executable[node_index[module_id]]
+                if node.module_path:
+                    path_to_stage.setdefault(node.module_path, stage.stage_id)
+    return path_to_stage
+
+
+def _stage_consumes_state_path(
+    stage_id: str,
+    module_path: str,
+    parallel_plan: Any,
+) -> bool:
+    for stage in getattr(parallel_plan, "stage_metadata", ()) or ():
+        if stage.stage_id != stage_id:
+            continue
+        return module_path in (getattr(stage, "module_paths", ()) or ())
+    return False
+
+
+def _build_state_manifest(
+    backend_graph: Any,
+    graph: Any,
+    parallel_plan: Any,
+    *,
+    state_source: Mapping[str, Any],
+) -> list[dict[str, object]]:
+    """Build the canonical state manifest for ownership-addressable shards.
+
+    Each entry records the canonical state id, kind, shape/dtype, a checksum
+    over the tensor bytes, the owning stage (from the exact plan), the
+    read-only stages that consume it, and the shard reference.
+    """
+    import hashlib
+
+    import torch
+
+    path_to_stage = _module_path_to_stage(parallel_plan, graph)
+    stage_ids = tuple(
+        stage.stage_id
+        for stage in getattr(parallel_plan, "stage_metadata", ()) or ()
+    )
+    manifest: list[dict[str, object]] = []
+    for key, tensor in state_source.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.device.type == "meta":
+            continue
+        checksum = hashlib.sha256(tensor.detach().cpu().numpy().tobytes()).hexdigest()
+        module_path, _, _leaf = key.rpartition(".")
+        owner_stage = path_to_stage.get(module_path, path_to_stage.get(key))
+        read_only_stages = tuple(
+            stage_id
+            for stage_id in stage_ids
+            if stage_id != owner_stage
+            and _stage_consumes_state_path(stage_id, module_path, parallel_plan)
+        )
+        manifest.append(
+            {
+                "state_id": key,
+                "kind": "parameter"
+                if key in dict(backend_graph.named_parameters())
+                else "buffer",
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "bytes": int(tensor.numel() * max(tensor.element_size(), 1)),
+                "checksum_sha256": checksum,
+                "owner_stage": owner_stage,
+                "read_only_stages": list(read_only_stages),
+                "shard_ref": (
+                    f"state-shards/{owner_stage}.pt"
+                    if owner_stage
+                    else "state-shards/unowned.pt"
+                ),
+            }
+        )
+    return manifest
+
+
+def _materialize_state_shards(
+    *,
+    plan_root: Path,
+    backend_graph: Any,
+    state_manifest: list[dict[str, object]],
+    state_source: Mapping[str, Any],
+) -> None:
+    """Write per-owner bounded state payload shards referenced by the manifest."""
+    del backend_graph
+
+    import torch
+
+    shards_root = plan_root / "state-shards"
+    shards_root.mkdir(parents=True, exist_ok=True)
+    groups: dict[str, dict[str, torch.Tensor]] = {}
+    for entry in state_manifest:
+        state_id = str(entry["state_id"])
+        owner = str(entry["owner_stage"] or "unowned")
+        groups.setdefault(owner, {})[state_id] = state_source[state_id]
+    for owner, payload in groups.items():
+        torch.save(payload, shards_root / f"{owner}.pt")
+    for existing in shards_root.glob("*.pt"):
+        if existing.stem not in groups:
+            existing.unlink()
+    state_manifest_path = plan_root / "state-manifest.json"
+    state_manifest_path.write_text(
+        json.dumps(state_manifest, sort_keys=True), encoding="utf-8"
+    )
+
+
+def _replace_parameter(module: Any, path: str, parameter: Any) -> None:
+    import torch
+
+    parent = module
+    *head, leaf = path.split(".")
+    for part in head:
+        parent = getattr(parent, part)
+    replacement = torch.nn.Parameter(
+        torch.empty(
+            parameter.shape,
+            dtype=parameter.dtype,
+            device="meta",
+            layout=parameter.layout,
+            requires_grad=parameter.requires_grad,
+        )
+    )
+    current = parent._parameters.get(leaf)
+    if current is None:
+        setattr(parent, leaf, replacement)
+    else:
+        parent._parameters[leaf] = replacement
+
+
+def _replace_buffer(module: Any, path: str, buffer: Any) -> None:
+    import torch
+
+    parent = module
+    *head, leaf = path.split(".")
+    for part in head:
+        parent = getattr(parent, part)
+    replacement = torch.empty(
+        buffer.shape,
+        dtype=buffer.dtype,
+        device="meta",
+        layout=buffer.layout,
+    )
+    current = parent._buffers.get(leaf)
+    if current is None:
+        setattr(parent, leaf, replacement)
+    else:
+        parent._buffers[leaf] = replacement

@@ -48,6 +48,22 @@ REPO = Path(__file__).resolve().parents[2]
 FIXTURE_ROOT = REPO / "tests" / "fixtures" / "ordinary_training_scripts"
 
 
+def _load_state_from_plan(plan_root: Path):
+    manifest_path = plan_root / "state-manifest.json"
+    shards_root = plan_root / "state-shards"
+    if manifest_path.is_file() and shards_root.is_dir():
+        merged: dict[str, torch.Tensor] = {}
+        for shard_path in sorted(shards_root.glob("*.pt")):
+            merged.update(torch.load(shard_path, map_location="cpu", weights_only=False))
+        return merged
+    state_path = plan_root / "initial-state.pt"
+    if state_path.is_file():
+        return torch.load(state_path, map_location="cpu", weights_only=False)
+    return torch.load(
+        plan_root / "backend-graph.pt", map_location="cpu", weights_only=False
+    ).state_dict()
+
+
 def test_generic_bootstrap_module_is_importable() -> None:
     module = importlib.import_module("shardgrid.runtime.generic_bootstrap")
     assert callable(getattr(module, "main", None))
@@ -318,15 +334,7 @@ class _FlexibleCollector:
         for source in sources:
             shard_path = Path(snapshot.checkpoint_path) / f"model_rank{source.rank}.pt"
             shard_path.parent.mkdir(parents=True, exist_ok=True)
-            state_path = plan_root / "initial-state.pt"
-            if state_path.is_file():
-                state = torch.load(state_path, map_location="cpu", weights_only=False)
-            else:
-                state = torch.load(
-                    plan_root / "backend-graph.pt",
-                    map_location="cpu",
-                    weights_only=False,
-                ).state_dict()
+            state = _load_state_from_plan(plan_root)
             from shardgrid.runtime.checkpoint import save_worker_state_shard
 
             result = save_worker_state_shard(
