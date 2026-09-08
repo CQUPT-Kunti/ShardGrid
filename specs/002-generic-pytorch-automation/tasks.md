@@ -934,7 +934,7 @@ T001-T065 completed historical implementation
     - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_large_model_capture_safety.py tests/integration/test_entrypoint_capture.py -q`
     - Result: `22 passed`
 
-- [ ] T073 Run New Phase 8 capture/planning safety gate in `specs/002-generic-pytorch-automation/tasks.md`
+- [x] T073 Run New Phase 8 capture/planning safety gate in `specs/002-generic-pytorch-automation/tasks.md`
   - Title: Gate large-model metadata-first planning
   - Phase: New Phase 8
   - Priority: P0 BLOCKING
@@ -943,6 +943,20 @@ T001-T065 completed historical implementation
   - Goal: Establish `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`, `CPU_REAL_FORWARD_BEFORE_PLAN=0`, `CPU_REAL_BACKWARD_BEFORE_PLAN=0`, and `MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS`.
   - Implementation Notes: Record real command output in this file. Do not run hardware stress.
   - Tests: `pytest tests/integration/test_large_model_capture_safety.py tests/integration/test_entrypoint_capture.py`
+  - Gate Evidence:
+    - `TASK=T073`
+    - `NEW_PHASE_8=PASS`
+    - `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`
+    - `CPU_REAL_FORWARD_BEFORE_PLAN=0`
+    - `CPU_REAL_BACKWARD_BEFORE_PLAN=0`
+    - `CPU_REAL_OPTIMIZER_STEP_BEFORE_PLAN=0`
+    - `MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS`
+    - `UNSUPPORTED_CAPTURE_FAILS_CLOSED=PASS`
+    - `GIANT_CPU_TENSOR_ALLOCATED=false`
+    - `GPU_HARDWARE_STRESS_RUN=false`
+    - `T074_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_large_model_capture_safety.py tests/integration/test_entrypoint_capture.py -q`
+    - Result: `22 passed`
   - Acceptance Criteria: New Phase 8 gate is PASS with no unexplained xfail.
 
 ## New Phase 9: Estimator-Based Admission
