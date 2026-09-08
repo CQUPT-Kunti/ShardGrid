@@ -1085,7 +1085,7 @@ T001-T065 completed historical implementation
 
 **Purpose**: Stop backend graph artifacts and worker startup from carrying or loading the full model state.
 
-- [ ] T081 [P] [US4] Add backend artifact payload regression tests in `tests/unit/test_runtime_artifact_payloads.py`
+- [x] T081 [P] [US4] Add backend artifact payload regression tests in `tests/unit/test_runtime_artifact_payloads.py`
   - Title: Prove backend graph is metadata-bounded
   - Phase: New Phase 10
   - Priority: P0 BLOCKING
