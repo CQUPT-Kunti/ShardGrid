@@ -3415,7 +3415,6 @@ class JobManager:
             node.type = None
         backend_graph = GraphModule(backend_graph, backend_graph.graph)
         torch.save(backend_graph, plan_root / "backend-graph.pt")
-        torch.save(capture.model.state_dict(), plan_root / "initial-state.pt")
         for index, sample in enumerate(capture.sample_args):
             torch.save(sample, plan_root / f"input-{index}.pt")
         if parallel_plan.stage_metadata:
@@ -3449,7 +3448,6 @@ class JobManager:
             "captured-context.json",
             "captured-graph.json",
             "backend-graph.pt",
-            "initial-state.pt",
             "runtime-plan.json",
         ):
             source = source_root / name

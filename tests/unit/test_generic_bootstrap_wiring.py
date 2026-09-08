@@ -318,9 +318,15 @@ class _FlexibleCollector:
         for source in sources:
             shard_path = Path(snapshot.checkpoint_path) / f"model_rank{source.rank}.pt"
             shard_path.parent.mkdir(parents=True, exist_ok=True)
-            state = torch.load(
-                plan_root / "initial-state.pt", map_location="cpu", weights_only=False
-            )
+            state_path = plan_root / "initial-state.pt"
+            if state_path.is_file():
+                state = torch.load(state_path, map_location="cpu", weights_only=False)
+            else:
+                state = torch.load(
+                    plan_root / "backend-graph.pt",
+                    map_location="cpu",
+                    weights_only=False,
+                ).state_dict()
             from shardgrid.runtime.checkpoint import save_worker_state_shard
 
             result = save_worker_state_shard(
@@ -560,7 +566,7 @@ def test_run_entrypoint_non_dry_run_reaches_formal_execution(tmp_path: Path) -> 
     assert "launcher_monitor" in events
     assert (Path(result.snapshot.plan_path) / "captured-graph.json").is_file()
     assert (Path(result.snapshot.plan_path) / "backend-graph.pt").is_file()
-    assert (Path(result.snapshot.plan_path) / "initial-state.pt").is_file()
+    assert (Path(result.snapshot.plan_path) / "backend-graph.pt").is_file()
     assert (Path(result.snapshot.plan_path) / "captured-context.json").is_file()
 
 
@@ -654,5 +660,4 @@ def test_captured_runtime_artifacts_are_persisted_for_bootstrap(tmp_path: Path) 
     assert graph["nodes"]
     backend = torch.load(plan_root / "backend-graph.pt", weights_only=False)
     assert backend is not None
-    state = torch.load(plan_root / "initial-state.pt", weights_only=False)
-    assert state
+    assert backend.state_dict()

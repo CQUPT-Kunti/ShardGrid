@@ -430,9 +430,10 @@ def _load_captured_runtime_artifacts() -> tuple[CanonicalGraphIR, Any, Mapping[s
         raise ValueError("CAPTURE_ARTIFACT_MISSING: plan/backend-graph.pt is required")
     backend_graph = torch.load(backend_path, map_location="cpu", weights_only=False)
     state_path = root / "plan" / "initial-state.pt"
-    if not state_path.is_file():
-        raise ValueError("CAPTURE_ARTIFACT_MISSING: plan/initial-state.pt is required")
-    initial_state = torch.load(state_path, map_location="cpu", weights_only=False)
+    if state_path.is_file():
+        initial_state = torch.load(state_path, map_location="cpu", weights_only=False)
+    else:
+        initial_state = backend_graph.state_dict()
     return graph, backend_graph, initial_state
 
 

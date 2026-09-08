@@ -1,77 +1,91 @@
 # Research: Generic PyTorch Automation
 
-## Decision: Capture the User's Real Entrypoint In-Process
+## Decision: Plan From Non-Materializing Metadata
 
-**Decision**: Add an internal `shardgrid run ENTRYPOINT [ARGS...]` bootstrap that starts the user's normal script and intercepts the first usable training step in the same process.
+**Decision**: ShardGrid must obtain graph, tensor, dtype, shape, state, and lifecycle metadata without requiring the control plane to construct the full real model state before planning.
 
-**Rationale**: This is the only path that obtains the real `nn.Module`, first batch, positional/keyword call structure, optimizer declaration, loss/backward boundary, and checkpoint intent without requiring ShardGrid-specific model factories or sample builders.
-
-**Alternatives considered**:
-
-- Static `build_model()` / `sample_inputs()` hooks: rejected because they become a production model API.
-- User `ModelProvider` / `ShardGridModel` wrappers: rejected because they force model rewrites.
-- Subprocess log scraping: rejected because it cannot safely recover Python objects or optimizer semantics.
-- Full arbitrary Python replay on workers immediately: rejected as too broad for this feature.
-
-## Decision: Prefer `torch.export`, Fall Back to FX, Use Dynamo Diagnostics
-
-**Decision**: Try `torch.export` first for supported models, fall back to FX symbolic tracing for simpler compatible graphs, and surface Dynamo/export diagnostics for unsupported graph breaks.
-
-**Rationale**: PyTorch documents `torch.export` as capturing a graph by tracing tensor computation from example inputs and emitting guards for dynamic shapes. FX remains useful for simpler symbolic-traceable modules but has documented limitations around dynamic control flow.
+**Rationale**: The T066 attempt showed that a parameter-heavy ordinary entrypoint can fail in CPU serialization and artifact transfer before GPU packing is tested. The product target includes models larger than control-plane RAM, so full control-plane materialization is disallowed.
 
 **Alternatives considered**:
 
-- FX only: rejected because FX symbolic tracing is weaker on modern PyTorch programs.
-- `torch.compile` as the production graph source: rejected because compile can graph-break and fall back to eager behavior, which is not a sufficient partition contract.
-- Hand-authored graph adapters: rejected because they recreate the ShardGrid-specific model contract.
+- Execute the user script normally and partition afterward: rejected because ordinary `HugeModel()` allocates full CPU parameters first.
+- Ask users to provide ShardGrid model factories or sample builders: rejected because it changes the ordinary PyTorch interface.
+- Fall back to full materialization when capture is hard: rejected because unsupported models must fail closed.
 
-**Reference sources**:
+## Decision: No Real CPU Forward/Backward Before Planning
 
-- PyTorch export overview: `https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/export.html`
-- PyTorch export programming model: `https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/export/programming_model.html`
-- PyTorch common graph breaks: `https://docs.pytorch.org/docs/2.14/user_guide/torch_compiler/compile/programming_model.common_graph_breaks.html`
-- PyTorch FX documentation: `https://docs.pytorch.org/docs/2.14/fx.html`
+**Decision**: Capture and dry-run planning must not require a full real CPU forward, backward, or optimizer step.
 
-## Decision: Split Execution Graph From State Ownership
-
-**Decision**: Make execution nodes, tensor values, parameter ownership, buffer ownership, logical partitioning, and placement separate contracts.
-
-**Rationale**: Current code still lets registration-order module lists leak into graph partitioning. Real PyTorch models can have functional ops, fused paths, shared parameters, tied weights, branch/merge graphs, and state-owning modules without independent execution nodes.
+**Rationale**: Real CPU capture execution is unsafe for large models and may perform training side effects before ShardGrid proves partition, placement, memory, and checkpoint safety.
 
 **Alternatives considered**:
 
-- Set `ordered_names = call_order`: rejected because call order still does not encode parameter/buffer ownership or multi-consumer dependencies.
-- Continue slicing `named_modules()`: rejected because registration order is not execution order.
+- Treat CPU dry-run as harmless: rejected because dry-run still consumes RAM and can trigger side effects.
+- Record after an actual first training step: rejected because planning must precede mutation.
 
-## Decision: Keep Existing Admission Chain
+## Decision: Fresh GPU Resources Stay, Per-Job GPU Trial Admission Goes
 
-**Decision**: Preserve static memory estimate + online calibration + bounded candidate search + real one-batch memory probe.
+**Decision**: Production admission uses conservative model-memory estimates plus fresh host/GPU resource discovery. It must not launch a per-job GPU forward/backward/optimizer trial to decide whether a candidate fits.
 
-**Rationale**: `JobManager._select_memory_probe_candidate()` already has the right high-level semantics: probe memory rejection is a normal candidate failure, cleanup occurs, and the planner can try the next candidate. The generic refactor should feed better graph/state memory data into this chain, not add a second independent reserve/headroom gate.
-
-**Alternatives considered**:
-
-- Fixed reserve/headroom admission: rejected because it would duplicate and conflict with the probe path.
-- Launch-first and rely on formal training OOM: rejected because formal training CUDA OOM is a safety failure, not a planning signal.
-
-## Decision: Produce Model-State Checkpoints First
-
-**Decision**: Generic checkpointing in this feature produces a standard PyTorch model `state_dict` and validates strict reload. Optimizer-state consolidation is deferred.
-
-**Rationale**: Model state can be keyed by original `state_dict` keys plus canonical state IDs. Optimizer state can depend on object identity, fused optimizers, sharding strategy, scheduler order, and hidden side effects, so it needs a later feature.
+**Rationale**: GPU free-memory discovery is resource observation and must remain. A per-job GPU trial is hidden training execution and blocks efficient scheduling.
 
 **Alternatives considered**:
 
-- Merge optimizer state now: rejected as too risky for the first generic contract.
-- Keep model-specific reconstruction: rejected because it preserves zoo/name coupling.
+- Keep one-batch GPU probe as normal admission: rejected by the new product requirement.
+- Ignore current GPU state and use static totals only: rejected because multi-job sharing and real cluster operation need fresh free-memory information.
+- Launch formal training and rely on OOM: rejected because formal OOM is a failure, not an estimator.
 
-## Decision: Keep Zoo and Stress Assets as Validation Only
+## Decision: Historical Calibration Is Offline Evidence
 
-**Decision**: `examples/models/generic_partition_zoo/` and stress catalogs remain test/benchmark inputs but leave the production path.
+**Decision**: Historical measured CUDA data may adjust estimator confidence only when it is recorded as prior calibration and does not trigger a new per-job trial run.
 
-**Rationale**: The assets are valuable regression fixtures, but production planning, runtime, and checkpointing must derive from captured user programs.
+**Rationale**: Calibration can improve estimates, but the scheduler must not hide a trial execution inside every submission.
 
 **Alternatives considered**:
 
-- Delete zoo/stress assets immediately: rejected because it loses existing coverage.
-- Keep zoo as fallback model factory: rejected because it keeps the wrong production contract.
+- Disable all calibration: rejected because historical data can be useful for conservative estimates.
+- Probe every candidate online: rejected because it violates the admission target.
+
+## Decision: Split Backend Graph From State Payload
+
+**Decision**: Runtime artifacts must separate graph/code/metadata from model parameter and buffer payloads. Backend graph artifacts must not contain full real parameter storage.
+
+**Rationale**: The blocked T066 run produced a large backend graph artifact because graph serialization carried full parameter storage. This makes CPU RAM, disk, and SSH transfer bottlenecks appear before distributed training.
+
+**Alternatives considered**:
+
+- Continue saving full graph modules: rejected because artifact size scales with model state.
+- Compress full state inside the graph artifact: rejected because CPU memory and deserialization still require full-state handling.
+
+## Decision: Worker Loads Owned State Only
+
+**Decision**: Workers must know ownership before materialization and load only assigned owned state or explicitly required read-only state.
+
+**Rationale**: Loading the full backend graph on CPU and pruning non-owned state afterward still fails the larger-than-control-plane and worker-memory goals.
+
+**Alternatives considered**:
+
+- Full load then `to_empty()` non-owned modules: rejected because CPU deserialization has already paid the full-state cost.
+- Broadcast complete model state to all workers: rejected because it defeats partition ownership and stress scalability.
+
+## Decision: Checkpoint Finalization Must Be Memory-Safe
+
+**Decision**: Checkpoint finalization must preserve standard model-state compatibility while avoiding full in-memory control-plane assembly for large models.
+
+**Rationale**: Users still need ordinary model-state artifacts, but finalization must not reintroduce the same control-plane RAM limit the planner removed.
+
+**Alternatives considered**:
+
+- Model-name-specific reconstruction: rejected because it reintroduces zoo/model coupling.
+- Drop standard model-state output: rejected because it breaks user expectations and prior checkpoint gates.
+
+## Decision: Rebuild The Task Route From T066
+
+**Decision**: T001-T065 remain frozen historical implementation. New unfinished work starts at T066 and replaces old T066+ planning.
+
+**Rationale**: The earlier phases produced useful assets and commits, but T066 exposed a product-level architecture mismatch. Reopening completed task IDs would destroy auditability.
+
+**Alternatives considered**:
+
+- Insert fixes into earlier task ranges: rejected because it rewrites completed history.
+- Mark old T066 pass with caveats: rejected because the stress did not validate GPU packing.

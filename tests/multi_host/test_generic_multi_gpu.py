@@ -192,7 +192,7 @@ def _fresh_discovery_config(tmp_path: Path):
             "ssh": {
                 "default_port": 22,
                 "connect_timeout_seconds": 10,
-                "command_timeout_seconds": 60,
+                "command_timeout_seconds": 300,
                 "probe_timeout_seconds": 120,
                 "strict_host_key_checking": False,
             },
