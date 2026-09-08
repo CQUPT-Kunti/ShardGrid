@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from shardgrid.engines.models import (
     EstimateKind,
     ModelProfile,
@@ -8,7 +10,12 @@ from shardgrid.engines.models import (
     TensorMetadata,
     TrainingMemoryEstimate,
 )
-from shardgrid.planner.memory import MemoryEstimationConfig, estimate_stage_memory
+from shardgrid.planner.memory import (
+    CalibrationProvenance,
+    MemoryEstimationConfig,
+    apply_offline_calibration,
+    estimate_stage_memory,
+)
 
 
 def _module(
@@ -233,3 +240,190 @@ def test_shared_tied_state_is_not_double_counted_in_module_slice_estimate() -> N
     assert estimate.parameter_bytes == 128
     assert estimate.gradient_bytes == 128
     assert estimate.optimizer_bytes == 128 * 2
+
+
+def _estimate() -> TrainingMemoryEstimate:
+    return TrainingMemoryEstimate(
+        parameter_bytes=100,
+        gradient_bytes=100,
+        optimizer_bytes=100,
+        activation_bytes=0,
+        temporary_bytes=0,
+        runtime_overhead_bytes=0,
+        communication_buffer_bytes=0,
+        estimated_peak_bytes=300,
+        safety_headroom_bytes=50,
+        planner_required_bytes=350,
+        estimate_kind=EstimateKind.ESTIMATED,
+        source="metadata-estimator",
+    )
+
+
+def _calibration(**overrides) -> CalibrationProvenance:
+    values = {
+        "gpu_name": "RTX 4060",
+        "dtype": "float32",
+        "optimizer_type": "adamw",
+        "model_family": "synthetic",
+        "batch_size": 8,
+        "recorded_at": "2026-09-01T00:00:00+00:00",
+        "source": "offline-calibration",
+    }
+    values.update(overrides)
+    return CalibrationProvenance(**values)
+
+
+def test_offline_calibration_matching_provenance_adjusts_estimate() -> None:
+    estimate = _estimate()
+    calibration = _calibration()
+
+    corrected = apply_offline_calibration(
+        estimate,
+        calibration,
+        gpu_name="RTX 4060",
+        dtype="float32",
+        optimizer_type="adamw",
+        model_family="synthetic",
+        batch_size=8,
+        measured_peak_bytes=400,
+    )
+
+    assert corrected.estimated_peak_bytes == 400
+    assert corrected.planner_required_bytes == 450
+    assert "CALIBRATION_APPLIED: offline" in corrected.notes
+    assert corrected.source == "offline-calibration"
+
+
+def test_offline_calibration_does_not_lower_metadata_estimate() -> None:
+    estimate = _estimate()
+    calibration = _calibration()
+
+    corrected = apply_offline_calibration(
+        estimate,
+        calibration,
+        gpu_name="RTX 4060",
+        dtype="float32",
+        optimizer_type="adamw",
+        model_family="synthetic",
+        batch_size=8,
+        measured_peak_bytes=100,
+    )
+
+    assert corrected.estimated_peak_bytes == 300
+    assert corrected.planner_required_bytes == 350
+    assert "CALIBRATION_APPLIED: offline" in corrected.notes
+
+
+def test_hardware_mismatch_calibration_is_ignored_conservatively() -> None:
+    estimate = _estimate()
+    calibration = _calibration(gpu_name="RTX 4090")
+
+    corrected = apply_offline_calibration(
+        estimate,
+        calibration,
+        gpu_name="RTX 4060",
+        dtype="float32",
+        optimizer_type="adamw",
+        model_family="synthetic",
+        batch_size=8,
+        measured_peak_bytes=9999,
+    )
+
+    assert corrected.estimated_peak_bytes == 300
+    assert "CALIBRATION_MISMATCH: ignored" in corrected.notes
+
+
+def test_dtype_mismatch_calibration_is_ignored_conservatively() -> None:
+    estimate = _estimate()
+    calibration = _calibration(dtype="float16")
+
+    corrected = apply_offline_calibration(
+        estimate,
+        calibration,
+        gpu_name="RTX 4060",
+        dtype="float32",
+        optimizer_type="adamw",
+        model_family="synthetic",
+        batch_size=8,
+        measured_peak_bytes=9999,
+    )
+
+    assert corrected.estimated_peak_bytes == 300
+    assert "CALIBRATION_MISMATCH: ignored" in corrected.notes
+
+
+def test_optimizer_mismatch_calibration_is_ignored_conservatively() -> None:
+    estimate = _estimate()
+    calibration = _calibration(optimizer_type="sgd")
+
+    corrected = apply_offline_calibration(
+        estimate,
+        calibration,
+        gpu_name="RTX 4060",
+        dtype="float32",
+        optimizer_type="adamw",
+        model_family="synthetic",
+        batch_size=8,
+        measured_peak_bytes=9999,
+    )
+
+    assert corrected.estimated_peak_bytes == 300
+    assert "CALIBRATION_MISMATCH: ignored" in corrected.notes
+
+
+def test_batch_regime_mismatch_calibration_is_ignored_conservatively() -> None:
+    estimate = _estimate()
+    calibration = _calibration(batch_size=32)
+
+    corrected = apply_offline_calibration(
+        estimate,
+        calibration,
+        gpu_name="RTX 4060",
+        dtype="float32",
+        optimizer_type="adamw",
+        model_family="synthetic",
+        batch_size=8,
+        measured_peak_bytes=9999,
+    )
+
+    assert corrected.estimated_peak_bytes == 300
+    assert "CALIBRATION_MISMATCH: ignored" in corrected.notes
+
+
+def test_stale_calibration_is_ignored_conservatively() -> None:
+    estimate = _estimate()
+    calibration = _calibration(recorded_at="2026-01-01T00:00:00+00:00")
+
+    corrected = apply_offline_calibration(
+        estimate,
+        calibration,
+        gpu_name="RTX 4060",
+        dtype="float32",
+        optimizer_type="adamw",
+        model_family="synthetic",
+        batch_size=8,
+        measured_peak_bytes=9999,
+        now=datetime(2026, 9, 3, 0, 0, tzinfo=UTC),
+    )
+
+    assert corrected.estimated_peak_bytes == 300
+    assert "CALIBRATION_STALE: ignored" in corrected.notes
+
+
+def test_missing_calibration_keeps_metadata_estimate_without_online_trial() -> None:
+    estimate = _estimate()
+
+    corrected = apply_offline_calibration(
+        estimate,
+        None,
+        gpu_name="RTX 4060",
+        dtype="float32",
+        optimizer_type="adamw",
+        model_family="synthetic",
+        batch_size=8,
+        measured_peak_bytes=None,
+    )
+
+    assert corrected is estimate
+    assert corrected.estimated_peak_bytes == 300
+    assert corrected.notes == ()

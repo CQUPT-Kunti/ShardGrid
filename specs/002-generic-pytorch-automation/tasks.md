@@ -1047,7 +1047,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/integration/test_generic_resource_discovery.py tests/unit/test_joint_partition_placement.py`
   - Acceptance Criteria: `PLACEMENT_USES_FRESH_FREE_VRAM=PASS`.
 
-- [ ] T079 [US3] Add offline calibration contract tests in `tests/unit/test_training_memory_estimator.py`
+- [x] T079 [US3] Add offline calibration contract tests in `tests/unit/test_training_memory_estimator.py`
   - Title: Separate historical calibration from online trial
   - Phase: New Phase 9
   - Priority: P1

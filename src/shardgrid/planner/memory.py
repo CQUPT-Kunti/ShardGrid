@@ -6,7 +6,8 @@ does not generate partition candidates or perform placement search.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -96,6 +97,107 @@ class StageMemoryFit:
     planner_required_bytes: int | None
     shortfall_bytes: int | None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CalibrationProvenance:
+    """Provenance for a historical offline CUDA calibration record.
+
+    Offline calibration records are prior measurements used only as correction
+    evidence for the metadata estimator. They must never trigger a per-job GPU
+    trial when a new job is submitted.
+    """
+
+    gpu_name: str
+    dtype: str
+    optimizer_type: str
+    model_family: str
+    batch_size: int
+    recorded_at: str
+    source: str = "offline-calibration"
+
+    def matches(
+        self,
+        *,
+        gpu_name: str,
+        dtype: str,
+        optimizer_type: str,
+        model_family: str,
+        batch_size: int,
+    ) -> bool:
+        return (
+            _normalize_gpu_name(self.gpu_name) == _normalize_gpu_name(gpu_name)
+            and normalize_dtype_name(self.dtype) == normalize_dtype_name(dtype)
+            and self.optimizer_type.strip().lower() == optimizer_type.strip().lower()
+            and self.model_family.strip().lower() == model_family.strip().lower()
+            and self.batch_size == batch_size
+        )
+
+
+def _normalize_gpu_name(value: str) -> str:
+    return "".join(value.strip().lower().split())
+
+
+def _is_stale_calibration(recorded_at: str, now: datetime | None) -> bool:
+    if now is None:
+        return False
+    try:
+        recorded = datetime.fromisoformat(recorded_at)
+    except ValueError:
+        return True
+    return recorded < now - timedelta(days=_CALIBRATION_MAX_AGE_DAYS)
+
+
+_CALIBRATION_MAX_AGE_DAYS = 30
+
+
+def apply_offline_calibration(
+    estimate: TrainingMemoryEstimate,
+    calibration: CalibrationProvenance | None,
+    *,
+    gpu_name: str,
+    dtype: str,
+    optimizer_type: str,
+    model_family: str,
+    batch_size: int,
+    measured_peak_bytes: int | None = None,
+    now: datetime | None = None,
+) -> TrainingMemoryEstimate:
+    """Apply a historical offline calibration record to an estimate.
+
+    Calibration is used only as offline correction evidence. When the record is
+    missing, stale, or mismatched against the current job metadata, the estimate
+    is returned unchanged (conservative) and no online per-job trial is started.
+    """
+    if calibration is None or measured_peak_bytes is None:
+        return estimate
+    if _is_stale_calibration(calibration.recorded_at, now):
+        return replace(
+            estimate,
+            notes=estimate.notes + ("CALIBRATION_STALE: ignored",),
+        )
+    if not calibration.matches(
+        gpu_name=gpu_name,
+        dtype=dtype,
+        optimizer_type=optimizer_type,
+        model_family=model_family,
+        batch_size=batch_size,
+    ):
+        return replace(
+            estimate,
+            notes=estimate.notes + ("CALIBRATION_MISMATCH: ignored",),
+        )
+    if estimate.estimated_peak_bytes is None:
+        return estimate
+    corrected_peak = max(estimate.estimated_peak_bytes, measured_peak_bytes)
+    return replace(
+        estimate,
+        estimated_peak_bytes=corrected_peak,
+        planner_required_bytes=corrected_peak + estimate.safety_headroom_bytes,
+        estimate_kind=EstimateKind.ESTIMATED,
+        source=calibration.source,
+        notes=estimate.notes + ("CALIBRATION_APPLIED: offline",),
+    )
 
 
 def normalize_dtype_name(dtype: Any) -> str | None:
