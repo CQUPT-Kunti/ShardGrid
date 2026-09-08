@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from shardgrid.common.config import ClusterConfig, TrainingConfig, load_training_config
-from shardgrid.common.enums import Health, PhysicalOS, RuntimeOS
+from shardgrid.common.enums import BackendStatus, Health, PhysicalOS, RuntimeOS
 from shardgrid.common.models import as_backend_name, as_engine_name, as_hostname, as_job_id
 from shardgrid.control.job_manager import (
     PROBE_INFRA_FAILURE,
@@ -24,6 +25,8 @@ from shardgrid.control.job_manager import (
     create_training_job,
 )
 from shardgrid.control.resource_manager import ResourceManager
+from shardgrid.engines.models import ParallelEngineCandidate
+from shardgrid.engines.selected import SelectedEngine
 from shardgrid.launchers.base import (
     LauncherOperation,
     LauncherResult,
@@ -31,6 +34,9 @@ from shardgrid.launchers.base import (
 )
 from shardgrid.planner.models import ExecutionPlan, MasterMetadata, WorkerAssignment
 from shardgrid.resources.models import NetworkLink, NetworkState, WorkerResource
+
+
+FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "ordinary_training_scripts"
 
 
 def _cluster_config(tmp_path: Path) -> ClusterConfig:
@@ -388,6 +394,114 @@ def test_candidate_identity_preserved_across_live_preflight(
         ("gpu4060", 0, "stage0"),
         ("gpu1060", 1, "stage1"),
     ]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "T076 expected-red: ordinary production run_entrypoint still calls "
+        "_select_memory_probe_candidate before formal training; T077 removes "
+        "that production admission dependency."
+    ),
+)
+def test_ordinary_production_admission_does_not_launch_per_job_gpu_trial_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _captured_plan("candidate-production")
+    fresh_worker_probes: list[str] = []
+    trial_probe_calls: list[str] = []
+    formal_calls: list[str] = []
+
+    def probe_worker(worker: object) -> object:
+        fresh_worker_probes.append(str(worker.worker_id))
+        resources = {
+            "gpu4060": _cluster_state().workers[0].resource,
+            "gpu1060": _cluster_state().workers[1].resource,
+        }
+        return SimpleNamespace(
+            worker_resource=resources[str(worker.worker_id)],
+            health=Health.HEALTHY,
+        )
+
+    def select_engine(engine_id, job, resources_state, network, *, registry=None):
+        del engine_id, resources_state, network, registry
+        return SelectedEngine(
+            job_id=job.job_id,
+            engine=SimpleNamespace(),
+            candidate=ParallelEngineCandidate(
+                engine_id="pytorch_pipeline",
+                name=as_engine_name("pytorch_pipeline"),
+                status=BackendStatus.AVAILABLE,
+            ),
+            parallel_plan=plan,
+            original_plan_path=plan.engine_plan_path,
+        )
+
+    manager = JobManager(
+        _cluster_config(tmp_path),
+        probe_worker=probe_worker,
+        probe_network=lambda worker_resources: _network_state(),
+        select_engine=select_engine,
+        source_root=Path(__file__).resolve().parents[2],
+    )
+
+    def build_plan(**kwargs):
+        del kwargs
+        manager._last_parallel_plan_candidates = (plan,)
+        return plan
+
+    def execution_plan(**kwargs) -> ExecutionPlan:
+        del kwargs
+        return ExecutionPlan(
+            job_id=as_job_id("job-production-no-trial"),
+            engine=as_engine_name("pytorch_pipeline"),
+            backend=as_backend_name("nccl"),
+            world_size=2,
+            master=MasterMetadata(address="10.87.5.155", port=31000),
+            workers=[
+                WorkerAssignment(worker_id="gpu4060", rank=0, stage="stage0"),
+                WorkerAssignment(worker_id="gpu1060", rank=1, stage="stage1"),
+            ],
+        )
+
+    def forbidden_probe(**kwargs):
+        del kwargs
+        trial_probe_calls.append("memory_probe")
+        raise AssertionError("production admission launched a per-job GPU trial probe")
+
+    monkeypatch.setattr(manager, "_build_automatic_parallel_plan", build_plan)
+    monkeypatch.setattr(manager, "_build_execution_plan", execution_plan)
+    monkeypatch.setattr(manager, "_persist_captured_runtime_artifacts", lambda **kwargs: None)
+    monkeypatch.setattr(manager, "_select_memory_probe_candidate", forbidden_probe)
+
+    def formal_execution(**kwargs):
+        del kwargs
+        formal_calls.append("formal")
+        return SimpleNamespace(status=SimpleNamespace(state="completed"))
+
+    monkeypatch.setattr(
+        manager,
+        "_execute_planned_job",
+        formal_execution,
+    )
+
+    result = manager.run_entrypoint(
+        SimpleNamespace(
+            entrypoint=FIXTURE_ROOT / "positional_tuple_train.py",
+            argv=("--epochs", "1", "--checkpoint", "out/tuple.pt"),
+            cwd=FIXTURE_ROOT,
+            environment={"SHARDGRID_TEST_CAPTURE": "1"},
+            cluster_config_path=str(tmp_path / "workers.yaml"),
+            dry_run=False,
+        ),
+        job_id=as_job_id("job-production-no-trial"),
+    )
+
+    assert fresh_worker_probes == ["gpu4060", "gpu1060"]
+    assert trial_probe_calls == []
+    assert formal_calls == ["formal"]
+    assert result.status.state == "completed"
 
 
 def test_candidate_identity_mismatch_rejected(tmp_path: Path) -> None:

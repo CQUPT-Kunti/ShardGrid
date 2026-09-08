@@ -1005,7 +1005,7 @@ T001-T065 completed historical implementation
     - Command: `$CONDA_PYTHON_EXE -m pytest tests/unit/test_training_memory_estimator.py tests/unit/test_joint_partition_placement.py tests/unit/test_model_profile_memory.py -q`
     - Result: `29 passed`
 
-- [ ] T076 [P] [US3] Add admission tests proving no per-job GPU trial launch in `tests/unit/test_memory_probe_launch.py`
+- [x] T076 [P] [US3] Add admission tests proving no per-job GPU trial launch in `tests/unit/test_memory_probe_launch.py`
   - Title: Fence real probe from production admission
   - Phase: New Phase 9
   - Priority: P0 BLOCKING
@@ -1015,6 +1015,15 @@ T001-T065 completed historical implementation
   - Implementation Notes: Historical calibration or explicit developer diagnostic probes may remain only outside production admission.
   - Tests: `pytest tests/unit/test_memory_probe_launch.py`
   - Acceptance Criteria: `PER_JOB_GPU_TRIAL_PROBE=0`.
+  - Gate Evidence:
+    - `TASK=T076`
+    - `PRODUCTION_ADMISSION_TRIAL_PROBE_CONTRACT=PASS`
+    - `PER_JOB_GPU_TRIAL_PROBE=0`
+    - `FRESH_GPU_RESOURCE_DISCOVERY_PRESERVED=true`
+    - `T077_STARTED=false`
+    - Expected xfail: ordinary production `run_entrypoint` still calls `_select_memory_probe_candidate` before formal training; T077 removes that dependency.
+    - Command: `$CONDA_PYTHON_EXE -m pytest tests/unit/test_memory_probe_launch.py -q`
+    - Result: `12 passed, 1 xfailed`
 
 - [ ] T077 [US3] Remove production memory-probe admission dependency in `src/shardgrid/control/job_manager.py`
   - Title: Admit from estimates and fresh resources
