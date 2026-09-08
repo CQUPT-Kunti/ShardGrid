@@ -151,6 +151,8 @@ def test_checkpoint_shards_preserve_original_parameter_state_dict_keys(tmp_path)
     )
 
     assert set(consolidated["state_dict"]) == set(case.module.state_dict())
+    loaded = torch.load(tmp_path / "model-state.pt", map_location="cpu", weights_only=False)
+    assert set(loaded) == set(case.module.state_dict())
     assert consolidated["schema_version"] == CHECKPOINT_SCHEMA_VERSION
     assert consolidated["graph_fingerprint"] == graph.graph_fingerprint
     assert consolidated["plan_id"] == "plan-test"
@@ -437,11 +439,11 @@ def test_consolidated_checkpoint_supports_strict_reload_for_plain_pytorch_model(
         expected_state_keys=tuple(source.module.state_dict()),
     )
     target = _ordinary_case("sequential")
-    load_result = target.module.load_state_dict(consolidated["state_dict"], strict=True)
+    loaded = torch.load(tmp_path / "model-state.pt", map_location="cpu", weights_only=False)
+    load_result = target.module.load_state_dict(loaded, strict=True)
 
     assert load_result.missing_keys == []
     assert load_result.unexpected_keys == []
-    loaded = torch.load(tmp_path / "model-state.pt", map_location="cpu", weights_only=False)
     assert set(loaded) == set(source.module.state_dict())
     file_load_result = target.module.load_state_dict(loaded, strict=True)
     assert file_load_result.missing_keys == []

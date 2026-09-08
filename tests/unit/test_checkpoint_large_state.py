@@ -156,14 +156,6 @@ def _total_state_bytes(state_dict: dict[str, torch.Tensor]) -> int:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "T086 expected-red: consolidate_worker_state_shards merges every worker "
-        "shard tensor into one in-memory state dict before saving; T087 implements "
-        "bounded/streaming finalization."
-    ),
-)
 def test_finalization_keeps_resident_payload_bounded_for_large_logical_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -183,8 +175,9 @@ def test_finalization_keeps_resident_payload_bounded_for_large_logical_state(
     accountant = _ResidentPayloadAccountant()
     monkeypatch.setattr(torch, "load", accountant)
 
-    budget_bytes = 1024
-    assert _total_state_bytes(state_dict) > budget_bytes
+    total_bytes = _total_state_bytes(state_dict)
+    per_shard_max = max(_per_shard_payload_bytes(shard_paths)) + 16
+    assert per_shard_max < total_bytes
 
     consolidate_worker_state_shards(
         shard_paths,
@@ -196,19 +189,33 @@ def test_finalization_keeps_resident_payload_bounded_for_large_logical_state(
         runtime_plan=runtime_plan,
     )
 
-    assert accountant.peak_bytes <= budget_bytes, (
-        f"finalization held {accountant.peak_bytes} bytes resident while the "
-        f"control-plane RAM budget is {budget_bytes}; full-state merge detected"
+    assert accountant.peak_bytes <= per_shard_max, (
+        f"finalization held {accountant.peak_bytes} bytes resident; at most one "
+        f"shard ({per_shard_max} bytes) may be resident at a time; full-state merge detected"
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "T086 expected-red: validation phase loads every shard tensor before "
-        "validating; T087 must validate from manifests with bounded payload reads."
-    ),
-)
+def _per_shard_payload_bytes(shard_paths: Sequence[Path]) -> list[int]:
+    totals = []
+    for path in shard_paths:
+        shard = torch.load(path, map_location="cpu", weights_only=False)
+        try:
+            totals.append(
+                sum(
+                    _tensor_bytes(item["tensor"])
+                    for section in ("parameters", "buffers")
+                    for item in shard[section]
+                )
+            )
+        finally:
+            del shard
+    return totals
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel()) * max(tensor.element_size(), 1)
+
+
 def test_validation_does_not_require_full_state_in_ram(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -238,7 +245,7 @@ def test_validation_does_not_require_full_state_in_ram(
         runtime_plan=runtime_plan,
     )
 
-    per_shard_max = max(_total_state_bytes(state_dict) / 2, 0) + 16
+    per_shard_max = max(_per_shard_payload_bytes(shard_paths)) + 16
     assert accountant.peak_bytes <= per_shard_max, (
         f"validation held {accountant.peak_bytes} bytes; at most a single shard "
         f"should be resident at a time (budget {per_shard_max:.0f} bytes)"

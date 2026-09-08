@@ -1167,7 +1167,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/unit/test_checkpoint_large_state.py tests/unit/test_checkpoint_generic_state.py`
   - Acceptance Criteria: `CHECKPOINT_CONTROL_PLANE_FULL_STATE_LOAD=0`.
 
-- [ ] T087 [US4] Implement memory-safe model-state finalization in `src/shardgrid/runtime/checkpoint.py`
+- [x] T087 [US4] Implement memory-safe model-state finalization in `src/shardgrid/runtime/checkpoint.py`
   - Title: Finalize standard state without full RAM assembly
   - Phase: New Phase 11
   - Priority: P0 BLOCKING

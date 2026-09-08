@@ -299,6 +299,7 @@ def test_checkpoint_shards_consolidate_complete_state_dict(tmp_path) -> None:
         shard_paths,
         tmp_path / "full-model-state-dict.pt",
         expected_state_keys=tuple(model.state_dict()),
+        load_state_dict=True,
     )
 
     assert set(consolidated["state_dict"]) == set(model.state_dict())
