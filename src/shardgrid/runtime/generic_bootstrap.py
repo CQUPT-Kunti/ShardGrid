@@ -118,7 +118,7 @@ def _run_training(
 ) -> dict[str, Any]:
     execution = _execution()
     parallel_plan = _load_parallel_plan()
-    graph, backend_graph, initial_state = _load_captured_runtime_artifacts()
+    graph, backend_graph = _load_captured_graph_artifacts()
     runtime_plan_path = _snapshot_root() / "plan" / "runtime-plan.json"
     if runtime_plan_path.is_file():
         runtime_plan = RuntimePlan.from_dict(
@@ -134,6 +134,7 @@ def _run_training(
         for worker in runtime_plan.ownership.workers
         if worker.worker_id == str(execution.workers[rank].worker_id)
     )
+    initial_state = _load_initial_state(_snapshot_root(), ownership=ownership)
     _materialize_owned_modules(
         backend_graph,
         graph,
@@ -417,7 +418,7 @@ def _save_checkpoint_shard(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _load_captured_runtime_artifacts() -> tuple[CanonicalGraphIR, Any, Mapping[str, Any]]:
+def _load_captured_graph_artifacts() -> tuple[CanonicalGraphIR, Any]:
     root = _snapshot_root()
     graph_path = root / "plan" / "captured-graph.json"
     if not graph_path.is_file():
@@ -429,16 +430,26 @@ def _load_captured_runtime_artifacts() -> tuple[CanonicalGraphIR, Any, Mapping[s
     if not backend_path.is_file():
         raise ValueError("CAPTURE_ARTIFACT_MISSING: plan/backend-graph.pt is required")
     backend_graph = torch.load(backend_path, map_location="cpu", weights_only=False)
+    return graph, backend_graph
+
+
+def _load_captured_runtime_artifacts() -> tuple[CanonicalGraphIR, Any, Mapping[str, Any]]:
+    graph, backend_graph = _load_captured_graph_artifacts()
+    root = _snapshot_root()
     initial_state = _load_initial_state(root)
     return graph, backend_graph, initial_state
 
 
-def _load_initial_state(root: Path) -> Mapping[str, Any]:
+def _load_initial_state(
+    root: Path,
+    ownership: Any = None,
+) -> Mapping[str, Any]:
     """Load the captured initial state from manifest-addressed shards.
 
     The state payload lives in per-owner bounded shards referenced by
-    ``state-manifest.json``.  Workers merge the shards they are allowed to
-    read; T084 restricts this to owned/read-only state ids only.
+    ``state-manifest.json``.  When an ownership spec is supplied, only the
+    shards that carry owned or explicitly allowed read-only state ids are
+    opened; non-owned mutable state is never materialized.
     """
     import torch
 
@@ -446,13 +457,34 @@ def _load_initial_state(root: Path) -> Mapping[str, Any]:
     shards_root = root / "plan" / "state-shards"
     if manifest_path.is_file() and shards_root.is_dir():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if ownership is None:
+            required_shards = {
+                str(entry["shard_ref"]) for entry in manifest
+            }
+        else:
+            allowed_state_ids = _owned_state_ids(ownership)
+            required_shards = {
+                str(entry["shard_ref"])
+                for entry in manifest
+                if str(entry["state_id"]) in allowed_state_ids
+            }
+        if not required_shards:
+            return {}
         merged: dict[str, Any] = {}
         for shard_path in sorted(shards_root.glob("*.pt")):
-            merged.update(
-                torch.load(shard_path, map_location="cpu", weights_only=False)
-            )
+            relative = f"state-shards/{shard_path.name}"
+            if relative not in required_shards:
+                continue
+            loaded = torch.load(shard_path, map_location="cpu", weights_only=False)
+            if ownership is not None:
+                loaded = {
+                    key: value
+                    for key, value in loaded.items()
+                    if key in allowed_state_ids
+                }
+            merged.update(loaded)
         covered = {str(entry["state_id"]) for entry in manifest}
-        if set(merged) != covered:
+        if set(merged) != covered and ownership is None:
             raise ValueError(
                 "CAPTURE_ARTIFACT_MISMATCH: state shards do not cover manifest "
                 f"(manifest={len(covered)}, shards={len(merged)})"
@@ -462,6 +494,18 @@ def _load_initial_state(root: Path) -> Mapping[str, Any]:
     if state_path.is_file():
         return torch.load(state_path, map_location="cpu", weights_only=False)
     return _legacy_backend_state(root)
+
+
+def _owned_state_ids(ownership: Any) -> set[str]:
+    """Compute the state ids this worker may load.
+
+    Owned state comes from the local parameter/buffer ids of the worker's
+    owned partitions; explicit read-only state ids are also allowed but never
+    count as owned mutable state.
+    """
+    return set(ownership.local_parameter_ids) | set(
+        ownership.local_buffer_ids
+    ) | set(ownership.read_only_state_ids)
 
 
 def _legacy_backend_state(root: Path) -> Mapping[str, Any]:
