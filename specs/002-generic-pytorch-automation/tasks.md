@@ -1156,7 +1156,7 @@ T001-T065 completed historical implementation
 
 **Purpose**: Preserve standard checkpoint semantics for large models and rerun hardware validation after architecture repair.
 
-- [ ] T086 [P] [US4] Add large-state checkpoint finalization tests in `tests/unit/test_checkpoint_large_state.py`
+- [x] T086 [P] [US4] Add large-state checkpoint finalization tests in `tests/unit/test_checkpoint_large_state.py`
   - Title: Prove checkpoint finalization is memory-safe
   - Phase: New Phase 11
   - Priority: P0 BLOCKING
