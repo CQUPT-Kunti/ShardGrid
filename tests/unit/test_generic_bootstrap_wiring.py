@@ -669,3 +669,152 @@ def test_captured_runtime_artifacts_are_persisted_for_bootstrap(tmp_path: Path) 
     backend = torch.load(plan_root / "backend-graph.pt", weights_only=False)
     assert backend is not None
     assert backend.state_dict()
+
+
+def _worker_state_shard_root(tmp_path: Path) -> Path:
+    root = tmp_path / "snapshot-root"
+    plan_root = root / "plan"
+    shards_root = plan_root / "state-shards"
+    shards_root.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"layers.0.weight": torch.zeros(4, 4), "layers.0.bias": torch.zeros(4)},
+        shards_root / "stage0.pt",
+    )
+    torch.save(
+        {"layers.1.weight": torch.zeros(4, 4), "layers.1.bias": torch.zeros(4)},
+        shards_root / "stage1.pt",
+    )
+    (plan_root / "state-manifest.json").write_text(
+        json.dumps(
+            [
+                {
+                    "state_id": "layers.0.weight",
+                    "kind": "parameter",
+                    "owner_stage": "stage0",
+                    "read_only_stages": [],
+                    "shard_ref": "state-shards/stage0.pt",
+                },
+                {
+                    "state_id": "layers.0.bias",
+                    "kind": "parameter",
+                    "owner_stage": "stage0",
+                    "read_only_stages": [],
+                    "shard_ref": "state-shards/stage0.pt",
+                },
+                {
+                    "state_id": "layers.1.weight",
+                    "kind": "parameter",
+                    "owner_stage": "stage1",
+                    "read_only_stages": [],
+                    "shard_ref": "state-shards/stage1.pt",
+                },
+                {
+                    "state_id": "layers.1.bias",
+                    "kind": "parameter",
+                    "owner_stage": "stage1",
+                    "read_only_stages": [],
+                    "shard_ref": "state-shards/stage1.pt",
+                },
+            ],
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "T083 expected-red: _load_initial_state merges all worker shards into "
+        "CPU before ownership selection; T084 restricts loading to owned and "
+        "explicit read-only state ids only."
+    ),
+)
+def test_worker_loads_only_owned_and_read_only_state_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shardgrid.runtime.generic_bootstrap as bootstrap
+
+    root = _worker_state_shard_root(tmp_path)
+    loaded_shards: list[str] = []
+    real_load = torch.load
+
+    def spy_load(path, *args, **kwargs):
+        loaded_shards.append(str(Path(path).name))
+        return real_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(bootstrap.torch, "load", spy_load)
+    monkeypatch.setenv("SHARDGRID_REMOTE_SNAPSHOT_ROOT", str(root))
+
+    state = bootstrap._load_initial_state(root / "plan")
+
+    assert set(state) == {"layers.0.weight", "layers.0.bias"}
+    assert loaded_shards == ["stage0.pt"], (
+        f"worker loaded non-owned shards: {loaded_shards}; "
+        "ownership must gate state payload load"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "T083 expected-red: ownership is resolved after full state payload load; "
+        "T084 resolves ownership before touching any state shard."
+    ),
+)
+def test_ownership_resolved_before_state_payload_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shardgrid.runtime.generic_bootstrap as bootstrap
+
+    root = _worker_state_shard_root(tmp_path)
+    shards_root = root / "plan" / "state-shards"
+    (root / "plan" / "runtime-plan.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "graph_fingerprint": "fp",
+                "logical": {
+                    "partitions": [
+                        {
+                            "partition_id": "stage0",
+                            "node_ids": ["n0"],
+                            "read_only_state_ids": [],
+                        },
+                        {
+                            "partition_id": "stage1",
+                            "node_ids": ["n1"],
+                            "read_only_state_ids": [],
+                        },
+                    ]
+                },
+                "placement": {"workers": []},
+                "ownership": {
+                    "workers": [
+                        {
+                            "worker_id": "worker-a",
+                            "owned_partitions": ["stage0"],
+                            "read_only_state_ids": [],
+                        }
+                    ]
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    order: list[str] = []
+    real_load = torch.load
+
+    def spy_load(path, *args, **kwargs):
+        order.append(str(Path(path).name))
+        return real_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(bootstrap.torch, "load", spy_load)
+
+    bootstrap._load_initial_state(root / "plan")
+
+    assert order == ["stage0.pt"], (
+        f"state shards loaded before ownership was resolved: {order}"
+    )
