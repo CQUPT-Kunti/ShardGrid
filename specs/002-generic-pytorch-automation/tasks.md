@@ -890,7 +890,7 @@ T001-T065 completed historical implementation
     - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_entrypoint_capture.py tests/integration/test_large_model_capture_safety.py -q`
     - Result: `15 passed`
 
-- [ ] T071 [US1] Add large-model dry-run planning fixtures in `tests/fixtures/ordinary_training_scripts/`
+- [x] T071 [US1] Add large-model dry-run planning fixtures in `tests/fixtures/ordinary_training_scripts/`
   - Title: Cover 30G 70G 100G declared model sizes
   - Phase: New Phase 8
   - Priority: P0 BLOCKING
@@ -900,6 +900,18 @@ T001-T065 completed historical implementation
   - Implementation Notes: Stress must not depend on giant CPU parameter serialization or artificial CUDA reserve buffers.
   - Tests: `pytest tests/integration/test_large_model_capture_safety.py`
   - Acceptance Criteria: `MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS`.
+  - Gate Evidence:
+    - `TASK=T071`
+    - `CONTROL_PLANE_RAM_BUDGET_GB=16`
+    - `DECLARED_MODEL_30G=PASS`
+    - `DECLARED_MODEL_70G=PASS`
+    - `DECLARED_MODEL_100G=PASS`
+    - `MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS`
+    - `GIANT_CPU_TENSOR_ALLOCATED=false`
+    - `DUMMY_CUDA_RESERVATION=false`
+    - `T072_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_large_model_capture_safety.py -q`
+    - Result: `5 passed`
 
 - [ ] T072 [US1] Add unsupported-safe-failure capture tests in `tests/integration/test_large_model_capture_safety.py`
   - Title: Fail closed on unsafe capture fallback

@@ -13,8 +13,8 @@ class LargeDeclaredStateModel(nn.Module):
         super().__init__()
         if declared_state_bytes <= 0:
             raise ValueError("declared_state_bytes must be positive")
-        elements = max(1, declared_state_bytes // torch.empty((), dtype=torch.float32).element_size())
-        self.weight = nn.Parameter(torch.empty(elements, dtype=torch.float32))
+        self.declared_state_bytes = declared_state_bytes
+        self.weight = nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.weight.reshape(-1)[0]

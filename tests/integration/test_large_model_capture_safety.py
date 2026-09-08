@@ -13,6 +13,11 @@ FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "ordinary_trai
 GB = 1024**3
 CONTROL_PLANE_RAM_BUDGET = 16 * GB
 DECLARED_STATE_BYTES = 30 * GB
+DECLARED_STATE_CASES = (
+    pytest.param(30 * GB, id="30G"),
+    pytest.param(70 * GB, id="70G"),
+    pytest.param(100 * GB, id="100G"),
+)
 
 
 class _StorageRequestRecorder:
@@ -80,3 +85,34 @@ def test_ordinary_entrypoint_planning_does_not_request_full_cpu_parameter_storag
 
     assert not getattr(result, "ok", True) is False
     assert recorder.oversize_requests == []
+
+
+@pytest.mark.parametrize("declared_state_bytes", DECLARED_STATE_CASES)
+def test_declared_state_larger_than_control_plane_ram_reaches_bounded_planning_capture(
+    declared_state_bytes: int,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorder = _StorageRequestRecorder(monkeypatch)
+    checkpoint_path = tmp_path / f"declared-{declared_state_bytes}.pt"
+
+    result = runner.capture_entrypoint(
+        FIXTURE_ROOT / "large_declared_state_train.py",
+        argv=("--checkpoint", str(checkpoint_path)),
+        cwd=FIXTURE_ROOT,
+        environment={
+            "SHARDGRID_DECLARED_STATE_BYTES": str(declared_state_bytes),
+            "SHARDGRID_CONTROL_PLANE_RAM_BUDGET_BYTES": str(CONTROL_PLANE_RAM_BUDGET),
+        },
+        dry_run=True,
+    )
+
+    assert not getattr(result, "ok", True) is False
+    assert declared_state_bytes > CONTROL_PLANE_RAM_BUDGET
+    assert recorder.oversize_requests == []
+    assert result.parameter_count == 1
+    assert result.graph_capture["backend"] == "shardgrid.metadata_declaration"
+    assert "BOUNDED_METADATA_CAPTURE_WITHOUT_REAL_CPU_EXECUTION" in result.graph_capture[
+        "diagnostics"
+    ]
+    assert not checkpoint_path.exists()
