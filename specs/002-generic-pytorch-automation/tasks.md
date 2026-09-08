@@ -1118,7 +1118,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/unit/test_generic_bootstrap_wiring.py`
   - Acceptance Criteria: `WORKER_FULL_MODEL_CPU_LOAD=0`.
 
-- [ ] T084 [US4] Implement owned-state-only runtime artifact loading in `src/shardgrid/runtime/generic_bootstrap.py`
+- [x] T084 [US4] Implement owned-state-only runtime artifact loading in `src/shardgrid/runtime/generic_bootstrap.py`
   - Title: Load state after ownership selection
   - Phase: New Phase 10
   - Priority: P0 BLOCKING
