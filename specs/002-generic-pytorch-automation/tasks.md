@@ -847,7 +847,7 @@ T001-T065 completed historical implementation
     - Expected xfail reason: current dry-run capture enters real `nn.Module.__call__` and runs autograd backward on CPU before planning; T070 must replace this with bounded metadata capture.
     - Passing evidence: dry-run capture currently suppresses the real optimizer parameter update, so optimizer mutation remains zero while forward/backward violations are explicitly captured.
 
-- [ ] T069 [US1] Implement metadata-first model/state capture in `src/shardgrid/bootstrap/runner.py`
+- [x] T069 [US1] Implement metadata-first model/state capture in `src/shardgrid/bootstrap/runner.py`
   - Title: Avoid full control-plane state materialization
   - Phase: New Phase 8
   - Priority: P0 BLOCKING
@@ -857,6 +857,17 @@ T001-T065 completed historical implementation
   - Implementation Notes: Fail closed when safe metadata capture is impossible. Do not require user-side ShardGrid protocols.
   - Tests: `pytest tests/integration/test_large_model_capture_safety.py tests/integration/test_entrypoint_capture.py`
   - Acceptance Criteria: Larger-than-control-plane model planning reaches graph/state metadata or a precise unsupported failure without full model materialization.
+  - Gate Evidence:
+    - `TASK=T069`
+    - `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`
+    - `METADATA_FIRST_MODEL_STATE_CAPTURE=PASS`
+    - `ORDINARY_PYTORCH_USER_API_PRESERVED=true`
+    - `FULL_MODEL_THEN_META_CONVERSION=false`
+    - `UNSAFE_FULL_MATERIALIZATION_FALLBACK=false`
+    - `T070_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_large_model_capture_safety.py tests/integration/test_entrypoint_capture.py -q`
+    - Result: `14 passed, 1 xfailed`
+    - Remaining expected xfail: T068/T070 CPU forward/backward capture execution constraint, not part of T069 materialization fix.
 
 - [ ] T070 [US2] Replace capture-time real CPU training with bounded metadata capture in `src/shardgrid/bootstrap/runner.py`
   - Title: Stop CPU forward/backward planning prerequisite

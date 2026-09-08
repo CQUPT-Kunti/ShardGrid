@@ -540,10 +540,12 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
     original_cuda_amp_autocast = torch.cuda.amp.autocast
     original_amp_grad_scaler_init = torch.amp.GradScaler.__init__
     original_cuda_amp_grad_scaler_init = torch.cuda.amp.GradScaler.__init__
+    original_torch_empty = torch.empty
     optimizer_step_methods = {
         cls: cls.step
         for cls in (Optimizer, torch.optim.SGD, torch.optim.Adam, torch.optim.AdamW)
     }
+    control_plane_ram_budget = _control_plane_ram_budget_bytes()
 
     def module_call(module: nn.Module, *args: Any, **kwargs: Any) -> Any:
         output = original_module_call(module, *args, **kwargs)
@@ -622,6 +624,18 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
         state.amp_scaler_observed = True
         original_cuda_amp_grad_scaler_init(scaler, *args, **kwargs)
 
+    def bounded_empty(*size: Any, **kwargs: Any) -> Any:
+        requested_bytes = _requested_tensor_storage_bytes(
+            size,
+            dtype=kwargs.get("dtype"),
+            original_empty=original_torch_empty,
+        )
+        if dry_run and control_plane_ram_budget and requested_bytes > control_plane_ram_budget:
+            bounded_kwargs = dict(kwargs)
+            bounded_kwargs.pop("device", None)
+            return original_torch_empty((1,), **bounded_kwargs)
+        return original_torch_empty(*size, **kwargs)
+
     nn.Module.__call__ = module_call
     torch.utils.data.DataLoader.__iter__ = dataloader_iter
     Optimizer.__init__ = optimizer_init
@@ -635,6 +649,7 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
     torch.cuda.amp.autocast = cuda_amp_autocast
     torch.amp.GradScaler.__init__ = amp_grad_scaler_init
     torch.cuda.amp.GradScaler.__init__ = cuda_amp_grad_scaler_init
+    torch.empty = bounded_empty
     try:
         yield
     finally:
@@ -651,6 +666,43 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
         torch.cuda.amp.autocast = original_cuda_amp_autocast
         torch.amp.GradScaler.__init__ = original_amp_grad_scaler_init
         torch.cuda.amp.GradScaler.__init__ = original_cuda_amp_grad_scaler_init
+        torch.empty = original_torch_empty
+
+
+def _control_plane_ram_budget_bytes() -> int | None:
+    value = os.environ.get("SHARDGRID_CONTROL_PLANE_RAM_BUDGET_BYTES")
+    if value is None:
+        return None
+    try:
+        budget = int(value)
+    except ValueError:
+        return None
+    return budget if budget > 0 else None
+
+
+def _requested_tensor_storage_bytes(
+    size: tuple[Any, ...],
+    *,
+    dtype: Any,
+    original_empty: Any,
+) -> int:
+    import torch
+
+    dims: tuple[Any, ...]
+    if len(size) == 1 and isinstance(size[0], (tuple, list)):
+        dims = tuple(size[0])
+    else:
+        dims = size
+    numel = 1
+    for dim in dims:
+        if dim == ():
+            continue
+        try:
+            numel *= int(dim)
+        except (TypeError, ValueError):
+            return 0
+    tensor_dtype = dtype or torch.float32
+    return numel * original_empty((), dtype=tensor_dtype).element_size()
 
 
 class _CaptureIterator:

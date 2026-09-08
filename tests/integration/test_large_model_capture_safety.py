@@ -61,14 +61,6 @@ def test_materialization_detection_harness_prevents_real_large_cpu_allocation(
     assert recorder.oversize_requests[-1] >= DECLARED_STATE_BYTES
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "T067 expected-red: current ordinary entrypoint capture executes user model "
-        "construction and requests complete CPU Parameter storage before planning; "
-        "T069 must remove this full-materialization prerequisite."
-    ),
-)
 def test_ordinary_entrypoint_planning_does_not_request_full_cpu_parameter_storage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
