@@ -10,18 +10,19 @@
 
 Each task starts with the required checklist line. Detailed metadata under each task is part of the task contract.
 
+## Historical Boundary
+
+T001-T065 are completed historical implementation and remain frozen. Do not renumber, reopen, or rewrite those task definitions. The previous T066 attempt is blocked and replaced by the new T066+ route below.
+
 ## Critical Path
 
 ```text
-T001-T008 regression baseline
-  -> T009-T021 planner semantic repair
-  -> T022-T027 production model decoupling
-  -> T028-T037 entrypoint capture
-  -> T038-T044 exact generic runtime
-  -> T045-T051 generic checkpoint
-  -> T052-T060 failure taxonomy and stress validation
-  -> T061-T066 real hardware acceptance
-  -> T067-T070 final acceptance/deprecation gates
+T001-T065 completed historical implementation
+  -> T066-T073 large-model capture/materialization safety
+  -> T074-T080 estimator-based admission
+  -> T081-T085 graph/state artifact and worker owned-state safety
+  -> T086-T089 large checkpoint finalization
+  -> T090 final corrected hardware and feature acceptance gate
 ```
 
 ## Phase 0: Characterization / Regression Safety
@@ -776,167 +777,432 @@ T001-T008 regression baseline
   - Tests: `pytest tests/multi_host/test_generic_multi_job_sharing.py`
   - Acceptance Criteria: `MULTI_JOB_GPU_SHARING=PASS`.
 
-- [ ] T066 [US4] Add low-memory packing stress acceptance in `tests/multi_host/test_generic_stress_packing.py`
-  - Title: Validate 4G to 512M stress bands
-  - Phase: Phase 7
-  - Priority: P2
+- [x] T066 [US5] Record previous T066 blocked architecture evidence in `specs/002-generic-pytorch-automation/tasks.md`
+  - Title: Preserve blocked stress baseline
+  - Phase: New Phase 8
+  - Priority: P0 BLOCKING
   - Depends on: T065
-  - Files: `tests/multi_host/test_generic_stress_packing.py`, `scripts/stress_dynamic_gpu_multi_job.py`
-  - Goal: Run 4G, 3G, 2G, 1G, and 512M packing/saturation after lower layers pass.
-  - Implementation Notes: Require structured proof for saturation and cleanup.
-  - Tests: `pytest tests/multi_host/test_generic_stress_packing.py`
-  - Acceptance Criteria: `MEMORY_PACKING_STRESS=PASS` or structured `SATURATION_NOT_PROVEN`/`SEARCH_BUDGET_LIMIT`.
+  - Files: `specs/002-generic-pytorch-automation/tasks.md`, `tests/multi_host/test_generic_stress_packing.py`
+  - Goal: Explicitly record `PREVIOUS_T066=BLOCKED` and the CPU serialization/backend artifact bottleneck before new implementation begins.
+  - Implementation Notes: Do not mark the old hardware stress as PASS. Do not run hardware tests in this task.
+  - Tests: documentation consistency check plus `git diff -- specs/002-generic-pytorch-automation/tasks.md`
+  - Acceptance Criteria: Old T066 failure is preserved and new T066+ task route starts without duplicate IDs.
+  - Gate Evidence:
+    - `TASK=T066`
+    - `PREVIOUS_T066=BLOCKED`
+    - `OLD_HARDWARE_STRESS_PASS=false`
+    - `MEMORY_PACKING_STRESS=NOT_RUN_TO_COMPLETION`
+    - `GPU_MEMORY_SATURATION=NOT_PROVEN`
+    - `FORMAL_TRAINING_OOM_COUNT=UNKNOWN`
+    - `NEW_T066_ROUTE_RECORDED=true`
+    - `T067_STARTED=false`
+    - Observed previous state: first `MEM_4G` job stalled at `state=snapshotting`, `phase=plan`; memory probe did not complete, formal training did not start, and `execution-plan.json` was not written.
+    - Observed artifact bottleneck: `backend-graph.pt` was approximately 1.3 GB, so CPU serialization/backend artifact transfer became the bottleneck before GPU memory packing could be validated.
+    - Current old stress fixture status: `tests/multi_host/test_generic_stress_packing.py` still contains parameter-heavy `MEM_4G`/`MEM_3G`/`MEM_2G`/`MEM_1G`/`MEM_512M` bands and describes real one-batch memory probe as part of the old automatic path; this remains historical evidence and is not accepted as the corrected stress design.
 
-## Phase 8: Compatibility Deprecation / Final Acceptance
+## New Phase 8: Large-Model Capture And Planning Safety
 
-**Purpose**: Keep old validation assets, deprecate production model-specific paths only after generic gates pass, and prove final user outcomes.
+**Purpose**: Remove full control-plane model materialization and real CPU training execution from planning prerequisites.
 
-- [ ] T067 [US4] Add compatibility regression gate for existing examples in `tests/integration/test_legacy_example_compatibility.py`
-  - Title: Keep legacy examples runnable
-  - Phase: Phase 8
+- [ ] T067 [P] [US1] Add full-control-plane-model materialization regression tests in `tests/integration/test_large_model_capture_safety.py`
+  - Title: Prove planning starts without full CPU model
+  - Phase: New Phase 8
+  - Priority: P0 BLOCKING
+  - Depends on: T066
+  - Files: `tests/integration/test_large_model_capture_safety.py`, `tests/fixtures/ordinary_training_scripts/`
+  - Goal: Create ordinary PyTorch entrypoint fixtures that declare model states larger than a configured control-plane RAM limit without requiring complete real CPU parameter materialization.
+  - Implementation Notes: Use normal user training scripts. Do not add ShardGrid user-facing model-provider APIs.
+  - Tests: `pytest tests/integration/test_large_model_capture_safety.py`
+  - Acceptance Criteria: Regression tests fail on current full-materialization behavior and define `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`.
+
+- [ ] T068 [P] [US2] Add no-real-CPU-capture-execution tests in `tests/integration/test_entrypoint_capture.py`
+  - Title: Prove capture does not train on CPU
+  - Phase: New Phase 8
+  - Priority: P0 BLOCKING
+  - Depends on: T066
+  - Files: `tests/integration/test_entrypoint_capture.py`, `tests/fixtures/ordinary_training_scripts/`
+  - Goal: Assert supported dry-run capture does not perform a full real CPU forward, backward, or optimizer step before planning.
+  - Implementation Notes: Use counters or deterministic side-effect evidence inside ordinary fixtures; fail closed for unsupported behavior.
+  - Tests: `pytest tests/integration/test_entrypoint_capture.py`
+  - Acceptance Criteria: `CPU_REAL_FORWARD_BEFORE_PLAN=0`, `CPU_REAL_BACKWARD_BEFORE_PLAN=0`, and `CPU_REAL_OPTIMIZER_STEP_BEFORE_PLAN=0` are enforceable.
+
+- [ ] T069 [US1] Implement metadata-first model/state capture in `src/shardgrid/bootstrap/runner.py`
+  - Title: Avoid full control-plane state materialization
+  - Phase: New Phase 8
+  - Priority: P0 BLOCKING
+  - Depends on: T067, T068
+  - Files: `src/shardgrid/bootstrap/runner.py`, `src/shardgrid/planner/generic_graph.py`, `tests/integration/test_large_model_capture_safety.py`
+  - Goal: Capture graph/state metadata for representable ordinary entrypoints without constructing the complete real model state on the control plane.
+  - Implementation Notes: Fail closed when safe metadata capture is impossible. Do not require user-side ShardGrid protocols.
+  - Tests: `pytest tests/integration/test_large_model_capture_safety.py tests/integration/test_entrypoint_capture.py`
+  - Acceptance Criteria: Larger-than-control-plane model planning reaches graph/state metadata or a precise unsupported failure without full model materialization.
+
+- [ ] T070 [US2] Replace capture-time real CPU training with bounded metadata capture in `src/shardgrid/bootstrap/runner.py`
+  - Title: Stop CPU forward/backward planning prerequisite
+  - Phase: New Phase 8
+  - Priority: P0 BLOCKING
+  - Depends on: T069
+  - Files: `src/shardgrid/bootstrap/runner.py`, `tests/integration/test_entrypoint_capture.py`
+  - Goal: Remove real CPU forward/backward/optimizer execution from the dry-run planning path.
+  - Implementation Notes: Preserve lifecycle metadata and fail with structured diagnostics when unsupported.
+  - Tests: `pytest tests/integration/test_entrypoint_capture.py tests/integration/test_large_model_capture_safety.py`
+  - Acceptance Criteria: No full real CPU training action is needed before planning for supported fixtures.
+
+- [ ] T071 [US1] Add large-model dry-run planning fixtures in `tests/fixtures/ordinary_training_scripts/`
+  - Title: Cover 30G 70G 100G declared model sizes
+  - Phase: New Phase 8
+  - Priority: P0 BLOCKING
+  - Depends on: T069
+  - Files: `tests/fixtures/ordinary_training_scripts/`, `tests/integration/test_large_model_capture_safety.py`
+  - Goal: Validate planning behavior for model states declared at 30 GB, 70 GB, and 100 GB under a 16 GB control-plane RAM budget.
+  - Implementation Notes: Stress must not depend on giant CPU parameter serialization or artificial CUDA reserve buffers.
+  - Tests: `pytest tests/integration/test_large_model_capture_safety.py`
+  - Acceptance Criteria: `MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS`.
+
+- [ ] T072 [US1] Add unsupported-safe-failure capture tests in `tests/integration/test_large_model_capture_safety.py`
+  - Title: Fail closed on unsafe capture fallback
+  - Phase: New Phase 8
   - Priority: P1
-  - Depends on: T060
-  - Files: `tests/integration/test_legacy_example_compatibility.py`, `examples/models/train_generic_dag.py`, `examples/models/train_automatic_plan.py`, `examples/models/generic_partition_zoo/models.py`
-  - Goal: Prove zoo/generic DAG/automatic examples remain validation assets.
-  - Implementation Notes: Do not restore production dependency on zoo builders.
-  - Tests: `pytest tests/integration/test_legacy_example_compatibility.py`
-  - Acceptance Criteria: `LEGACY_VALIDATION_ASSETS=PASS`.
+  - Depends on: T070
+  - Files: `tests/integration/test_large_model_capture_safety.py`, `src/shardgrid/bootstrap/runner.py`
+  - Goal: Prove ShardGrid reports precise unsupported reasons rather than falling back to full materialization or real CPU training.
+  - Implementation Notes: Cover dynamic control flow, custom op, optimizer mutation, and missing metadata examples where practical.
+  - Tests: `pytest tests/integration/test_large_model_capture_safety.py`
+  - Acceptance Criteria: Unsupported capture produces structured failures before mutation.
 
-- [ ] T068 [US4] Add production dependency scanner in `tests/unit/test_no_production_zoo_dependency.py`
-  - Title: Enforce no production zoo dependency
-  - Phase: Phase 8
+- [ ] T073 Run New Phase 8 capture/planning safety gate in `specs/002-generic-pytorch-automation/tasks.md`
+  - Title: Gate large-model metadata-first planning
+  - Phase: New Phase 8
   - Priority: P0 BLOCKING
-  - Depends on: T027, T048
-  - Files: `tests/unit/test_no_production_zoo_dependency.py`, `src/shardgrid/control/job_manager.py`, `src/shardgrid/runtime/`, `src/shardgrid/planner/`
-  - Goal: Fail if production planner/runtime/checkpoint imports zoo builders or branches on model catalog names.
-  - Implementation Notes: Permit references under `examples/`, `tests/`, and explicit compatibility paths only.
-  - Tests: `pytest tests/unit/test_no_production_zoo_dependency.py`
-  - Acceptance Criteria: `PRODUCTION_ZOO_DEPENDENCY=0` remains enforced.
+  - Depends on: T067, T068, T069, T070, T071, T072
+  - Files: `tests/integration/test_large_model_capture_safety.py`, `tests/integration/test_entrypoint_capture.py`, `specs/002-generic-pytorch-automation/tasks.md`
+  - Goal: Establish `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`, `CPU_REAL_FORWARD_BEFORE_PLAN=0`, `CPU_REAL_BACKWARD_BEFORE_PLAN=0`, and `MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS`.
+  - Implementation Notes: Record real command output in this file. Do not run hardware stress.
+  - Tests: `pytest tests/integration/test_large_model_capture_safety.py tests/integration/test_entrypoint_capture.py`
+  - Acceptance Criteria: New Phase 8 gate is PASS with no unexplained xfail.
 
-- [ ] T069 [US1] Add three-project final acceptance suite in `tests/integration/test_generic_industrial_entrypoints.py`
-  - Title: Validate three ordinary PyTorch projects
-  - Phase: Phase 8
-  - Priority: P0 BLOCKING
-  - Depends on: T037, T051, T060
-  - Files: `tests/integration/test_generic_industrial_entrypoints.py`, `tests/fixtures/ordinary_training_scripts/`
-  - Goal: Verify Project A, Project B, and Project C launch through `shardgrid run` with no ShardGrid-specific model provider, stage, model branch, or manual sample input.
-  - Implementation Notes: Include structured inputs and at least three model structures.
-  - Tests: `pytest tests/integration/test_generic_industrial_entrypoints.py`
-  - Acceptance Criteria: `INDUSTRIAL_ENTRYPOINTS=PASS`.
+## New Phase 9: Estimator-Based Admission
 
-- [ ] T070 Run final feature acceptance commands and record release readiness in `specs/002-generic-pytorch-automation/tasks.md`
-  - Title: Final feature gate
-  - Phase: Phase 8
+**Purpose**: Replace production per-job GPU trial admission with conservative estimates plus fresh resource snapshots.
+
+- [ ] T074 [P] [US3] Add memory-estimator coverage tests in `tests/unit/test_training_memory_estimator.py`
+  - Title: Cover training-memory components
+  - Phase: New Phase 9
   - Priority: P0 BLOCKING
-  - Depends on: T061, T062, T063, T064, T065, T066, T067, T068, T069
-  - Files: `tests/unit/`, `tests/integration/`, `tests/multi_host/`, `tests/hardware/`
-  - Goal: Establish all final acceptance signals.
-  - Implementation Notes: Hardware commands are opt-in and must run after CPU/local gates.
+  - Depends on: T073
+  - Files: `tests/unit/test_training_memory_estimator.py`, `src/shardgrid/planner/memory.py`
+  - Goal: Assert estimates account for parameters, buffers, gradients, optimizer state, activations, liveness, saved tensors, workspace, communication buffers, dtype, batch/input shape, and shared/tied state.
+  - Implementation Notes: Use conservative characterization where exact values are not possible.
+  - Tests: `pytest tests/unit/test_training_memory_estimator.py tests/unit/test_model_profile_memory.py`
+  - Acceptance Criteria: `MODEL_MEMORY_ESTIMATED_BEFORE_MATERIALIZATION=PASS`.
+
+- [ ] T075 [US3] Implement pre-materialization training memory estimator in `src/shardgrid/planner/memory.py`
+  - Title: Estimate before materialization
+  - Phase: New Phase 9
+  - Priority: P0 BLOCKING
+  - Depends on: T074
+  - Files: `src/shardgrid/planner/memory.py`, `tests/unit/test_training_memory_estimator.py`
+  - Goal: Produce conservative partition/job memory estimates from metadata before formal materialization.
+  - Implementation Notes: Do not run a model on CPU or GPU to obtain required admission data.
+  - Tests: `pytest tests/unit/test_training_memory_estimator.py tests/unit/test_joint_partition_placement.py`
+  - Acceptance Criteria: Estimates are available for placement without full model materialization.
+
+- [ ] T076 [P] [US3] Add admission tests proving no per-job GPU trial launch in `tests/unit/test_memory_probe_launch.py`
+  - Title: Fence real probe from production admission
+  - Phase: New Phase 9
+  - Priority: P0 BLOCKING
+  - Depends on: T073
+  - Files: `tests/unit/test_memory_probe_launch.py`, `src/shardgrid/control/job_manager.py`
+  - Goal: Fail if ordinary production admission launches runtime with forward/backward/optimizer probe before formal training.
+  - Implementation Notes: Historical calibration or explicit developer diagnostic probes may remain only outside production admission.
+  - Tests: `pytest tests/unit/test_memory_probe_launch.py`
+  - Acceptance Criteria: `PER_JOB_GPU_TRIAL_PROBE=0`.
+
+- [ ] T077 [US3] Remove production memory-probe admission dependency in `src/shardgrid/control/job_manager.py`
+  - Title: Admit from estimates and fresh resources
+  - Phase: New Phase 9
+  - Priority: P0 BLOCKING
+  - Depends on: T075, T076
+  - Files: `src/shardgrid/control/job_manager.py`, `src/shardgrid/planner/placement.py`, `tests/unit/test_memory_probe_launch.py`
+  - Goal: Route ordinary production entrypoints through estimate-based admission and keep per-job GPU trial execution out of the production path.
+  - Implementation Notes: Preserve resource refresh and formal OOM classification. Do not remove optional historical calibration records if they are offline only.
+  - Tests: `pytest tests/unit/test_memory_probe_launch.py tests/unit/test_joint_partition_placement.py`
+  - Acceptance Criteria: Production admission records no GPU trial execution and still rejects infeasible plans safely.
+
+- [ ] T078 [US3] Add fresh-free-VRAM admission regression tests in `tests/integration/test_generic_resource_discovery.py`
+  - Title: Preserve fresh resource discovery
+  - Phase: New Phase 9
+  - Priority: P0 BLOCKING
+  - Depends on: T077
+  - Files: `tests/integration/test_generic_resource_discovery.py`, `src/shardgrid/control/resource_manager.py`, `src/shardgrid/planner/placement.py`
+  - Goal: Prove estimate-based admission still uses current host reachability, GPU health, total memory, used memory, and free memory for each job.
+  - Implementation Notes: Do not regress to static GPU totals.
+  - Tests: `pytest tests/integration/test_generic_resource_discovery.py tests/unit/test_joint_partition_placement.py`
+  - Acceptance Criteria: `PLACEMENT_USES_FRESH_FREE_VRAM=PASS`.
+
+- [ ] T079 [US3] Add offline calibration contract tests in `tests/unit/test_training_memory_estimator.py`
+  - Title: Separate historical calibration from online trial
+  - Phase: New Phase 9
+  - Priority: P1
+  - Depends on: T075
+  - Files: `tests/unit/test_training_memory_estimator.py`, `src/shardgrid/planner/memory.py`
+  - Goal: Allow historical calibration records to adjust estimates only when provenance is recorded and no per-job trial launches.
+  - Implementation Notes: Stale or mismatched calibration must not silently admit unsafe jobs.
+  - Tests: `pytest tests/unit/test_training_memory_estimator.py`
+  - Acceptance Criteria: Calibration is offline evidence, not production trial execution.
+
+- [ ] T080 Run New Phase 9 admission gate in `specs/002-generic-pytorch-automation/tasks.md`
+  - Title: Gate estimator-based admission
+  - Phase: New Phase 9
+  - Priority: P0 BLOCKING
+  - Depends on: T074, T075, T076, T077, T078, T079
+  - Files: `tests/unit/test_training_memory_estimator.py`, `tests/unit/test_memory_probe_launch.py`, `tests/integration/test_generic_resource_discovery.py`, `specs/002-generic-pytorch-automation/tasks.md`
+  - Goal: Establish `MODEL_MEMORY_ESTIMATED_BEFORE_MATERIALIZATION=PASS`, `PLACEMENT_USES_FRESH_FREE_VRAM=PASS`, and `PER_JOB_GPU_TRIAL_PROBE=0`.
+  - Implementation Notes: Record real command output in this file.
+  - Tests: `pytest tests/unit/test_training_memory_estimator.py tests/unit/test_memory_probe_launch.py tests/integration/test_generic_resource_discovery.py`
+  - Acceptance Criteria: New Phase 9 gate is PASS.
+
+## New Phase 10: Artifact And Worker Owned-State Safety
+
+**Purpose**: Stop backend graph artifacts and worker startup from carrying or loading the full model state.
+
+- [ ] T081 [P] [US4] Add backend artifact payload regression tests in `tests/unit/test_runtime_artifact_payloads.py`
+  - Title: Prove backend graph is metadata-bounded
+  - Phase: New Phase 10
+  - Priority: P0 BLOCKING
+  - Depends on: T073
+  - Files: `tests/unit/test_runtime_artifact_payloads.py`, `src/shardgrid/control/job_manager.py`, `src/shardgrid/runtime/generic_bootstrap.py`
+  - Goal: Fail if backend graph artifacts embed full real parameter or buffer payloads.
+  - Implementation Notes: Include large declared state cases and artifact-size evidence.
+  - Tests: `pytest tests/unit/test_runtime_artifact_payloads.py`
+  - Acceptance Criteria: `BACKEND_GRAPH_FULL_PARAMETER_PAYLOAD=0`.
+
+- [ ] T082 [US4] Split graph metadata from state payload artifacts in `src/shardgrid/control/job_manager.py`
+  - Title: Persist bounded runtime artifacts
+  - Phase: New Phase 10
+  - Priority: P0 BLOCKING
+  - Depends on: T081
+  - Files: `src/shardgrid/control/job_manager.py`, `src/shardgrid/artifacts/snapshot.py`, `tests/unit/test_runtime_artifact_payloads.py`
+  - Goal: Persist backend graph/code/metadata separately from state payload manifests and owned shards.
+  - Implementation Notes: Do not serialize full parameter storage inside backend graph artifacts.
+  - Tests: `pytest tests/unit/test_runtime_artifact_payloads.py tests/integration/test_code_snapshot.py`
+  - Acceptance Criteria: Backend graph size is bounded by metadata and not total model state.
+
+- [ ] T083 [P] [US4] Add worker full-state-load regression tests in `tests/unit/test_generic_bootstrap_wiring.py`
+  - Title: Prove workers load owned state only
+  - Phase: New Phase 10
+  - Priority: P0 BLOCKING
+  - Depends on: T081
+  - Files: `tests/unit/test_generic_bootstrap_wiring.py`, `src/shardgrid/runtime/generic_bootstrap.py`
+  - Goal: Fail if generic bootstrap deserializes a full model state or full backend graph before ownership is applied.
+  - Implementation Notes: Tests must distinguish graph metadata load from state payload load.
+  - Tests: `pytest tests/unit/test_generic_bootstrap_wiring.py`
+  - Acceptance Criteria: `WORKER_FULL_MODEL_CPU_LOAD=0`.
+
+- [ ] T084 [US4] Implement owned-state-only runtime artifact loading in `src/shardgrid/runtime/generic_bootstrap.py`
+  - Title: Load state after ownership selection
+  - Phase: New Phase 10
+  - Priority: P0 BLOCKING
+  - Depends on: T082, T083
+  - Files: `src/shardgrid/runtime/generic_bootstrap.py`, `src/shardgrid/runtime/dag.py`, `tests/unit/test_generic_bootstrap_wiring.py`
+  - Goal: Make workers load only assigned owned or explicitly read-only state payloads.
+  - Implementation Notes: Preserve exact plan checks; do not re-place or repartition on workers.
+  - Tests: `pytest tests/unit/test_generic_bootstrap_wiring.py tests/unit/test_runtime_exact_plan.py`
+  - Acceptance Criteria: `WORKER_OWNED_STATE_ONLY=PASS` and exact plan execution remains PASS.
+
+- [ ] T085 Run New Phase 10 artifact/runtime gate in `specs/002-generic-pytorch-automation/tasks.md`
+  - Title: Gate metadata-bounded artifacts
+  - Phase: New Phase 10
+  - Priority: P0 BLOCKING
+  - Depends on: T081, T082, T083, T084
+  - Files: `tests/unit/test_runtime_artifact_payloads.py`, `tests/unit/test_generic_bootstrap_wiring.py`, `tests/unit/test_runtime_exact_plan.py`, `specs/002-generic-pytorch-automation/tasks.md`
+  - Goal: Establish `BACKEND_GRAPH_FULL_PARAMETER_PAYLOAD=0`, `WORKER_FULL_MODEL_CPU_LOAD=0`, `WORKER_OWNED_STATE_ONLY=PASS`, and `EXACT_PLAN_EXECUTION=PASS`.
+  - Implementation Notes: Record real command output in this file.
+  - Tests: `pytest tests/unit/test_runtime_artifact_payloads.py tests/unit/test_generic_bootstrap_wiring.py tests/unit/test_runtime_exact_plan.py`
+  - Acceptance Criteria: New Phase 10 gate is PASS.
+
+## New Phase 11: Large Checkpoint And Corrected Hardware Acceptance
+
+**Purpose**: Preserve standard checkpoint semantics for large models and rerun hardware validation after architecture repair.
+
+- [ ] T086 [P] [US4] Add large-state checkpoint finalization tests in `tests/unit/test_checkpoint_large_state.py`
+  - Title: Prove checkpoint finalization is memory-safe
+  - Phase: New Phase 11
+  - Priority: P0 BLOCKING
+  - Depends on: T085
+  - Files: `tests/unit/test_checkpoint_large_state.py`, `src/shardgrid/runtime/checkpoint.py`
+  - Goal: Fail if checkpoint finalization must load all shard tensors into control-plane memory at once.
+  - Implementation Notes: Preserve standard model-state compatibility and existing strict reload semantics.
+  - Tests: `pytest tests/unit/test_checkpoint_large_state.py tests/unit/test_checkpoint_generic_state.py`
+  - Acceptance Criteria: `CHECKPOINT_CONTROL_PLANE_FULL_STATE_LOAD=0`.
+
+- [ ] T087 [US4] Implement memory-safe model-state finalization in `src/shardgrid/runtime/checkpoint.py`
+  - Title: Finalize standard state without full RAM assembly
+  - Phase: New Phase 11
+  - Priority: P0 BLOCKING
+  - Depends on: T086
+  - Files: `src/shardgrid/runtime/checkpoint.py`, `src/shardgrid/control/job_manager.py`, `tests/unit/test_checkpoint_large_state.py`
+  - Goal: Validate and assemble standard model-state output through bounded or streaming shard handling.
+  - Implementation Notes: Do not reintroduce model-name reconstruction.
+  - Tests: `pytest tests/unit/test_checkpoint_large_state.py tests/unit/test_checkpoint_generic_state.py tests/integration/test_generic_checkpoint_reload.py`
+  - Acceptance Criteria: Large-state checkpoint finalization is memory-safe and standard-compatible.
+
+- [ ] T088 [P] [US5] Add corrected GPU-packing stress fixtures in `tests/fixtures/ordinary_training_scripts/`
+  - Title: Stress GPU memory without huge CPU artifacts
+  - Phase: New Phase 11
+  - Priority: P1
+  - Depends on: T080, T085
+  - Files: `tests/fixtures/ordinary_training_scripts/`, `tests/multi_host/test_generic_stress_packing.py`
+  - Goal: Replace the old parameter-heavy stress shape with workloads that validate GPU training memory packing without measuring CPU serialization capacity.
+  - Implementation Notes: Do not use artificial dummy CUDA reserve buffers. Record model/job assignment, free/final memory, optimizer progress, checkpoint validation, cleanup, and saturation classification.
+  - Tests: `pytest tests/multi_host/test_generic_stress_packing.py`
+  - Acceptance Criteria: Stress can prove GPU packing or report structured non-proof without CPU artifact bottleneck.
+
+- [ ] T089 [US5] Add final production-dependency and historical-regression gate in `tests/unit/test_no_production_zoo_dependency.py`
+  - Title: Preserve completed capabilities after repair
+  - Phase: New Phase 11
+  - Priority: P0 BLOCKING
+  - Depends on: T087
+  - Files: `tests/unit/test_no_production_zoo_dependency.py`, `tests/integration/test_legacy_example_compatibility.py`, `tests/integration/test_generic_industrial_entrypoints.py`
+  - Goal: Revalidate no production zoo/model-name dependency and preserve ordinary entrypoint behavior after artifact/admission/checkpoint repair.
+  - Implementation Notes: T001-T065 definitions remain historical; this task adds regression evidence only.
+  - Tests: `pytest tests/unit/test_no_production_zoo_dependency.py tests/integration/test_legacy_example_compatibility.py tests/integration/test_generic_industrial_entrypoints.py`
+  - Acceptance Criteria: `PRODUCTION_ZOO_DEPENDENCY=0` and `ORDINARY_PYTORCH_ENTRYPOINT=PASS`.
+
+- [ ] T090 Run final corrected Feature 002 acceptance gate in `specs/002-generic-pytorch-automation/tasks.md`
+  - Title: Final corrected architecture gate
+  - Phase: New Phase 11
+  - Priority: P0 BLOCKING
+  - Depends on: T073, T080, T085, T087, T088, T089
+  - Files: `tests/unit/`, `tests/integration/`, `tests/hardware/`, `tests/multi_host/`, `specs/002-generic-pytorch-automation/tasks.md`
+  - Goal: Establish final corrected acceptance signals and rerun hardware validation only after local architecture gates pass.
+  - Implementation Notes: Hardware commands are opt-in and must report actual discovered hosts/GPUs, placement, free/final memory, optimizer progress, formal OOM count, checkpoint validation, saturation classification, and cleanup.
   - Tests: `pytest tests/unit tests/integration`; opt-in `pytest tests/hardware tests/multi_host`
-  - Acceptance Criteria: `FEATURE_ACCEPTANCE=PASS`, `TASKS_COMPLETE=YES`, `IMPLEMENTATION_DONE=YES`.
+  - Acceptance Criteria: `FEATURE_ACCEPTANCE=PASS`, `IMPLEMENTATION_DONE=YES`, `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`, `CPU_REAL_FORWARD_BEFORE_PLAN=0`, `CPU_REAL_BACKWARD_BEFORE_PLAN=0`, `PER_JOB_GPU_TRIAL_PROBE=0`, `BACKEND_GRAPH_FULL_PARAMETER_PAYLOAD=0`, `WORKER_FULL_MODEL_CPU_LOAD=0`, `MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS`, and `GPU_PACKING_STRESS_VALIDATED=PASS`.
 
 ## Dependency Graph
 
 ### Phase Gates
 
-- Phase 0 Gate: T008 -> `REGRESSION_BASELINE=PASS`
-- Phase 1 Gate: T021 -> `PLANNER_COMPATIBILITY=PASS`
-- Phase 2 Gate: T027 -> `PRODUCTION_ZOO_DEPENDENCY=0`
-- Phase 3 Gate: T037 -> `ENTRYPOINT_CAPTURE=PASS`
-- Phase 4 Gate: T044 -> `GENERIC_RUNTIME_LOCAL=PASS`
-- Phase 5 Gate: T051 -> `STANDARD_STATE_DICT_STRICT_LOAD=PASS`
-- Phase 6 Gate: T060 -> `FAILURE_TAXONOMY=PASS`, `STRESS_EVIDENCE=PASS`
-- Phase 7 Gate: T066 -> `HARDWARE_VALIDATION=PASS` or explicit opt-in skip
-- Phase 8 Gate: T070 -> `FEATURE_ACCEPTANCE=PASS`
+- Historical Gate: T001-T065 -> completed implementation, frozen task definitions.
+- New Phase 8 Gate: T073 -> `CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0`, `CPU_REAL_FORWARD_BEFORE_PLAN=0`, `CPU_REAL_BACKWARD_BEFORE_PLAN=0`, `MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS`
+- New Phase 9 Gate: T080 -> `MODEL_MEMORY_ESTIMATED_BEFORE_MATERIALIZATION=PASS`, `PLACEMENT_USES_FRESH_FREE_VRAM=PASS`, `PER_JOB_GPU_TRIAL_PROBE=0`
+- New Phase 10 Gate: T085 -> `BACKEND_GRAPH_FULL_PARAMETER_PAYLOAD=0`, `WORKER_FULL_MODEL_CPU_LOAD=0`, `WORKER_OWNED_STATE_ONLY=PASS`, `EXACT_PLAN_EXECUTION=PASS`
+- New Phase 11 Gate: T090 -> `FEATURE_ACCEPTANCE=PASS`, `GPU_PACKING_STRESS_VALIDATED=PASS`
 
 ### User Story Dependencies
 
-- US1 Run Existing Training Entrypoint: starts after Phase 2 gate; depends on planner decoupling for end-to-end dry-run.
-- US2 Plan From Execution Graph, Not Model Names: starts after Phase 0 gate; blocks US1 production planning and US3 runtime.
-- US3 Execute And Consolidate Generic Training: starts after US1 capture and US2 planner gates.
-- US4 Keep Validation Assets Out Of Production Flow: can begin after Phase 2 for example scoping and after Phase 5 for final scanner/stress coverage.
+- US1 Plan Models Larger Than Control Plane Memory: starts at T067 and gates at T073.
+- US2 Capture Training Metadata Without Real CPU Training: starts at T068 and gates at T073.
+- US3 Admit Jobs From Estimates And Fresh Resources: starts after T073 and gates at T080.
+- US4 Execute With Owned State Only And Safe Artifacts: starts after T073/T080 and gates at T085/T087.
+- US5 Keep Existing Capabilities And Validation Assets: records old T066 at T066 and finalizes at T088-T090.
 
 ### Blocking Tasks
 
-T001, T002, T003, T004, T005, T006, T007, T008, T009, T010, T011, T012, T013, T014, T015, T016, T018, T020, T021, T022, T023, T024, T027, T028, T029, T030, T031, T032, T034, T037, T038, T039, T040, T041, T043, T044, T045, T046, T047, T048, T049, T051, T052, T053, T054, T055, T058, T060, T061, T062, T063, T064, T068, T069, T070.
+T066, T067, T068, T069, T070, T071, T073, T074, T075, T076, T077, T078, T080, T081, T082, T083, T084, T085, T086, T087, T089, T090.
 
 ## Parallel Execution Examples
 
-### Phase 0
+### New Phase 8
 
 ```bash
-Task: T001 CLI characterization
-Task: T002 JobManager coupling characterization
-Task: T003 CPU model fixtures
-Task: T007 checkpoint baseline
+Task: T067 large-model materialization tests
+Task: T068 no-real-CPU-capture-execution tests
 ```
 
-### Phase 1
+### New Phase 9
 
 ```bash
-Task: T009 state ownership dataclasses
-Task: T010 execution-node value metadata
-Task: T020 planner compatibility matrix tests
+Task: T074 estimator coverage tests
+Task: T076 no per-job GPU trial tests
 ```
 
-### Phase 3
+### New Phase 10
 
 ```bash
-Task: T028 CLI contract tests
-Task: T030 ordinary training script fixtures
-Task: T031 capture contract tests
+Task: T081 backend artifact payload tests
+Task: T083 worker full-state-load tests
 ```
 
-### Phase 5
+### New Phase 11
 
 ```bash
-Task: T045 checkpoint contract tests
-```
-
-### Phase 6
-
-```bash
-Task: T052 failure-code enums
-Task: T057 stress classification tests
+Task: T086 large-state checkpoint tests
+Task: T088 corrected GPU-packing stress fixtures
 ```
 
 ## Implementation Strategy
 
 ### MVP First
 
-1. Complete Phase 0 regression baseline.
-2. Complete Phase 1 planner semantic repair.
-3. Complete Phase 2 production decoupling.
-4. Complete Phase 3 `shardgrid run` capture path.
-5. Stop and validate US1 independently with ordinary PyTorch scripts.
+1. Freeze and record completed T001-T065 plus blocked old T066 evidence.
+2. Remove the full-control-plane-model and real-CPU-capture prerequisites.
+3. Establish large-model dry-run planning under a configured control-plane RAM limit.
+4. Replace production per-job GPU trial admission with estimates plus fresh resources.
+5. Split graph metadata from state payloads and enforce worker owned-state-only loading.
+6. Make checkpoint finalization memory-safe while keeping standard model-state compatibility.
+7. Re-run corrected hardware acceptance and GPU packing stress.
 
-### Incremental Delivery
+### Critical Path
 
-1. Deliver US2 planner correctness first because runtime/checkpoint cannot be safe without it.
-2. Deliver US1 entrypoint capture after production decoupling.
-3. Deliver US3 runtime/checkpoint once exact plan and capture artifacts are stable.
-4. Deliver US4 compatibility/stress gates without putting zoo assets back into production.
+```text
+T066
+  -> T067/T068
+  -> T069
+  -> T070/T071/T072
+  -> T073
+  -> T074/T076
+  -> T075/T077/T078/T079
+  -> T080
+  -> T081/T083
+  -> T082/T084
+  -> T085
+  -> T086/T087
+  -> T088/T089
+  -> T090
+```
 
 ### Hardware Order
 
 ```text
-CPU planner compatibility
-  -> local runtime
-  -> generic checkpoint
-  -> failure taxonomy
-  -> single GPU
-  -> multi GPU
-  -> multi host
-  -> multi job sharing
-  -> memory packing stress
+metadata-first capture gate
+  -> estimator admission gate
+  -> artifact/owned-state gate
+  -> checkpoint memory-safety gate
+  -> single GPU regression
+  -> multi GPU regression
+  -> SSH multi-host regression
+  -> multi-job sharing regression
+  -> corrected GPU packing stress
 ```
+
+## Replaced / Moved Old T066+ Content
+
+- Old T066 low-memory packing stress is replaced by T066 blocked evidence, T088 corrected stress fixture design, and T090 final corrected hardware gate.
+- Old T067 legacy example compatibility moves into T089 final regression.
+- Old T068 no-production-zoo scanner moves into T089 final regression.
+- Old T069 three-project final acceptance moves into T089 final regression.
+- Old T070 final feature gate is replaced by T090 with the new architecture acceptance signals.
 
 ## Final Status Targets
 
 ```text
-TASKS_CREATED=YES
+TASKS_REPLANNED_FROM_T066=YES
+T001_T065_FROZEN=YES
+PREVIOUS_T066_STATUS=BLOCKED
 IMPLEMENTATION_STARTED=NO
-SPEC_MODIFIED=NO
-PLAN_MODIFIED=NO
-OLD_SPEC_FILES_MODIFIED=0
+PRODUCTION_CODE_MODIFIED=NO
+CONTROL_PLANE_FULL_MODEL_BEFORE_PLAN=0
+CPU_REAL_FORWARD_BEFORE_PLAN=0
+CPU_REAL_BACKWARD_BEFORE_PLAN=0
+PER_JOB_GPU_TRIAL_PROBE=0
+MODEL_MEMORY_ESTIMATED_BEFORE_MATERIALIZATION=PASS
+PLACEMENT_USES_FRESH_FREE_VRAM=PASS
+BACKEND_GRAPH_FULL_PARAMETER_PAYLOAD=0
+WORKER_FULL_MODEL_CPU_LOAD=0
+WORKER_OWNED_STATE_ONLY=PASS
+MODEL_LARGER_THAN_CONTROL_PLANE_RAM_PLANNING=PASS
+ORDINARY_PYTORCH_ENTRYPOINT=PASS
+FEATURE_ACCEPTANCE=PASS
 ```
