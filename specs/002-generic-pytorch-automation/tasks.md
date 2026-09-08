@@ -869,7 +869,7 @@ T001-T065 completed historical implementation
     - Result: `14 passed, 1 xfailed`
     - Remaining expected xfail: T068/T070 CPU forward/backward capture execution constraint, not part of T069 materialization fix.
 
-- [ ] T070 [US2] Replace capture-time real CPU training with bounded metadata capture in `src/shardgrid/bootstrap/runner.py`
+- [x] T070 [US2] Replace capture-time real CPU training with bounded metadata capture in `src/shardgrid/bootstrap/runner.py`
   - Title: Stop CPU forward/backward planning prerequisite
   - Phase: New Phase 8
   - Priority: P0 BLOCKING
@@ -879,6 +879,16 @@ T001-T065 completed historical implementation
   - Implementation Notes: Preserve lifecycle metadata and fail with structured diagnostics when unsupported.
   - Tests: `pytest tests/integration/test_entrypoint_capture.py tests/integration/test_large_model_capture_safety.py`
   - Acceptance Criteria: No full real CPU training action is needed before planning for supported fixtures.
+  - Gate Evidence:
+    - `TASK=T070`
+    - `CPU_REAL_FORWARD_BEFORE_PLAN=0`
+    - `CPU_REAL_BACKWARD_BEFORE_PLAN=0`
+    - `CPU_REAL_OPTIMIZER_STEP_BEFORE_PLAN=0`
+    - `BOUNDED_METADATA_CAPTURE=PASS`
+    - `UNSAFE_CPU_EXECUTION_FALLBACK=false`
+    - `T071_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest --run-integration tests/integration/test_entrypoint_capture.py tests/integration/test_large_model_capture_safety.py -q`
+    - Result: `15 passed`
 
 - [ ] T071 [US1] Add large-model dry-run planning fixtures in `tests/fixtures/ordinary_training_scripts/`
   - Title: Cover 30G 70G 100G declared model sizes

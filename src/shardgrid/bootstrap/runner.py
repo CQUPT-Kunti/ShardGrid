@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import runpy
 import sys
+import textwrap
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -548,6 +550,13 @@ def _torch_capture_hooks(state: _CaptureState, *, dry_run: bool) -> Iterator[Non
     control_plane_ram_budget = _control_plane_ram_budget_bytes()
 
     def module_call(module: nn.Module, *args: Any, **kwargs: Any) -> Any:
+        if dry_run and state.model is None and _looks_like_user_model(module):
+            state.model = module
+            state.args = tuple(args)
+            state.kwargs = dict(kwargs)
+            state.output = None
+            _capture_declared_graph_or_fail(state)
+            raise _CaptureComplete
         output = original_module_call(module, *args, **kwargs)
         if state.model is None and _looks_like_user_model(module):
             state.model = module
@@ -780,6 +789,51 @@ def _build_context(state: _CaptureState) -> CapturedTrainingContext:
             "diagnostics": list(state.graph_capture_diagnostics),
         },
     )
+
+
+def _capture_declared_graph_or_fail(state: _CaptureState) -> None:
+    if state.model is None:
+        raise ValueError("cannot capture graph metadata without a model")
+    if _forward_contains_python_control_flow(state.model):
+        state.failure = CaptureFailure(
+            stage="graph_capture",
+            code="DYNAMIC_CONTROL_FLOW_UNSUPPORTED",
+            message=(
+                "model forward contains Python control flow that cannot be proven "
+                "safe without real CPU execution"
+            ),
+            artifact_log_ref="diagnostics/capture.json",
+        )
+        raise _CaptureFailed
+    module_count = sum(1 for _ in state.model.named_modules())
+    state_count = sum(1 for _ in state.model.state_dict().keys())
+    state.graph_capture_backend = "shardgrid.metadata_declaration"
+    state.graph_capture_diagnostics = (
+        "BOUNDED_METADATA_CAPTURE_WITHOUT_REAL_CPU_EXECUTION",
+        f"MODULE_COUNT:{module_count}",
+        f"STATE_OBJECT_COUNT:{state_count}",
+    )
+
+
+def _forward_contains_python_control_flow(model: Any) -> bool:
+    import inspect
+
+    try:
+        source = inspect.getsource(model.forward)
+    except (OSError, TypeError):
+        return True
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.While)):
+            return True
+        if isinstance(node, ast.If) and any(
+            isinstance(child, ast.Call) for child in ast.walk(node.test)
+        ):
+            return True
+    return False
 
 
 def _capture_graph_or_fail(state: _CaptureState) -> None:
