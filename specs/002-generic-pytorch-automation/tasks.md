@@ -963,7 +963,7 @@ T001-T065 completed historical implementation
 
 **Purpose**: Replace production per-job GPU trial admission with conservative estimates plus fresh resource snapshots.
 
-- [ ] T074 [P] [US3] Add memory-estimator coverage tests in `tests/unit/test_training_memory_estimator.py`
+- [x] T074 [P] [US3] Add memory-estimator coverage tests in `tests/unit/test_training_memory_estimator.py`
   - Title: Cover training-memory components
   - Phase: New Phase 9
   - Priority: P0 BLOCKING
@@ -973,6 +973,16 @@ T001-T065 completed historical implementation
   - Implementation Notes: Use conservative characterization where exact values are not possible.
   - Tests: `pytest tests/unit/test_training_memory_estimator.py tests/unit/test_model_profile_memory.py`
   - Acceptance Criteria: `MODEL_MEMORY_ESTIMATED_BEFORE_MATERIALIZATION=PASS`.
+  - Gate Evidence:
+    - `TASK=T074`
+    - `TRAINING_MEMORY_COMPONENT_COVERAGE=PASS`
+    - `MODEL_MEMORY_ESTIMATED_BEFORE_MATERIALIZATION=contract asserted`
+    - `REAL_MODEL_EXECUTION_FOR_ESTIMATE=0`
+    - `T075_STARTED=false`
+    - Covered: parameters, buffers, gradients, optimizer state, activations, activation liveness/backward saved tensor fallback, temporary/workspace, communication buffers, dtype/mixed precision, batch/input shape, shared/tied state.
+    - Expected xfail: module-slice estimates still count tied/shared parameter owners per module instead of charging one canonical state object.
+    - Command: `$CONDA_PYTHON_EXE -m pytest tests/unit/test_training_memory_estimator.py tests/unit/test_model_profile_memory.py -q`
+    - Result: `16 passed, 1 xfailed`
 
 - [ ] T075 [US3] Implement pre-materialization training memory estimator in `src/shardgrid/planner/memory.py`
   - Title: Estimate before materialization
