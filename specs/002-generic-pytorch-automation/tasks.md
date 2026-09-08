@@ -1107,7 +1107,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/unit/test_runtime_artifact_payloads.py tests/integration/test_code_snapshot.py`
   - Acceptance Criteria: Backend graph size is bounded by metadata and not total model state.
 
-- [ ] T083 [P] [US4] Add worker full-state-load regression tests in `tests/unit/test_generic_bootstrap_wiring.py`
+- [x] T083 [P] [US4] Add worker full-state-load regression tests in `tests/unit/test_generic_bootstrap_wiring.py`
   - Title: Prove workers load owned state only
   - Phase: New Phase 10
   - Priority: P0 BLOCKING
