@@ -1058,7 +1058,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/unit/test_training_memory_estimator.py`
   - Acceptance Criteria: Calibration is offline evidence, not production trial execution.
 
-- [ ] T080 Run New Phase 9 admission gate in `specs/002-generic-pytorch-automation/tasks.md`
+- [x] T080 Run New Phase 9 admission gate in `specs/002-generic-pytorch-automation/tasks.md`
   - Title: Gate estimator-based admission
   - Phase: New Phase 9
   - Priority: P0 BLOCKING
@@ -1068,6 +1068,18 @@ T001-T065 completed historical implementation
   - Implementation Notes: Record real command output in this file.
   - Tests: `pytest tests/unit/test_training_memory_estimator.py tests/unit/test_memory_probe_launch.py tests/integration/test_generic_resource_discovery.py`
   - Acceptance Criteria: New Phase 9 gate is PASS.
+  - Gate Evidence:
+    - `TASK=T080`
+    - `NEW_PHASE_9=PASS`
+    - `MODEL_MEMORY_ESTIMATED_BEFORE_MATERIALIZATION=PASS` (T075 estimator reads metadata only; no CPU/GPU execution for estimate)
+    - `PLACEMENT_USES_FRESH_FREE_VRAM=PASS` (T078 placement uses fresh `gpu_free_memory`; stale total-only workers are rejected)
+    - `PER_JOB_GPU_TRIAL_PROBE=0` (T077 production `run_entrypoint` no longer calls `_select_memory_probe_candidate`; `_select_memory_probe_candidate` remains fenced as legacy/diagnostic)
+    - `ESTIMATE_DRIVEN_ADMISSION=PASS` (planner `planner_required_bytes` from estimator + fresh worker usable bytes)
+    - `OFFLINE_CALIBRATION_ONLY=PASS` (T079 calibration requires provenance; mismatch/stale ignored conservatively; missing calibration keeps metadata estimate)
+    - `FORMAL_OOM_NOT_ADMISSION_FEEDBACK=PASS` (formal training OOM classified as `FORMAL_TRAINING_OOM` terminal failure in ssh_launcher; no candidate retry)
+    - `T081_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest tests/unit/test_training_memory_estimator.py tests/unit/test_memory_probe_launch.py tests/unit/test_joint_partition_placement.py tests/unit/test_model_profile_memory.py tests/unit/test_generic_bootstrap_wiring.py -q && SHARDGRID_ENABLE_INTEGRATION_TESTS=1 $CONDA_PYTHON_EXE -m pytest tests/integration/test_generic_resource_discovery.py --run-integration -q`
+    - Result: `58 passed` (unit) + `9 passed` (integration discovery)
 
 ## New Phase 10: Artifact And Worker Owned-State Safety
 
