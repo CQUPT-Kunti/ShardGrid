@@ -339,7 +339,7 @@ def test_model_profile_tracks_root_owned_state_without_standalone_module_entry()
     assert profile.state_parameter_bytes == model_parameter_bytes
 
 
-def test_model_profile_currently_counts_tied_parameters_per_module_owner() -> None:
+def test_model_profile_counts_tied_parameters_once_for_training_memory() -> None:
     case = _ordinary_case("shared_tied_parameter")
     profile = _profile_ordinary_case("shared_tied_parameter")
 
@@ -351,7 +351,7 @@ def test_model_profile_currently_counts_tied_parameters_per_module_owner() -> No
     assert case.module.embedding.weight is case.module.decoder.weight
     assert profile.shared_parameter_groups == (("embedding.weight", "decoder.weight"),)
     assert _parameter_names(profile) == {"embedding.weight", "decoder.weight"}
-    assert profile.total_memory.parameter_bytes == unique_model_parameter_bytes * 2
+    assert profile.total_memory.parameter_bytes == unique_model_parameter_bytes
     assert profile.state_parameter_bytes == unique_model_parameter_bytes
     assert {
         state.checkpoint_owner_key

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from shardgrid.engines.models import (
     EstimateKind,
     ModelProfile,
@@ -104,7 +102,7 @@ def test_training_memory_estimate_covers_core_state_gradient_optimizer_activatio
     assert estimate.temporary_bytes == 0
     assert estimate.runtime_overhead_bytes == 32
     assert estimate.communication_buffer_bytes == 16
-    assert estimate.estimated_peak_bytes == 512 + 512 + 1024 + 384 + 32 + 16
+    assert estimate.estimated_peak_bytes == 512 + 64 + 512 + 1024 + 384 + 32 + 16
     assert estimate.planner_required_bytes == estimate.estimated_peak_bytes + 8
     assert estimate.estimate_kind == EstimateKind.ESTIMATED
     assert estimate.source == "unit-test-metadata"
@@ -134,7 +132,7 @@ def test_estimator_accounts_for_activation_liveness_backward_saved_tensors_and_w
 
     estimate = estimate_stage_memory(profile, (0, 1), config)
 
-    assert estimate.activation_bytes == activation
+    assert estimate.activation_bytes == backward_saved
     assert estimate.temporary_bytes == max(workspace, int(activation * 0.25))
     assert estimate.optimizer_bytes == 10 * 4
     assert estimate.communication_buffer_bytes == 300
@@ -142,7 +140,7 @@ def test_estimator_accounts_for_activation_liveness_backward_saved_tensors_and_w
         40
         + 40
         + 40
-        + activation
+        + backward_saved
         + max(workspace, int(activation * 0.25))
         + 300
     )
@@ -193,7 +191,9 @@ def test_unknown_batch_shape_preserves_unknown_activation_without_cpu_or_gpu_exe
 
     assert estimate.activation_bytes is None
     assert estimate.temporary_bytes == 0
-    assert estimate.estimated_peak_bytes == estimate.parameter_bytes + estimate.gradient_bytes + estimate.optimizer_bytes
+    assert estimate.estimated_peak_bytes == (
+        estimate.parameter_bytes + estimate.gradient_bytes + estimate.optimizer_bytes
+    )
 
 
 def test_unsupported_optimizer_returns_structured_unsupported_estimate() -> None:
@@ -211,13 +211,6 @@ def test_unsupported_optimizer_returns_structured_unsupported_estimate() -> None
     assert estimate.notes == ("optimizer 8bit-adam is unsupported for memory estimation",)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "T074 coverage gap: module-slice estimates still count tied/shared "
-        "parameter owners per module instead of charging one canonical state object."
-    ),
-)
 def test_shared_tied_state_is_not_double_counted_in_module_slice_estimate() -> None:
     profile = _profile(
         _module("embedding", parameter_count=32, parameter_bytes=128),
@@ -238,3 +231,5 @@ def test_shared_tied_state_is_not_double_counted_in_module_slice_estimate() -> N
     estimate = estimate_stage_memory(profile, (0, 2))
 
     assert estimate.parameter_bytes == 128
+    assert estimate.gradient_bytes == 128
+    assert estimate.optimizer_bytes == 128 * 2

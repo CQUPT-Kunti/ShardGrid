@@ -222,14 +222,13 @@ def estimate_stage_memory(
         raise ValueError("module_range must select at least one module")
     estimate_config = config or MemoryEstimationConfig()
 
-    parameter_bytes = sum(module.parameter_bytes for module in selected)
-    trainable_parameter_bytes = sum(
-        module.trainable_parameter_bytes for module in selected
-    )
-    parameter_count = sum(module.parameter_count for module in selected)
-    trainable_parameter_count = sum(
-        module.trainable_parameter_count for module in selected
-    )
+    (
+        parameter_count,
+        parameter_bytes,
+        trainable_parameter_count,
+        trainable_parameter_bytes,
+    ) = _selected_parameter_stats(profile, selected)
+    buffer_bytes = _selected_buffer_bytes(profile, selected)
 
     activation_total = 0
     activation_known = False
@@ -276,6 +275,7 @@ def estimate_stage_memory(
     activation_bytes = activation_total if activation_known else None
     peak = (
         parameter_bytes
+        + buffer_bytes
         + gradient_bytes
         + optimizer_bytes
         + (activation_bytes or 0)
@@ -622,6 +622,7 @@ def _activation_bytes_for_module(
     module: ModuleProfile,
     config: MemoryEstimationConfig,
 ) -> int | None:
+    saved_or_liveness = module.memory.activation_bytes
     if module.output_tensors:
         if config.activation_dtype is not None:
             total = 0
@@ -629,16 +630,105 @@ def _activation_bytes_for_module(
                 numel = _tensor_numel(tensor.shape)
                 size = dtype_bytes(config.activation_dtype)
                 if numel is None or size is None:
-                    return module.memory.activation_bytes
+                    return saved_or_liveness
                 total += numel * size
-            return total
+            return max(total, saved_or_liveness or 0)
         total = 0
         for tensor in module.output_tensors:
             if tensor.estimated_bytes is None:
-                return module.memory.activation_bytes
+                return saved_or_liveness
             total += tensor.estimated_bytes
-        return total
-    return module.memory.activation_bytes
+        return max(total, saved_or_liveness or 0)
+    return saved_or_liveness
+
+
+def _selected_parameter_stats(
+    profile: ModelProfile,
+    selected: Sequence[ModuleProfile],
+) -> tuple[int, int, int, int]:
+    shared_owner_by_name = _shared_owner_by_parameter_name(profile)
+    if not shared_owner_by_name and not profile.state_memory:
+        return (
+            sum(module.parameter_count for module in selected),
+            sum(module.parameter_bytes for module in selected),
+            sum(module.trainable_parameter_count for module in selected),
+            sum(module.trainable_parameter_bytes for module in selected),
+        )
+
+    state_by_key = {
+        state.state_dict_key: state
+        for state in profile.state_memory
+        if state.kind == "parameter"
+    }
+    seen_keys: set[str] = set()
+    totals = [0, 0, 0, 0]
+    for module in selected:
+        parameter_names = module.parameter_names
+        if not parameter_names:
+            totals[0] += module.parameter_count
+            totals[1] += module.parameter_bytes
+            totals[2] += module.trainable_parameter_count
+            totals[3] += module.trainable_parameter_bytes
+            continue
+        count_share = _ceil_div(module.parameter_count, len(parameter_names))
+        bytes_share = _ceil_div(module.parameter_bytes, len(parameter_names))
+        trainable_count_share = _ceil_div(
+            module.trainable_parameter_count,
+            len(parameter_names),
+        )
+        trainable_bytes_share = _ceil_div(
+            module.trainable_parameter_bytes,
+            len(parameter_names),
+        )
+        for name in parameter_names:
+            canonical_key = shared_owner_by_name.get(name, name)
+            if canonical_key in seen_keys:
+                continue
+            seen_keys.add(canonical_key)
+            state = state_by_key.get(canonical_key)
+            totals[0] += count_share
+            totals[1] += state.bytes if state is not None else bytes_share
+            totals[2] += trainable_count_share
+            totals[3] += state.bytes if state is not None else trainable_bytes_share
+    return tuple(totals)  # type: ignore[return-value]
+
+
+def _selected_buffer_bytes(
+    profile: ModelProfile,
+    selected: Sequence[ModuleProfile],
+) -> int:
+    if not profile.state_memory:
+        return 0
+    selected_paths = tuple(module.module_path for module in selected)
+    total = 0
+    seen: set[str] = set()
+    for state in profile.state_memory:
+        if state.kind != "buffer" or state.canonical_state_id in seen:
+            continue
+        if any(
+            state.state_dict_key == path or state.state_dict_key.startswith(f"{path}.")
+            for path in selected_paths
+        ):
+            seen.add(state.canonical_state_id)
+            total += state.bytes
+    return total
+
+
+def _shared_owner_by_parameter_name(profile: ModelProfile) -> dict[str, str]:
+    owners: dict[str, str] = {}
+    for group in profile.shared_parameter_groups:
+        if not group:
+            continue
+        owner = group[0]
+        for name in group:
+            owners[name] = owner
+    return owners
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    if divisor <= 0:
+        return 0
+    return ceil(value / divisor)
 
 
 def _temporary_bytes_for_module(

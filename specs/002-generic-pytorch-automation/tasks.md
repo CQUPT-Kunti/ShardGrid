@@ -984,7 +984,7 @@ T001-T065 completed historical implementation
     - Command: `$CONDA_PYTHON_EXE -m pytest tests/unit/test_training_memory_estimator.py tests/unit/test_model_profile_memory.py -q`
     - Result: `16 passed, 1 xfailed`
 
-- [ ] T075 [US3] Implement pre-materialization training memory estimator in `src/shardgrid/planner/memory.py`
+- [x] T075 [US3] Implement pre-materialization training memory estimator in `src/shardgrid/planner/memory.py`
   - Title: Estimate before materialization
   - Phase: New Phase 9
   - Priority: P0 BLOCKING
@@ -994,6 +994,16 @@ T001-T065 completed historical implementation
   - Implementation Notes: Do not run a model on CPU or GPU to obtain required admission data.
   - Tests: `pytest tests/unit/test_training_memory_estimator.py tests/unit/test_joint_partition_placement.py`
   - Acceptance Criteria: Estimates are available for placement without full model materialization.
+  - Gate Evidence:
+    - `TASK=T075`
+    - `MODEL_MEMORY_ESTIMATED_BEFORE_MATERIALIZATION=PASS`
+    - `ESTIMATE_AVAILABLE_TO_PLACEMENT=PASS`
+    - `REAL_CPU_EXECUTION_FOR_ESTIMATE=0`
+    - `REAL_GPU_EXECUTION_FOR_ESTIMATE=0`
+    - `FULL_MODEL_MATERIALIZATION_FOR_ESTIMATE=0`
+    - `T076_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest tests/unit/test_training_memory_estimator.py tests/unit/test_joint_partition_placement.py tests/unit/test_model_profile_memory.py -q`
+    - Result: `29 passed`
 
 - [ ] T076 [P] [US3] Add admission tests proving no per-job GPU trial launch in `tests/unit/test_memory_probe_launch.py`
   - Title: Fence real probe from production admission
