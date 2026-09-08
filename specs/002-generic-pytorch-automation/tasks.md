@@ -1189,7 +1189,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/multi_host/test_generic_stress_packing.py`
   - Acceptance Criteria: Stress can prove GPU packing or report structured non-proof without CPU artifact bottleneck.
 
-- [ ] T089 [US5] Add final production-dependency and historical-regression gate in `tests/unit/test_no_production_zoo_dependency.py`
+- [x] T089 [US5] Add final production-dependency and historical-regression gate in `tests/unit/test_no_production_zoo_dependency.py`
   - Title: Preserve completed capabilities after repair
   - Phase: New Phase 11
   - Priority: P0 BLOCKING
