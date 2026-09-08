@@ -1129,7 +1129,7 @@ T001-T065 completed historical implementation
   - Tests: `pytest tests/unit/test_generic_bootstrap_wiring.py tests/unit/test_runtime_exact_plan.py`
   - Acceptance Criteria: `WORKER_OWNED_STATE_ONLY=PASS` and exact plan execution remains PASS.
 
-- [ ] T085 Run New Phase 10 artifact/runtime gate in `specs/002-generic-pytorch-automation/tasks.md`
+- [x] T085 Run New Phase 10 artifact/runtime gate in `specs/002-generic-pytorch-automation/tasks.md`
   - Title: Gate metadata-bounded artifacts
   - Phase: New Phase 10
   - Priority: P0 BLOCKING
@@ -1139,6 +1139,18 @@ T001-T065 completed historical implementation
   - Implementation Notes: Record real command output in this file.
   - Tests: `pytest tests/unit/test_runtime_artifact_payloads.py tests/unit/test_generic_bootstrap_wiring.py tests/unit/test_runtime_exact_plan.py`
   - Acceptance Criteria: New Phase 10 gate is PASS.
+  - Gate Evidence:
+    - `TASK=T085`
+    - `NEW_PHASE_10=PASS`
+    - `BACKEND_GRAPH_FULL_PARAMETER_PAYLOAD=0` (T082 backend-graph.pt parameters/buffers moved to meta tensors; artifact bounded by graph metadata, not state)
+    - `WORKER_FULL_MODEL_CPU_LOAD=0` (T084 `_load_initial_state` gates shard opening by owned/read-only state ids resolved from exact plan ownership before payload load)
+    - `WORKER_OWNED_STATE_ONLY=PASS` (foreign-shard non-owned mutable state never materialized; read-only state ids explicitly allowed)
+    - `EXACT_PLAN_EXECUTION=PASS` (runtime continues decoding planner-selected exact plan; no repartition/round-robin/placement reconstruction)
+    - `GRAPH_STATE_ARTIFACT_SEPARATION=PASS` (state-manifest.json + state-shards/{owner}.pt separate from graph artifact)
+    - `OWNERSHIP_BEFORE_STATE_LOAD=PASS` (ownership resolved before any state shard is opened)
+    - `T086_STARTED=false`
+    - Command: `$CONDA_PYTHON_EXE -m pytest tests/unit/test_runtime_artifact_payloads.py tests/unit/test_generic_bootstrap_wiring.py tests/unit/test_runtime_exact_plan.py -q && SHARDGRID_ENABLE_INTEGRATION_TESTS=1 $CONDA_PYTHON_EXE -m pytest tests/integration/test_code_snapshot.py tests/integration/test_generic_runtime_local.py --run-integration -q`
+    - Result: `23 passed` (gate) + `10 passed` (affected regression: code snapshot + local generic runtime)
 
 ## New Phase 11: Large Checkpoint And Corrected Hardware Acceptance
 
