@@ -6,12 +6,14 @@ import gc
 import json
 import os
 import random
+import shlex
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from uuid import uuid4
 
 from shardgrid.artifacts.collector import (
@@ -21,23 +23,58 @@ from shardgrid.artifacts.collector import (
     WorkerArtifactSource,
 )
 from shardgrid.artifacts.metadata import write_snapshot_metadata
-from shardgrid.artifacts.snapshot import create_code_snapshot
+from shardgrid.artifacts.snapshot import (
+    create_code_snapshot,
+    load_capture_context,
+    write_capture_context,
+)
 from shardgrid.artifacts.store import ArtifactStore
 from shardgrid.artifacts.transport import build_transport_config, select_artifact_transport
+from shardgrid.bootstrap.runner import (
+    CapturedEntrypointWorkload,
+    CaptureResult,
+    capture_entrypoint_workload,
+)
 from shardgrid.common.config import (
     ClusterConfig,
+    TrainingArtifactsConfig,
     TrainingConfig,
+    TrainingJobConfig,
+    TrainingModelConfig,
+    TrainingPlanningConfig,
+    TrainingResourcesConfig,
     WorkerConfig,
     load_training_config,
 )
-from shardgrid.common.enums import BackendStatus, FailureStage, Health, JobState, PhysicalOS
+from shardgrid.common.enums import (
+    BackendStatus,
+    FailureCode,
+    FailureStage,
+    Health,
+    JobState,
+    PhysicalOS,
+)
 from shardgrid.common.errors import make_failure_record
-from shardgrid.common.models import BackendName, JobId, WorkerId, as_job_id
+from shardgrid.common.models import (
+    BackendName,
+    JobId,
+    WorkerId,
+    as_backend_name,
+    as_engine_name,
+    as_job_id,
+)
 from shardgrid.control.resource_manager import ClusterState, ResourceManager
 from shardgrid.control.status_store import StatusStore
 from shardgrid.distributed.backend import select_backend
 from shardgrid.engines.base import registered_engine_registry
-from shardgrid.engines.models import ParallelPlan
+from shardgrid.engines.models import (
+    ParallelPlan,
+    ParallelPlanAttempt,
+    ParallelPlanCommunicationEdge,
+    ParallelPlanPlacement,
+    ParallelPlanProvenance,
+    ParallelPlanStage,
+)
 from shardgrid.engines.selected import SelectedEngine, select_with_fallback
 from shardgrid.jobs.models import FailureRecord, JobSnapshot, JobStatus, TrainingJob
 from shardgrid.launchers.base import (
@@ -112,6 +149,32 @@ def _probe_log_has_oom(text: str | None) -> bool:
             "out of memory",
         )
     )
+
+
+def _probe_log_has_port_collision(text: str | None) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "eaddrinuse",
+            "address already in use",
+            "server socket has failed to listen",
+        )
+    )
+
+
+def _parse_probe_marker_from_tail(text: str) -> dict[str, object] | None:
+    marker = "T074_TRAIN_EVIDENCE "
+    for line in reversed(text.splitlines()):
+        if not line.startswith(marker):
+            continue
+        try:
+            payload = json.loads(line[len(marker):])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 def _parse_probe_data_payload(text: str | None) -> dict[str, object] | None:
@@ -214,6 +277,16 @@ class JobRunResult:
     launcher_result: LauncherResult | None = None
 
 
+@dataclass(frozen=True)
+class PlannerWorkload:
+    model: object
+    sample_args: tuple[object, ...] = ()
+    sample_kwargs: Mapping[str, object] = field(default_factory=dict)
+    model_name: str = "captured_model"
+    source: str = "captured_context"
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
 PROBE_PASS = "PASS"
 PROBE_MEMORY_REJECT = "MEMORY_REJECT"
 PROBE_RESOURCE_CHANGED = "RESOURCE_CHANGED"
@@ -277,6 +350,17 @@ class MemoryProbeResult:
         }
 
 
+def _probe_infra_failure_code(exc: MemoryProbeInfraFailure) -> FailureCode:
+    subtype = str(exc.result.subtype or "").upper()
+    if subtype in {"RENDEZVOUS_TIMEOUT", "DISTRIBUTE_RENDEZVOUS"}:
+        return FailureCode.RENDEZVOUS_FAILURE
+    if subtype in {"SSH_FAILURE", "CONNECTION_FAILURE", "TRANSPORT_FAILURE"}:
+        return FailureCode.NETWORK_FAILURE
+    if subtype in {"LAUNCH_FAILURE", "DISTRIBUTE_FAILURE", "PROCESS_LAUNCH_FAILURE"}:
+        return FailureCode.PROCESS_LAUNCH_FAILURE
+    return FailureCode.INFRA_FAILURE
+
+
 class MemoryProbeSelectionError(ValueError):
     def __init__(self, result: MemoryProbeResult) -> None:
         super().__init__(result.message)
@@ -333,6 +417,8 @@ class JobManager:
         self._last_planning_evidence: dict[str, object] = {}
         self._last_parallel_plan_candidates: tuple[ParallelPlan, ...] = ()
         self._data_test_cache: dict[tuple[str, str], tuple[float, bool, str | None]] = {}
+        self._captured_runtime_artifacts_ready = False
+        self._latest_captured_snapshot: JobSnapshot | None = None
 
     def run(
         self,
@@ -526,6 +612,9 @@ class JobManager:
                                 exc.result.to_dict(), sort_keys=True
                             ),
                         },
+                        code=FailureCode.MEMORY_REJECT,
+                        producer="job_manager",
+                        retryable=True,
                         secrets=self._secrets,
                     )
                     current = self._failed_status(current, phase="plan", failure=failure)
@@ -550,6 +639,9 @@ class JobManager:
                                     exc.result.to_dict(), sort_keys=True
                                 ),
                             },
+                            code=FailureCode.RESOURCE_CHANGED,
+                            producer="job_manager",
+                            retryable=True,
                             secrets=self._secrets,
                         )
                         current = self._failed_status(
@@ -573,6 +665,9 @@ class JobManager:
                                 "replanning after probe resource revalidation"
                             ),
                             recommended_action="add or repair workers, then retry",
+                            code=FailureCode.RESOURCE_CHANGED,
+                            producer="job_manager",
+                            retryable=True,
                             secrets=self._secrets,
                         )
                         current = self._failed_status(
@@ -607,6 +702,8 @@ class JobManager:
                                 exc.result.to_dict(), sort_keys=True
                             ),
                         },
+                        code=_probe_infra_failure_code(exc),
+                        producer="job_manager",
                         retryable=True,
                         secrets=self._secrets,
                     )
@@ -634,6 +731,8 @@ class JobManager:
                                 exc.result.to_dict(), sort_keys=True
                             ),
                         },
+                        code=FailureCode.RUNTIME_FAILURE,
+                        producer="job_manager",
                         secrets=self._secrets,
                     )
                     current = self._failed_status(
@@ -667,35 +766,136 @@ class JobManager:
                 snapshot_path=str(self._artifact_store.snapshot_paths(job.job_id).root),
             )
         )
-        create_code_snapshot(snapshot, source_root=self._source_root, secrets=self._secrets)
-        execution_plan = self._build_execution_plan(
+        return self._execute_planned_job(
             job=job,
             training_config=training_config,
-            parallel_plan=selected_engine.parallel_plan,
-            workers=selected_workers,
+            selected_engine=selected_engine,
+            selected_workers=selected_workers,
+            cluster_state=cluster_state,
+            network_state=network_state,
+            current=current,
             snapshot=snapshot,
-            rejected_engine_ids=selected_engine.rejected_engine_ids,
+            planning_evidence=planning_evidence,
+            dry_run=dry_run,
         )
-        if not dry_run:
-            try:
-                execution_plan, cluster_state, network_state = self._prepare_live_execution_plan(
-                    training_config=training_config,
+
+
+    def _execute_planned_job(
+        self,
+        *,
+        job: TrainingJob,
+        training_config: TrainingConfig,
+        selected_engine: SelectedEngine,
+        selected_workers: list[WorkerConfig],
+        cluster_state: ClusterState,
+        network_state: NetworkState,
+        current: JobStatus,
+        snapshot: JobSnapshot,
+        planning_evidence: dict[str, object] | None,
+        dry_run: bool,
+    ) -> JobRunResult:
+            snapshot = self._artifact_store.create_snapshot(
+                replace(
+                    job,
+                    snapshot_path=str(self._artifact_store.snapshot_paths(job.job_id).root),
+                )
+            )
+            create_code_snapshot(snapshot, source_root=self._source_root, secrets=self._secrets)
+            execution_plan = self._build_execution_plan(
+                job=job,
+                training_config=training_config,
+                parallel_plan=selected_engine.parallel_plan,
+                workers=selected_workers,
+                snapshot=snapshot,
+                rejected_engine_ids=selected_engine.rejected_engine_ids,
+            )
+            if not dry_run:
+                try:
+                    execution_plan, cluster_state, network_state = self._prepare_live_execution_plan(
+                        training_config=training_config,
+                        execution_plan=execution_plan,
+                        cluster_state=cluster_state,
+                        network_state=network_state,
+                    )
+                except Exception as exc:
+                    failure = make_failure_record(
+                        stage=FailureStage.LAUNCH,
+                        host=str(self.cluster_config.control.hostname),
+                        message=f"live execution preflight failed: {exc}",
+                        recommended_action=(
+                            "repair the selected workers or rerun planning before launch"
+                        ),
+                        secrets=self._secrets,
+                    )
+                    current = self._failed_status(current, phase="launch", failure=failure)
+                    self._status_store.save_path(self._status_store.status_path(job.job_id), current)
+                    return self._failed_run_result(
+                        job,
+                        current,
+                        snapshot=snapshot,
+                        execution_plan=execution_plan,
+                        parallel_plan=selected_engine.parallel_plan,
+                        cluster_state=cluster_state,
+                        network_state=network_state,
+                    )
+            current = self._persist_status(
+                replace(
+                    current,
+                    workers=[assignment.worker_id for assignment in execution_plan.workers],
+                    assignments=list(execution_plan.workers),
+                    runtime_environment_refs=self._runtime_refs(execution_plan),
+                    backend=execution_plan.backend,
+                ),
+                snapshot=snapshot,
+                state=JobState.SNAPSHOTTING,
+                phase="plan",
+            )
+            launch_metadata = self._launch_metadata(
+                selected_engine,
+                planning_evidence=planning_evidence,
+            )
+            probe_selection = (planning_evidence or {}).get("memory_probe_selection")
+            if isinstance(probe_selection, dict):
+                launch_metadata["memory_probe_selection_ref"] = str(
+                    self._write_memory_probe_selection_artifact(
+                        snapshot=snapshot,
+                        selection=probe_selection,
+                    )
+                )
+
+            self._write_snapshot_metadata(
+                snapshot=snapshot,
+                job=job,
+                training_config=training_config,
+                parallel_plan=selected_engine.parallel_plan,
+                execution_plan=execution_plan,
+                network_state=network_state,
+                job_status=current,
+                launch_metadata=launch_metadata,
+                dry_run=dry_run,
+            )
+            if dry_run:
+                return JobRunResult(
+                    job=job,
+                    status=current,
+                    snapshot=snapshot,
                     execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
                     cluster_state=cluster_state,
                     network_state=network_state,
                 )
-            except Exception as exc:
+
+            preparation = selected_engine.engine.prepare(snapshot, execution_plan)
+            if preparation.status not in (BackendStatus.AVAILABLE, BackendStatus.EXPERIMENTAL):
                 failure = make_failure_record(
-                    stage=FailureStage.LAUNCH,
+                    stage=FailureStage.PLAN,
                     host=str(self.cluster_config.control.hostname),
-                    message=f"live execution preflight failed: {exc}",
-                    recommended_action=(
-                        "repair the selected workers or rerun planning before launch"
-                    ),
+                    message="engine preparation did not produce an available runtime",
+                    recommended_action="inspect engine diagnostics and rerun planning",
                     secrets=self._secrets,
                 )
-                current = self._failed_status(current, phase="launch", failure=failure)
-                self._status_store.save_path(self._status_store.status_path(job.job_id), current)
+                current = self._failed_status(current, phase="plan", failure=failure)
+                self._save_status(current, snapshot=snapshot)
                 return self._failed_run_result(
                     job,
                     current,
@@ -705,6 +905,464 @@ class JobManager:
                     cluster_state=cluster_state,
                     network_state=network_state,
                 )
+            launcher = self._launcher_factory(training_config.job.backend)
+            context = LauncherContext(
+                job=job,
+                execution_plan=execution_plan,
+                cluster_state=cluster_state,
+                snapshot=snapshot,
+                job_status=current,
+                runtime_environment_refs=self._runtime_refs(execution_plan),
+            )
+
+            current = self._persist_status(
+                current,
+                snapshot=snapshot,
+                state=JobState.DISTRIBUTING,
+                phase="distribute",
+            )
+            context = replace(context, job_status=current)
+            prepare_result = launcher.prepare(context)
+            if prepare_result.status not in {LauncherResultStatus.SUCCESS, LauncherResultStatus.NOOP}:
+                current = self._failed_status(
+                    current,
+                    phase="distribute",
+                    failure=self._launcher_failure(
+                        prepare_result,
+                        FailureStage.DISTRIBUTE,
+                        "launcher prepare failed before distribution completed",
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=prepare_result,
+                )
+
+            context = replace(context, job_status=self._load_status(snapshot, current))
+            distribute_result = launcher.distribute(context)
+            if distribute_result.status not in {
+                LauncherResultStatus.SUCCESS,
+                LauncherResultStatus.NOOP,
+            }:
+                current = self._failed_status(
+                    self._load_status(snapshot, current),
+                    phase="distribute",
+                    failure=self._launcher_failure(
+                        distribute_result,
+                        FailureStage.DISTRIBUTE,
+                        "launcher distribute failed before launch",
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=distribute_result,
+                )
+
+            conflicts = self._status_store.reserve_resources(job.job_id, execution_plan.workers)
+            if conflicts:
+                current = self._failed_status(
+                    self._load_status(snapshot, current),
+                    phase="launch",
+                    failure=make_failure_record(
+                        stage=FailureStage.LAUNCH,
+                        host=str(self.cluster_config.control.hostname),
+                        message="GPU resource reservation conflict before launch",
+                        recommended_action=(
+                            "wait for the running job to finish or choose different workers"
+                        ),
+                        runtime_environment={
+                            "conflicts": json.dumps(conflicts, sort_keys=True),
+                        },
+                        secrets=self._secrets,
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=distribute_result,
+                )
+
+            current = self._persist_status(
+                self._load_status(snapshot, current),
+                snapshot=snapshot,
+                state=JobState.LAUNCHING,
+                phase="launch",
+            )
+            context = replace(context, job_status=current)
+            launch_result = launcher.launch(context)
+            if launch_result.status not in {LauncherResultStatus.SUCCESS, LauncherResultStatus.NOOP}:
+                current = self._failed_status(
+                    self._load_status(snapshot, current),
+                    phase="launch",
+                    failure=self._launcher_failure(
+                        launch_result,
+                        FailureStage.LAUNCH,
+                        "launcher launch failed before rendezvous",
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                self._status_store.release_resources(job.job_id)
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=launch_result,
+                )
+
+            context = replace(context, job_status=self._load_status(snapshot, current))
+            monitor_result, current = self._monitor_until_terminal(
+                launcher=launcher,
+                context=context,
+                snapshot=snapshot,
+                current=current,
+                training_config=training_config,
+            )
+            if monitor_result.status not in {
+                LauncherResultStatus.SUCCESS,
+                LauncherResultStatus.NOOP,
+            } or current.state is JobState.FAILED:
+                current = self._failed_status(
+                    current,
+                    phase=current.phase,
+                    failure=current.failure
+                    or self._launcher_failure(
+                        monitor_result,
+                        self._failure_stage_for_phase(current.phase),
+                        "launcher monitor observed a terminal failure",
+                    ),
+                )
+                self._stop_failed_job_ranks(
+                    launcher=launcher,
+                    context=replace(context, job_status=current),
+                )
+                current = self._load_status(snapshot, current)
+                self._status_store.release_resources(job.job_id)
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    launcher_result=monitor_result,
+                )
+
+            self._status_store.release_resources(job.job_id)
+            current = self._persist_status(
+                current,
+                snapshot=snapshot,
+                state=JobState.CHECKPOINTING,
+                phase="checkpoint",
+                preserve_metrics=True,
+            )
+            collection_result = self._collect_artifacts(
+                snapshot,
+                training_config,
+                execution_plan,
+                current,
+            )
+            self._write_collection_diagnostics(snapshot, collection_result)
+            if collection_result.status is not CollectionStatus.SUCCESS:
+                current = self._failed_status(
+                    current,
+                    phase="checkpoint",
+                    failure=self._artifact_collection_failure(collection_result),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    collection_result=collection_result,
+                    launcher_result=monitor_result,
+                )
+
+            try:
+                checkpoint_metadata = self._finalize_checkpoint_bundle(
+                    snapshot=snapshot,
+                    training_config=training_config,
+                    execution_plan=execution_plan,
+                    current=current,
+                    collection_result=collection_result,
+                )
+            except Exception as exc:
+                current = self._failed_status(
+                    current,
+                    phase="checkpoint",
+                    failure=make_failure_record(
+                        stage=FailureStage.CHECKPOINT,
+                        host=str(self.cluster_config.control.hostname),
+                        message=f"distributed checkpoint finalization failed: {exc}",
+                        recommended_action=(
+                            "inspect collected checkpoint shards and rerun the job"
+                        ),
+                        secrets=self._secrets,
+                    ),
+                )
+                self._save_terminal_snapshot(
+                    snapshot,
+                    job,
+                    training_config,
+                    selected_engine.parallel_plan,
+                    execution_plan,
+                    network_state,
+                    current,
+                )
+                return self._failed_run_result(
+                    job,
+                    current,
+                    snapshot=snapshot,
+                    execution_plan=execution_plan,
+                    parallel_plan=selected_engine.parallel_plan,
+                    cluster_state=cluster_state,
+                    network_state=network_state,
+                    collection_result=collection_result,
+                    launcher_result=monitor_result,
+                )
+
+            current = self._complete_status(
+                current,
+                checkpoint_ref=str(checkpoint_metadata["checkpoint_ref"]),
+            )
+            self._save_terminal_snapshot(
+                snapshot,
+                job,
+                training_config,
+                selected_engine.parallel_plan,
+                execution_plan,
+                network_state,
+                current,
+                checkpoint_metadata=checkpoint_metadata,
+                launch_metadata=launch_metadata,
+            )
+            return JobRunResult(
+                job=job,
+                status=current,
+                snapshot=snapshot,
+                execution_plan=execution_plan,
+                parallel_plan=selected_engine.parallel_plan,
+                cluster_state=cluster_state,
+                network_state=network_state,
+                collection_result=collection_result,
+                launcher_result=monitor_result,
+            )
+
+    def run_entrypoint(
+        self,
+        entrypoint: Any,
+        *,
+        job_id: JobId | None = None,
+        dry_run: bool | None = None,
+        min_selected_physical_hosts: int | None = None,
+    ) -> JobRunResult:
+        if dry_run is None:
+            dry_run = bool(getattr(entrypoint, "dry_run", False))
+        self._last_planning_evidence = {}
+        self._last_parallel_plan_candidates = ()
+        training_config = self._entrypoint_training_config(entrypoint)
+        job = create_training_job(
+            config_path=str(getattr(entrypoint, "cluster_config_path", None) or ""),
+            model="captured-entrypoint",
+            requested_world_size=training_config.resources.world_size,
+            backend_preference=training_config.job.communication_backend,
+            runtime_environment_ref="env:cluster/shardgrid",
+            job_id=job_id,
+        )
+        current = self._status_store.create_initial_status(job)
+        snapshot = self._artifact_store.create_snapshot(
+            replace(
+                job,
+                snapshot_path=str(self._artifact_store.snapshot_paths(job.job_id).root),
+            )
+        )
+        current = self._persist_status(
+            current,
+            snapshot=snapshot,
+            state=JobState.PLANNING,
+            phase="capture",
+        )
+
+        capture = capture_entrypoint_workload(
+            getattr(entrypoint, "entrypoint"),
+            argv=tuple(getattr(entrypoint, "argv", ())),
+            cwd=getattr(entrypoint, "cwd", None),
+            environment=getattr(entrypoint, "environment", {}),
+            dry_run=True,
+        )
+        write_capture_context(
+            snapshot,
+            capture if isinstance(capture, CaptureResult) else capture.context,
+        )
+        capture_metadata = load_capture_context(snapshot)
+        if isinstance(capture, CaptureResult):
+            failure = self._capture_failure(capture)
+            current = self._failed_status(current, phase="capture", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+
+        create_code_snapshot(snapshot, source_root=self._source_root, secrets=self._secrets)
+        selected_workers = self._select_candidate_workers(training_config)
+        probe_results = [self._probe_worker(worker) for worker in selected_workers]
+        healthy_worker_ids = {
+            result.worker_resource.worker_id
+            for result in probe_results
+            if result.health is Health.HEALTHY
+        }
+        selected_workers = [
+            worker for worker in selected_workers if worker.worker_id in healthy_worker_ids
+        ]
+        worker_resources = [
+            result.worker_resource
+            for result in probe_results
+            if result.worker_resource.worker_id in healthy_worker_ids
+        ]
+        if not worker_resources:
+            failure = make_failure_record(
+                stage=FailureStage.PROBE,
+                host=str(self.cluster_config.control.hostname),
+                message="no healthy workers are available for captured entrypoint planning",
+                recommended_action="repair worker runtime readiness and retry shardgrid run",
+                secrets=self._secrets,
+            )
+            current = self._failed_status(current, phase="probe", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+
+        reserved_worker_resources = self._apply_active_resource_reservations(
+            worker_resources,
+            current_job_id=job.job_id,
+        )
+        cluster_state = self._resource_manager.build_cluster_state(
+            reserved_worker_resources,
+            network_state=None,
+            require_network=False,
+        )
+        try:
+            network_state = self._probe_network(worker_resources)
+            cluster_state = self._resource_manager.build_cluster_state(
+                reserved_worker_resources,
+                network_state=network_state,
+                require_network=True,
+            )
+            selected_engine = self._select_engine(
+                self._selected_engine_id(),
+                job,
+                cluster_state,
+                network_state,
+                registry=registered_engine_registry(),
+            )
+            captured_workload = self._captured_entrypoint_planner_workload(
+                capture,
+                capture_metadata,
+            )
+            parallel_plan = self._build_automatic_parallel_plan(
+                training_config=training_config,
+                cluster_state=cluster_state,
+                selected_engine=selected_engine,
+                captured_workload=captured_workload,
+                min_selected_physical_hosts=min_selected_physical_hosts,
+            )
+            execution_plan = self._build_execution_plan(
+                job=job,
+                training_config=training_config,
+                parallel_plan=parallel_plan,
+                workers=selected_workers,
+                snapshot=snapshot,
+                rejected_engine_ids=getattr(selected_engine, "rejected_engine_ids", ()),
+            )
+        except Exception as exc:
+            failure = make_failure_record(
+                stage=FailureStage.PLAN,
+                host=str(self.cluster_config.control.hostname),
+                message=f"captured entrypoint planning failed: {exc}",
+                recommended_action=(
+                    "inspect plan/capture-context.json and planner diagnostics, then retry"
+                ),
+                runtime_environment={"artifact_log": "plan/capture-context.json"},
+                secrets=self._secrets,
+            )
+            current = self._failed_status(current, phase="plan", failure=failure)
+            self._save_status(current, snapshot=snapshot)
+            return self._failed_run_result(job, current, snapshot=snapshot)
+
         current = self._persist_status(
             replace(
                 current,
@@ -717,379 +1375,62 @@ class JobManager:
             state=JobState.SNAPSHOTTING,
             phase="plan",
         )
-        launch_metadata = self._launch_metadata(
-            selected_engine,
-            planning_evidence=planning_evidence,
-        )
-        probe_selection = (planning_evidence or {}).get("memory_probe_selection")
-        if isinstance(probe_selection, dict):
-            launch_metadata["memory_probe_selection_ref"] = str(
-                self._write_memory_probe_selection_artifact(
-                    snapshot=snapshot,
-                    selection=probe_selection,
-                )
-            )
+        planning_evidence = dict(self._last_planning_evidence)
+        planning_evidence["capture_context_ref"] = "plan/capture-context.json"
 
-        self._write_snapshot_metadata(
-            snapshot=snapshot,
-            job=job,
-            training_config=training_config,
-            parallel_plan=selected_engine.parallel_plan,
-            execution_plan=execution_plan,
-            network_state=network_state,
-            job_status=current,
-            launch_metadata=launch_metadata,
-            dry_run=dry_run,
+        selected_engine = SelectedEngine(
+            job_id=job.job_id,
+            engine=selected_engine.engine,
+            candidate=selected_engine.candidate,
+            parallel_plan=parallel_plan,
+            original_plan_path=parallel_plan.engine_plan_path,
+            rejected_engine_ids=tuple(
+                getattr(selected_engine, "rejected_engine_ids", ())
+            ),
         )
+
         if dry_run:
+            self._write_snapshot_metadata(
+                snapshot=snapshot,
+                job=job,
+                training_config=training_config,
+                parallel_plan=selected_engine.parallel_plan,
+                execution_plan=execution_plan,
+                network_state=network_state,
+                job_status=current,
+                launch_metadata={"capture_context_ref": "plan/capture-context.json"},
+                dry_run=True,
+            )
+            self._last_planning_evidence = planning_evidence
             return JobRunResult(
                 job=job,
                 status=current,
                 snapshot=snapshot,
                 execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
+                parallel_plan=parallel_plan,
                 cluster_state=cluster_state,
                 network_state=network_state,
             )
 
-        preparation = selected_engine.engine.prepare(snapshot, execution_plan)
-        if preparation.status not in (BackendStatus.AVAILABLE, BackendStatus.EXPERIMENTAL):
-            failure = make_failure_record(
-                stage=FailureStage.PLAN,
-                host=str(self.cluster_config.control.hostname),
-                message="engine preparation did not produce an available runtime",
-                recommended_action="inspect engine diagnostics and rerun planning",
-                secrets=self._secrets,
-            )
-            current = self._failed_status(current, phase="plan", failure=failure)
-            self._save_status(current, snapshot=snapshot)
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-            )
-        launcher = self._launcher_factory(training_config.job.backend)
-        context = LauncherContext(
+        self._persist_captured_runtime_artifacts(
+            snapshot=snapshot,
+            capture=capture,
+            parallel_plan=parallel_plan,
+        )
+        planning_evidence["admission_source"] = "estimate_driven"
+        planning_evidence["per_job_gpu_trial_probe"] = False
+        self._last_planning_evidence = planning_evidence
+        return self._execute_planned_job(
             job=job,
-            execution_plan=execution_plan,
-            cluster_state=cluster_state,
-            snapshot=snapshot,
-            job_status=current,
-            runtime_environment_refs=self._runtime_refs(execution_plan),
-        )
-
-        current = self._persist_status(
-            current,
-            snapshot=snapshot,
-            state=JobState.DISTRIBUTING,
-            phase="distribute",
-        )
-        context = replace(context, job_status=current)
-        prepare_result = launcher.prepare(context)
-        if prepare_result.status not in {LauncherResultStatus.SUCCESS, LauncherResultStatus.NOOP}:
-            current = self._failed_status(
-                current,
-                phase="distribute",
-                failure=self._launcher_failure(
-                    prepare_result,
-                    FailureStage.DISTRIBUTE,
-                    "launcher prepare failed before distribution completed",
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=prepare_result,
-            )
-
-        context = replace(context, job_status=self._load_status(snapshot, current))
-        distribute_result = launcher.distribute(context)
-        if distribute_result.status not in {
-            LauncherResultStatus.SUCCESS,
-            LauncherResultStatus.NOOP,
-        }:
-            current = self._failed_status(
-                self._load_status(snapshot, current),
-                phase="distribute",
-                failure=self._launcher_failure(
-                    distribute_result,
-                    FailureStage.DISTRIBUTE,
-                    "launcher distribute failed before launch",
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=distribute_result,
-            )
-
-        conflicts = self._status_store.reserve_resources(job.job_id, execution_plan.workers)
-        if conflicts:
-            current = self._failed_status(
-                self._load_status(snapshot, current),
-                phase="launch",
-                failure=make_failure_record(
-                    stage=FailureStage.LAUNCH,
-                    host=str(self.cluster_config.control.hostname),
-                    message="GPU resource reservation conflict before launch",
-                    recommended_action=(
-                        "wait for the running job to finish or choose different workers"
-                    ),
-                    runtime_environment={
-                        "conflicts": json.dumps(conflicts, sort_keys=True),
-                    },
-                    secrets=self._secrets,
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=distribute_result,
-            )
-
-        current = self._persist_status(
-            self._load_status(snapshot, current),
-            snapshot=snapshot,
-            state=JobState.LAUNCHING,
-            phase="launch",
-        )
-        context = replace(context, job_status=current)
-        launch_result = launcher.launch(context)
-        if launch_result.status not in {LauncherResultStatus.SUCCESS, LauncherResultStatus.NOOP}:
-            current = self._failed_status(
-                self._load_status(snapshot, current),
-                phase="launch",
-                failure=self._launcher_failure(
-                    launch_result,
-                    FailureStage.LAUNCH,
-                    "launcher launch failed before rendezvous",
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            self._status_store.release_resources(job.job_id)
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=launch_result,
-            )
-
-        context = replace(context, job_status=self._load_status(snapshot, current))
-        monitor_result, current = self._monitor_until_terminal(
-            launcher=launcher,
-            context=context,
-            snapshot=snapshot,
-            current=current,
             training_config=training_config,
-        )
-        if monitor_result.status not in {
-            LauncherResultStatus.SUCCESS,
-            LauncherResultStatus.NOOP,
-        } or current.state is JobState.FAILED:
-            current = self._failed_status(
-                current,
-                phase=current.phase,
-                failure=current.failure
-                or self._launcher_failure(
-                    monitor_result,
-                    self._failure_stage_for_phase(current.phase),
-                    "launcher monitor observed a terminal failure",
-                ),
-            )
-            self._stop_failed_job_ranks(
-                launcher=launcher,
-                context=replace(context, job_status=current),
-            )
-            current = self._load_status(snapshot, current)
-            self._status_store.release_resources(job.job_id)
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                launcher_result=monitor_result,
-            )
-
-        self._status_store.release_resources(job.job_id)
-        current = self._persist_status(
-            current,
-            snapshot=snapshot,
-            state=JobState.CHECKPOINTING,
-            phase="checkpoint",
-            preserve_metrics=True,
-        )
-        collection_result = self._collect_artifacts(
-            snapshot,
-            training_config,
-            execution_plan,
-            current,
-        )
-        self._write_collection_diagnostics(snapshot, collection_result)
-        if collection_result.status is not CollectionStatus.SUCCESS:
-            current = self._failed_status(
-                current,
-                phase="checkpoint",
-                failure=self._artifact_collection_failure(collection_result),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                collection_result=collection_result,
-                launcher_result=monitor_result,
-            )
-
-        try:
-            checkpoint_metadata = self._finalize_checkpoint_bundle(
-                snapshot=snapshot,
-                training_config=training_config,
-                execution_plan=execution_plan,
-                current=current,
-                collection_result=collection_result,
-            )
-        except Exception as exc:
-            current = self._failed_status(
-                current,
-                phase="checkpoint",
-                failure=make_failure_record(
-                    stage=FailureStage.CHECKPOINT,
-                    host=str(self.cluster_config.control.hostname),
-                    message=f"distributed checkpoint finalization failed: {exc}",
-                    recommended_action=(
-                        "inspect collected checkpoint shards and rerun the job"
-                    ),
-                    secrets=self._secrets,
-                ),
-            )
-            self._save_terminal_snapshot(
-                snapshot,
-                job,
-                training_config,
-                selected_engine.parallel_plan,
-                execution_plan,
-                network_state,
-                current,
-            )
-            return self._failed_run_result(
-                job,
-                current,
-                snapshot=snapshot,
-                execution_plan=execution_plan,
-                parallel_plan=selected_engine.parallel_plan,
-                cluster_state=cluster_state,
-                network_state=network_state,
-                collection_result=collection_result,
-                launcher_result=monitor_result,
-            )
-
-        current = self._complete_status(
-            current,
-            checkpoint_ref=str(checkpoint_metadata["checkpoint_ref"]),
-        )
-        self._save_terminal_snapshot(
-            snapshot,
-            job,
-            training_config,
-            selected_engine.parallel_plan,
-            execution_plan,
-            network_state,
-            current,
-            checkpoint_metadata=checkpoint_metadata,
-            launch_metadata=launch_metadata,
-        )
-        return JobRunResult(
-            job=job,
-            status=current,
-            snapshot=snapshot,
-            execution_plan=execution_plan,
-            parallel_plan=selected_engine.parallel_plan,
+            selected_engine=selected_engine,
+            selected_workers=selected_workers,
             cluster_state=cluster_state,
             network_state=network_state,
-            collection_result=collection_result,
-            launcher_result=monitor_result,
+            current=current,
+            snapshot=snapshot,
+            planning_evidence=planning_evidence,
+            dry_run=dry_run,
         )
 
     def _monitor_until_terminal(
@@ -1624,7 +1965,12 @@ class JobManager:
                         if worker.conda_prefix
                         else self.cluster_config.runtime.python_executable
                     ),
-                    launch_command=self._launch_command_for_assignment(parallel_plan, rank),
+                    launch_command=self._launch_command_for_assignment(
+                        parallel_plan,
+                        rank,
+                        job=job,
+                        snapshot=snapshot,
+                    ),
                     environment=self._assignment_environment(
                         training_config=training_config,
                         parallel_plan=parallel_plan,
@@ -1666,8 +2012,22 @@ class JobManager:
             labels=labels,
         )
 
-    def _launch_command_for_assignment(self, parallel_plan: ParallelPlan, rank: int) -> str:
+    def _launch_command_for_assignment(
+        self,
+        parallel_plan: ParallelPlan,
+        rank: int,
+        *,
+        job: TrainingJob | None = None,
+        snapshot: JobSnapshot | None = None,
+    ) -> str:
         if parallel_plan.partition_source == "automatic":
+            if self._generic_runtime_bootstrap_requested(parallel_plan):
+                return self._generic_runtime_bootstrap_command(
+                    parallel_plan,
+                    rank,
+                    job=job,
+                    snapshot=snapshot,
+                )
             if parallel_plan.requirements.get("generic_dag_runtime") == "true":
                 if parallel_plan.requirements.get("memory_probe") == "true":
                     return (
@@ -1677,6 +2037,48 @@ class JobManager:
                 return f"python examples/models/train_generic_dag.py --rank {rank}"
             return f"python examples/models/train_automatic_plan.py --rank {rank}"
         return f"python examples/models/train_pipeline.py --rank {rank}"
+
+    def _generic_runtime_bootstrap_requested(self, parallel_plan: ParallelPlan) -> bool:
+        return parallel_plan.requirements.get("workload_source") == "captured_context"
+
+    def _generic_runtime_bootstrap_command(
+        self,
+        parallel_plan: ParallelPlan,
+        rank: int,
+        *,
+        job: TrainingJob | None = None,
+        snapshot: JobSnapshot | None = None,
+    ) -> str:
+        plan_artifact = (
+            "plan/original-parallel-plan.json"
+            if snapshot is None
+            else str(Path(snapshot.plan_path) / "original-parallel-plan.json")
+        )
+        context_artifact = (
+            "plan/captured-context.json"
+            if snapshot is None
+            else str(Path(snapshot.plan_path) / "captured-context.json")
+        )
+        command = [
+            "python",
+            "-m",
+            "shardgrid.runtime.generic_bootstrap",
+            "--rank",
+            str(rank),
+            "--parallel-plan-id",
+            parallel_plan.parallel_plan_id,
+            "--selected-candidate-id",
+            parallel_plan.selected_candidate_id or "",
+            "--plan-artifact",
+            plan_artifact,
+            "--context-artifact",
+            context_artifact,
+            "--job-id",
+            "" if job is None else str(job.job_id),
+        ]
+        if parallel_plan.requirements.get("memory_probe") == "true":
+            command.append("--memory-probe")
+        return " ".join(shlex.quote(item) for item in command)
 
     def _assignment_environment(
         self,
@@ -1905,14 +2307,18 @@ class JobManager:
                 )
         return [by_worker[assignment.worker_id] for assignment in execution_plan.workers]
 
-    def _allocate_live_master_port(self, worker: WorkerConfig) -> int:
+    def _allocate_live_master_port(self, worker: WorkerConfig, attempt: int = 1) -> int:
         runtime = self._runtime_wrapper(worker)
         preferred = self._resolved_rendezvous_port()
+        random.seed()
+        offset = random.randint(0, 9973)
         script = (
             "import json, socket\n"
             f"preferred = {preferred}\n"
+            f"offset = {offset}\n"
             "chosen = None\n"
-            "for port in range(preferred + 1, preferred + 101):\n"
+            "for index in range(offset, offset + 128):\n"
+            "    port = preferred + 1 + (index % 10000)\n"
             "    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
             "    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
             "    try:\n"
@@ -2020,6 +2426,7 @@ class JobManager:
                 source_root=self._source_root,
                 secrets=self._secrets,
             )
+            self._copy_captured_runtime_artifacts(probe_snapshot)
             current = self._status_store.create_initial_status(probe_job)
             result = self._run_probe_candidate_with_live_preflight(
                 training_config=training_config,
@@ -2412,6 +2819,13 @@ class JobManager:
                     LauncherResultStatus.BLOCKED,
                     LauncherResultStatus.UNSUPPORTED,
                 }:
+                    if (
+                        monitor.status is LauncherResultStatus.FAILED
+                        and self._memory_probe_completed(
+                            probe_snapshot, probe_execution.world_size
+                        )
+                    ):
+                        continue
                     failure = current_status.failure or monitor.failure
                     return self._classify_probe_result(
                         probe_snapshot=probe_snapshot,
@@ -2445,6 +2859,11 @@ class JobManager:
                 pass
             try:
                 launcher.cleanup(context)
+            except Exception:
+                pass
+            try:
+                if hasattr(launcher, "remove_remote_snapshot"):
+                    launcher.remove_remote_snapshot(context)
             except Exception:
                 pass
 
@@ -2574,6 +2993,21 @@ class JobManager:
                 master_port=master.port,
             )
         if rendezvous_ready is True and not training_started:
+            if _probe_log_has_port_collision(log_tail):
+                return MemoryProbeResult(
+                    status=PROBE_INFRA_FAILURE,
+                    candidate_id=probe_plan.selected_candidate_id,
+                    subtype="PORT_COLLISION",
+                    message=(
+                        "probe rendezvous port collision detected; "
+                        "reallocating a fresh master port"
+                    ),
+                    rendezvous_ready=True,
+                    phase=phase,
+                    attempt=attempt,
+                    master_addr=master.address,
+                    master_port=master.port,
+                )
             return MemoryProbeResult(
                 status=PROBE_RUNTIME_FAILURE,
                 candidate_id=probe_plan.selected_candidate_id,
@@ -2644,6 +3078,12 @@ class JobManager:
                 train = payload.get("train")
                 if isinstance(train, dict):
                     payloads.append(train)
+                    continue
+                log_tail = payload.get("log_tail")
+                if isinstance(log_tail, str):
+                    parsed = _parse_probe_marker_from_tail(log_tail)
+                    if parsed is not None:
+                        payloads.append(parsed)
         if len(payloads) < world_size:
             return False
         return all(
@@ -2733,6 +3173,200 @@ class JobManager:
     def _automatic_planning_enabled(self, training_config: TrainingConfig) -> bool:
         return training_config.planning.mode == "automatic"
 
+    def _entrypoint_training_config(self, entrypoint: Any) -> TrainingConfig:
+        enabled_workers = [worker for worker in self.cluster_config.workers if worker.enabled]
+        world_size = max(1, len(enabled_workers))
+        communication_backend = self.cluster_config.backend_preference.communication_backend
+        if str(communication_backend) == "auto":
+            communication_backend = as_backend_name("nccl")
+        entrypoint_path = Path(getattr(entrypoint, "entrypoint")).name
+        return TrainingConfig(
+            job=TrainingJobConfig(
+                name=entrypoint_path or "captured-entrypoint",
+                backend=self.cluster_config.backend_preference.launcher,
+                communication_backend=communication_backend,
+            ),
+            model=TrainingModelConfig(
+                name="captured-entrypoint",
+                type="captured_entrypoint",
+                parameters={"entrypoint": entrypoint_path},
+            ),
+            resources=TrainingResourcesConfig(
+                world_size=world_size,
+                preferred_workers=[worker.worker_id for worker in enabled_workers],
+            ),
+            artifacts=TrainingArtifactsConfig(snapshot_name="captured-entrypoint"),
+            planning=TrainingPlanningConfig(mode="automatic"),
+        )
+
+    def _capture_failure(self, result: CaptureResult) -> FailureRecord:
+        failure = result.failure
+        message = (
+            "entrypoint capture failed without structured diagnostics"
+            if failure is None
+            else f"entrypoint capture failed: {failure.message}"
+        )
+        artifact_log = (
+            "plan/capture-context.json"
+            if failure is None or failure.artifact_log_ref is None
+            else failure.artifact_log_ref
+        )
+        return make_failure_record(
+            stage=FailureStage.BOOTSTRAP,
+            host=str(self.cluster_config.control.hostname),
+            message=message,
+            recommended_action="inspect plan/capture-context.json and retry shardgrid run",
+            runtime_environment={"artifact_log": artifact_log},
+            secrets=self._secrets,
+        )
+
+    def _captured_entrypoint_planner_workload(
+        self,
+        capture: CapturedEntrypointWorkload,
+        capture_metadata: Mapping[str, object],
+    ) -> PlannerWorkload:
+        model_identity = capture.context.model_identity
+        model_name = model_identity.get("class_name") or "captured-entrypoint"
+        return PlannerWorkload(
+            model=capture.model,
+            sample_args=capture.sample_args,
+            sample_kwargs=capture.sample_kwargs,
+            model_name=model_name,
+            source="capture_context_artifact",
+            metadata={
+                "capture_context_ref": "plan/capture-context.json",
+                "capture_backend": str(capture_metadata.get("capture_backend", "")),
+                "capture_backend_version": str(
+                    capture_metadata.get("capture_backend_version", "")
+                ),
+                "model_identity": dict(model_identity),
+                "tensor_metadata_keys": sorted(
+                    str(key)
+                    for key in (
+                        capture_metadata.get("tensor_metadata", {})
+                        if isinstance(capture_metadata.get("tensor_metadata"), dict)
+                        else {}
+                    )
+                ),
+                "state_key_count": len(
+                    capture_metadata.get("state_dict_key_to_canonical_state_id", {})
+                    if isinstance(
+                        capture_metadata.get("state_dict_key_to_canonical_state_id"),
+                        dict,
+                    )
+                    else {}
+                ),
+            },
+        )
+
+    def _persist_captured_runtime_artifacts(
+        self,
+        *,
+        snapshot: JobSnapshot,
+        capture: CapturedEntrypointWorkload,
+        parallel_plan: ParallelPlan,
+    ) -> None:
+        """Persist artifacts required by ``shardgrid.runtime.generic_bootstrap``.
+
+        The worker-side generic runtime must not rebuild the user model.  It
+        consumes the captured FX backend graph, the initial state values, the
+        canonical graph, and the input samples persisted here.
+        """
+        from shardgrid.planner.generic_graph import FXGraphCaptureAdapter
+
+        plan_root = Path(snapshot.plan_path).resolve()
+        plan_root.mkdir(parents=True, exist_ok=True)
+        context_path = plan_root / "capture-context.json"
+        if context_path.is_file():
+            shutil.copyfile(context_path, plan_root / "captured-context.json")
+        else:
+            (plan_root / "captured-context.json").write_text("{}", encoding="utf-8")
+        capture_result = FXGraphCaptureAdapter().capture(
+            capture.model,
+            sample_args=capture.sample_args,
+            sample_kwargs=dict(capture.sample_kwargs or {}),
+        )
+        graph = capture_result.canonical_graph
+        (plan_root / "captured-graph.json").write_text(
+            json.dumps(graph.to_dict(), sort_keys=True),
+            encoding="utf-8",
+        )
+        import torch
+        from torch import nn as _nn
+        from torch.fx import GraphModule
+
+        backend_graph = capture_result.backend_graph
+        for node in backend_graph.graph.nodes:
+            node.type = None
+        backend_graph = GraphModule(backend_graph, backend_graph.graph)
+        state_manifest = _build_state_manifest(
+            backend_graph,
+            graph,
+            parallel_plan,
+            state_source=capture.model.state_dict(),
+        )
+        _materialize_state_shards(
+            plan_root=plan_root,
+            backend_graph=backend_graph,
+            state_manifest=state_manifest,
+            state_source=capture.model.state_dict(),
+        )
+        for name, parameter in list(backend_graph.named_parameters(remove_duplicate=False)):
+            if parameter.device.type != "meta":
+                _replace_parameter(backend_graph, name, parameter)
+        for name, buffer in list(backend_graph.named_buffers(remove_duplicate=False)):
+            if buffer.device.type != "meta":
+                _replace_buffer(backend_graph, name, buffer)
+        torch.save(backend_graph, plan_root / "backend-graph.pt")
+        for index, sample in enumerate(capture.sample_args):
+            torch.save(sample, plan_root / f"input-{index}.pt")
+        if parallel_plan.stage_metadata:
+            from shardgrid.runtime.dag import compile_runtime_plan
+            from shardgrid.runtime.generic_bootstrap import _decode_exact_plan
+
+            logical, placement = _decode_exact_plan(graph, parallel_plan, None)
+            runtime_plan = compile_runtime_plan(graph, logical, placement)
+            (plan_root / "runtime-plan.json").write_text(
+                json.dumps(runtime_plan.to_dict(), sort_keys=True),
+                encoding="utf-8",
+            )
+        self._latest_captured_snapshot = snapshot
+        self._captured_runtime_artifacts_ready = True
+
+    def _copy_captured_runtime_artifacts(self, target_snapshot: JobSnapshot) -> None:
+        """Copy persisted captured runtime artifacts into another snapshot.
+
+        Memory probe snapshots launch the same generic runtime bootstrap, so
+        they must receive the captured graph / backend / state artifacts.
+        """
+        if not getattr(self, "_captured_runtime_artifacts_ready", False):
+            return
+        main = self._latest_captured_snapshot
+        if main is None:
+            return
+        source_root = Path(main.plan_path).resolve()
+        target_root = Path(target_snapshot.plan_path).resolve()
+        target_root.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "captured-context.json",
+            "captured-graph.json",
+            "backend-graph.pt",
+            "runtime-plan.json",
+            "state-manifest.json",
+        ):
+            source = source_root / name
+            if source.is_file():
+                shutil.copyfile(source, target_root / name)
+        shards_source = source_root / "state-shards"
+        if shards_source.is_dir():
+            shutil.copytree(
+                shards_source,
+                target_root / "state-shards",
+                dirs_exist_ok=True,
+            )
+        for path in sorted(source_root.glob("input-*.pt")):
+            shutil.copyfile(path, target_root / path.name)
+
     def _build_automatic_parallel_plan(
         self,
         *,
@@ -2740,6 +3374,7 @@ class JobManager:
         cluster_state: ClusterState,
         selected_engine: SelectedEngine,
         min_selected_physical_hosts: int | None = None,
+        captured_workload: PlannerWorkload | None = None,
     ) -> ParallelPlan:
         memory_config = self._planner_memory_config()
         min_worker_count, max_worker_count = self._automatic_worker_count_bounds(
@@ -2773,11 +3408,20 @@ class JobManager:
         profile = None
         joint = None
         try:
-            model, sample_args, sample_kwargs = self._planner_workload(training_config)
+            workload = self._automatic_planner_workload(
+                training_config,
+                captured_workload=captured_workload,
+            )
+            model = workload.model
+            sample_args = workload.sample_args
+            sample_kwargs = dict(workload.sample_kwargs)
+            evidence["planner_workload_source"] = workload.source
+            if workload.metadata:
+                evidence["planner_workload_metadata"] = dict(workload.metadata)
             profile = build_model_profile(
                 model,
                 engine_id=self._selected_engine_name(selected_engine),
-                model_name=training_config.model.name,
+                model_name=workload.model_name,
                 sample_args=sample_args,
                 sample_kwargs=sample_kwargs,
                 memory_config=memory_config,
@@ -2807,10 +3451,16 @@ class JobManager:
                 and item.partition_candidate.candidate_id
                 != selected_joint.partition_candidate.candidate_id
             )
-            plans = tuple(
-                build_automatic_parallel_plan(profile, candidate)
-                for candidate in ordered_joints
-            )
+            if captured_workload is None:
+                plans = tuple(
+                    build_automatic_parallel_plan(profile, candidate)
+                    for candidate in ordered_joints
+                )
+            else:
+                plans = tuple(
+                    self._build_captured_parallel_plan(profile, candidate)
+                    for candidate in ordered_joints
+                )
             if self._generic_dag_runtime_requested(training_config):
                 for plan in plans:
                     plan.requirements["generic_dag_runtime"] = "true"
@@ -2831,6 +3481,125 @@ class JobManager:
             gc.collect()
             evidence["control_rss_after_cleanup"] = _process_rss_bytes()
             self._last_planning_evidence = dict(evidence)
+
+    def _automatic_planner_workload(
+        self,
+        training_config: TrainingConfig,
+        *,
+        captured_workload: PlannerWorkload | None = None,
+    ) -> PlannerWorkload:
+        if captured_workload is not None:
+            return captured_workload
+        model, sample_args, sample_kwargs = self._planner_workload(training_config)
+        return PlannerWorkload(
+            model=model,
+            sample_args=tuple(sample_args),
+            sample_kwargs=dict(sample_kwargs),
+            model_name=training_config.model.name,
+            source="legacy_config_model_type",
+        )
+
+    def _build_captured_parallel_plan(
+        self,
+        profile: object,
+        selected_plan: object,
+    ) -> ParallelPlan:
+        if selected_plan.status is not FeasibilityStatus.FEASIBLE:
+            raise ValueError("captured planner requires a feasible placement plan")
+        candidate = selected_plan.partition_candidate
+        if candidate is None:
+            raise ValueError("captured planner requires partition candidate metadata")
+        placements = {
+            placement.stage_id: placement for placement in selected_plan.stage_placements
+        }
+        stages = [
+            ParallelPlanStage(
+                stage_id=stage.stage_id,
+                rank=placements[stage.stage_id].rank,
+                module_ids=stage.module_ids,
+                module_paths=stage.module_paths,
+                start_index=stage.start_index,
+                stop_index=stage.stop_index,
+                boundary_before_id=stage.boundary_before_id,
+                boundary_after_id=stage.boundary_after_id,
+                parameter_names_or_ranges=stage.parameter_names_or_ranges,
+                parameter_bytes=stage.parameter_bytes,
+                gradient_bytes=stage.gradient_bytes,
+                activation_bytes=stage.activation_bytes,
+                estimated_compute_units=stage.estimated_compute_units,
+                estimated_peak_training_memory=stage.estimated_peak_training_memory,
+                required_runtime=stage.required_runtime,
+                required_backends=stage.required_backends,
+                placement=ParallelPlanPlacement(
+                    worker_id=placements[stage.stage_id].worker_id,
+                    rank=placements[stage.stage_id].rank,
+                    machine_id=placements[stage.stage_id].machine_id,
+                    gpu_index=0,
+                    usable_memory_before_bytes=placements[
+                        stage.stage_id
+                    ].usable_memory_before_bytes,
+                    remaining_memory_bytes=placements[stage.stage_id].remaining_memory_bytes,
+                    utilization_ratio=placements[stage.stage_id].utilization_ratio,
+                ),
+            )
+            for stage in candidate.stages
+        ]
+        return ParallelPlan(
+            parallel_plan_id=f"{profile.profile_id}:{candidate.candidate_id}",
+            engine=as_engine_name(profile.engine_id),
+            engine_plan_path=candidate.original_engine_plan_ref,
+            model_name=profile.model_name,
+            world_size=len(stages),
+            stages=[stage.stage_id for stage in stages],
+            partition_source="automatic",
+            model_profile_id=profile.profile_id,
+            selected_candidate_id=candidate.candidate_id,
+            stage_metadata=stages,
+            communication_edges=[
+                ParallelPlanCommunicationEdge(
+                    source_stage_id=edge.source_stage_id,
+                    target_stage_id=edge.target_stage_id,
+                    source_module_id=edge.source_module_id,
+                    target_module_id=edge.target_module_id,
+                    activation=edge.activation,
+                    gradient=edge.gradient,
+                    estimated_bytes_per_step=edge.estimated_bytes_per_step,
+                    estimate_kind=edge.estimate_kind,
+                )
+                for edge in candidate.communication_edges
+            ],
+            planning_provenance=ParallelPlanProvenance(
+                partition_source="automatic",
+                model_profile_id=profile.profile_id,
+                selected_candidate_id=candidate.candidate_id,
+                selected_worker_count=selected_plan.selected_worker_count,
+                attempted_worker_counts=selected_plan.attempted_worker_counts,
+                attempts=tuple(
+                    ParallelPlanAttempt(
+                        worker_count=attempt.worker_count,
+                        worker_ids=attempt.worker_ids,
+                        candidate_id=attempt.candidate_id,
+                        status=attempt.status.value,
+                        reasons=attempt.reasons,
+                    )
+                    for attempt in selected_plan.attempts
+                ),
+                partition_algorithm="execution_graph_partition",
+                total_cross_worker_communication_bytes=candidate.estimated_bytes_per_step,
+                selected_reason=selected_plan.selected_reason,
+                fallback_reason=selected_plan.fallback_reason,
+                rejection_reasons=selected_plan.reasons,
+            ),
+            requirements={
+                "plan_mode": "automatic",
+                "partition_source": "automatic",
+                "workload_source": "captured_context",
+                "required_runtime": profile.required_runtime or "",
+                "required_backends": ",".join(profile.required_backends),
+                "selected_worker_count": str(selected_plan.selected_worker_count),
+            },
+            limitations=[],
+        )
 
     def _automatic_worker_count_bounds(
         self,
@@ -2955,7 +3724,7 @@ class JobManager:
 
     def _generic_dag_runtime_requested(self, training_config: TrainingConfig) -> bool:
         return (
-            training_config.model.type == "generic_dag"
+            training_config.model.type in {"generic_dag", "captured_entrypoint"}
             or str(training_config.model.parameters.get("generic_dag_runtime", "false")).lower()
             == "true"
         )
@@ -3212,7 +3981,10 @@ class JobManager:
         if step_values:
             manifest["training_step"] = next(iter(step_values))
         consolidation = training_config.artifacts.checkpoint.consolidation
-        generic_dag_checkpoint = training_config.model.type == "generic_dag"
+        generic_dag_checkpoint = training_config.model.type in {
+            "generic_dag",
+            "captured_entrypoint",
+        }
         optional_artifact: dict[str, object] = {
             "enabled": consolidation.enabled or generic_dag_checkpoint,
             "required": consolidation.required or generic_dag_checkpoint,
@@ -3311,11 +4083,10 @@ class JobManager:
                     f"checkpoint shard world_size mismatch for rank {assignment.rank}"
                 )
             local_path = Path(artifact.local_path).resolve()
-            if training_config.model.type == "generic_dag":
-                checkpoint_metadata = {
-                    **self._generic_checkpoint_metadata_from_shard(local_path),
-                    **checkpoint_metadata,
-                }
+            checkpoint_metadata = {
+                **self._generic_checkpoint_metadata_from_shard(local_path),
+                **checkpoint_metadata,
+            }
             shard = {
                 "worker_id": str(assignment.worker_id),
                 "rank": assignment.rank,
@@ -3342,6 +4113,18 @@ class JobManager:
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict):
             return {}
+        if payload.get("schema_version") == "shardgrid.generic_dag_checkpoint.v1":
+            return {
+                "checkpoint_schema_version": payload["schema_version"],
+                "graph_fingerprint": payload.get("graph_fingerprint"),
+                "plan_id": payload.get("plan_id"),
+                "step": payload.get("training_step"),
+                "rank": payload.get("rank"),
+                "worker_id": payload.get("worker_id"),
+                "gpu_index": payload.get("gpu_index"),
+                "gpu_id": payload.get("gpu_id"),
+                "owned_partition_ids": payload.get("owned_partition_ids", ()),
+            }
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
             return dict(metadata)
@@ -3397,14 +4180,32 @@ class JobManager:
         manifest_ref: str,
         device: str,
     ) -> str | None:
-        if training_config.model.type == "generic_dag":
-            return self._write_generic_dag_model_state(
+        if self._checkpoint_shards_are_generic(shards):
+            return self._write_generic_model_state(
                 snapshot=snapshot,
-                training_config=training_config,
                 current=current,
                 shards=shards,
                 manifest_ref=manifest_ref,
             )
+        return self._write_legacy_consolidated_model(
+            snapshot=snapshot,
+            training_config=training_config,
+            current=current,
+            shards=shards,
+            manifest_ref=manifest_ref,
+            device=device,
+        )
+
+    def _write_legacy_consolidated_model(
+        self,
+        *,
+        snapshot: JobSnapshot,
+        training_config: TrainingConfig,
+        current: JobStatus,
+        shards: Sequence[dict[str, object]],
+        manifest_ref: str,
+        device: str,
+    ) -> str | None:
         if training_config.model.type != "minimal_sequential":
             return None
 
@@ -3499,42 +4300,35 @@ class JobManager:
         full_model.load_state_dict(reloaded["model_state_dict"], strict=True)
         return consolidated_ref
 
-    def _write_generic_dag_model_state(
+    def _checkpoint_shards_are_generic(self, shards: Sequence[dict[str, object]]) -> bool:
+        return bool(shards) and all(
+            isinstance(shard.get("checkpoint_metadata"), dict)
+            and shard["checkpoint_metadata"].get("checkpoint_schema_version")
+            == "shardgrid.generic_dag_checkpoint.v1"
+            for shard in shards
+        )
+
+    def _write_generic_model_state(
         self,
         *,
         snapshot: JobSnapshot,
-        training_config: TrainingConfig,
         current: JobStatus,
         shards: Sequence[dict[str, object]],
         manifest_ref: str,
     ) -> str:
-        import torch
-        from examples.models.generic_partition_zoo import build_zoo_model, make_zoo_sample
-
         from shardgrid.runtime.checkpoint import consolidate_worker_state_shards
 
-        zoo_model = str(training_config.model.parameters.get("zoo_model", "mini_unet"))
-        model_kwargs = self._generic_dag_model_kwargs(training_config)
-        full_model = build_zoo_model(zoo_model, **model_kwargs)
-        expected_state = full_model.state_dict()
         output_ref = "checkpoint/model-state.pt"
         output_path = Path(snapshot.checkpoint_path) / "model-state.pt"
         payload = consolidate_worker_state_shards(
             [Path(str(shard["local_path"])) for shard in shards],
             output_path,
-            expected_state_keys=tuple(expected_state),
+            expected_graph_fingerprint=str(
+                shards[0]["checkpoint_metadata"].get("graph_fingerprint")
+            ),
+            expected_plan_id=str(shards[0]["checkpoint_metadata"].get("plan_id")),
+            expected_training_step=int(shards[0]["checkpoint_metadata"].get("step", 0)),
         )
-        for key, expected in expected_state.items():
-            actual = payload["state_dict"][key]
-            if tuple(actual.shape) != tuple(expected.shape):
-                raise ValueError(f"checkpoint tensor shape mismatch for {key}")
-            if actual.dtype != expected.dtype:
-                raise ValueError(f"checkpoint tensor dtype mismatch for {key}")
-        load_result = full_model.load_state_dict(payload["state_dict"], strict=True)
-        sample_args, sample_kwargs = make_zoo_sample(zoo_model, **model_kwargs)
-        full_model.eval()
-        with torch.no_grad():
-            output = full_model(*sample_args, **sample_kwargs)
         training_evidence = payload.get("training_evidence")
         if not isinstance(training_evidence, dict):
             training_evidence = {
@@ -3542,25 +4336,23 @@ class JobManager:
                 "any_parameter_changed": False,
                 "all_trainable_workers_parameter_changed": False,
             }
-        payload.update(
-            {
-                "format": "shardgrid-generic-dag-model-state/v1",
-                "job_id": str(current.job_id),
-                "model_name": training_config.model.name,
-                "model_type": training_config.model.type,
-                "zoo_model": zoo_model,
-                "model_config": training_config.to_dict()["model"],
-                "checkpoint_ref": manifest_ref,
-                "final_metrics": dict(current.final_metrics),
-                "strict_load_missing_keys": list(load_result.missing_keys),
-                "strict_load_unexpected_keys": list(load_result.unexpected_keys),
-                "validation_forward_passed": _contains_tensor(output),
-                "training_evidence": training_evidence,
-                "parameter_changed": bool(training_evidence["any_parameter_changed"]),
-                "final_model_path": str(output_path.resolve()),
-            }
+        metadata_path = Path(snapshot.checkpoint_path) / "model-state-metadata.json"
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "format": "shardgrid-generic-model-state/v1",
+                    "job_id": str(current.job_id),
+                    "checkpoint_ref": manifest_ref,
+                    "final_metrics": dict(current.final_metrics),
+                    "training_evidence": training_evidence,
+                    "parameter_changed": bool(training_evidence["any_parameter_changed"]),
+                    "final_model_path": str(output_path.resolve()),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
         )
-        torch.save(payload, output_path)
         print(f"FINAL_MODEL_PATH={output_path.resolve()}", flush=True)
         return output_ref
 
@@ -3816,3 +4608,176 @@ def _covers_workers(network_state: NetworkState, worker_ids: list[WorkerId]) -> 
             ):
                 return False
     return True
+
+
+def _module_path_to_stage(
+    parallel_plan: Any,
+    graph: Any,
+) -> dict[str, str]:
+    """Map canonical module paths to owning stage ids from the exact plan."""
+    if not getattr(parallel_plan, "stage_metadata", None):
+        return {}
+    executable = tuple(
+        node for node in graph.nodes if node.op_kind not in {"placeholder", "output"}
+    )
+    node_index = {node.node_id: index for index, node in enumerate(executable)}
+    module_index = {
+        str(node.module_path): index
+        for index, node in enumerate(executable)
+        if node.module_path
+    }
+    path_to_stage: dict[str, str] = {}
+    for stage in parallel_plan.stage_metadata:
+        for path in getattr(stage, "module_paths", ()) or ():
+            if path in module_index:
+                path_to_stage.setdefault(path, stage.stage_id)
+        for module_id in getattr(stage, "module_ids", ()) or ():
+            if module_id in node_index:
+                node = executable[node_index[module_id]]
+                if node.module_path:
+                    path_to_stage.setdefault(node.module_path, stage.stage_id)
+    return path_to_stage
+
+
+def _stage_consumes_state_path(
+    stage_id: str,
+    module_path: str,
+    parallel_plan: Any,
+) -> bool:
+    for stage in getattr(parallel_plan, "stage_metadata", ()) or ():
+        if stage.stage_id != stage_id:
+            continue
+        return module_path in (getattr(stage, "module_paths", ()) or ())
+    return False
+
+
+def _build_state_manifest(
+    backend_graph: Any,
+    graph: Any,
+    parallel_plan: Any,
+    *,
+    state_source: Mapping[str, Any],
+) -> list[dict[str, object]]:
+    """Build the canonical state manifest for ownership-addressable shards.
+
+    Each entry records the canonical state id, kind, shape/dtype, a checksum
+    over the tensor bytes, the owning stage (from the exact plan), the
+    read-only stages that consume it, and the shard reference.
+    """
+    import hashlib
+
+    import torch
+
+    path_to_stage = _module_path_to_stage(parallel_plan, graph)
+    stage_ids = tuple(
+        stage.stage_id
+        for stage in getattr(parallel_plan, "stage_metadata", ()) or ()
+    )
+    manifest: list[dict[str, object]] = []
+    for key, tensor in state_source.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.device.type == "meta":
+            continue
+        checksum = hashlib.sha256(tensor.detach().cpu().numpy().tobytes()).hexdigest()
+        module_path, _, _leaf = key.rpartition(".")
+        owner_stage = path_to_stage.get(module_path, path_to_stage.get(key))
+        read_only_stages = tuple(
+            stage_id
+            for stage_id in stage_ids
+            if stage_id != owner_stage
+            and _stage_consumes_state_path(stage_id, module_path, parallel_plan)
+        )
+        manifest.append(
+            {
+                "state_id": key,
+                "kind": "parameter"
+                if key in dict(backend_graph.named_parameters())
+                else "buffer",
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "bytes": int(tensor.numel() * max(tensor.element_size(), 1)),
+                "checksum_sha256": checksum,
+                "owner_stage": owner_stage,
+                "read_only_stages": list(read_only_stages),
+                "shard_ref": (
+                    f"state-shards/{owner_stage}.pt"
+                    if owner_stage
+                    else "state-shards/unowned.pt"
+                ),
+            }
+        )
+    return manifest
+
+
+def _materialize_state_shards(
+    *,
+    plan_root: Path,
+    backend_graph: Any,
+    state_manifest: list[dict[str, object]],
+    state_source: Mapping[str, Any],
+) -> None:
+    """Write per-owner bounded state payload shards referenced by the manifest."""
+    del backend_graph
+
+    import torch
+
+    shards_root = plan_root / "state-shards"
+    shards_root.mkdir(parents=True, exist_ok=True)
+    groups: dict[str, dict[str, torch.Tensor]] = {}
+    for entry in state_manifest:
+        state_id = str(entry["state_id"])
+        owner = str(entry["owner_stage"] or "unowned")
+        groups.setdefault(owner, {})[state_id] = state_source[state_id]
+    for owner, payload in groups.items():
+        torch.save(payload, shards_root / f"{owner}.pt")
+    for existing in shards_root.glob("*.pt"):
+        if existing.stem not in groups:
+            existing.unlink()
+    state_manifest_path = plan_root / "state-manifest.json"
+    state_manifest_path.write_text(
+        json.dumps(state_manifest, sort_keys=True), encoding="utf-8"
+    )
+
+
+def _replace_parameter(module: Any, path: str, parameter: Any) -> None:
+    import torch
+
+    parent = module
+    *head, leaf = path.split(".")
+    for part in head:
+        parent = getattr(parent, part)
+    replacement = torch.nn.Parameter(
+        torch.empty(
+            parameter.shape,
+            dtype=parameter.dtype,
+            device="meta",
+            layout=parameter.layout,
+            requires_grad=parameter.requires_grad,
+        )
+    )
+    current = parent._parameters.get(leaf)
+    if current is None:
+        setattr(parent, leaf, replacement)
+    else:
+        parent._parameters[leaf] = replacement
+
+
+def _replace_buffer(module: Any, path: str, buffer: Any) -> None:
+    import torch
+
+    parent = module
+    *head, leaf = path.split(".")
+    for part in head:
+        parent = getattr(parent, part)
+    replacement = torch.empty(
+        buffer.shape,
+        dtype=buffer.dtype,
+        device="meta",
+        layout=buffer.layout,
+    )
+    current = parent._buffers.get(leaf)
+    if current is None:
+        setattr(parent, leaf, replacement)
+    else:
+        parent._buffers[leaf] = replacement

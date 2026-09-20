@@ -350,7 +350,7 @@ def _stage_placements(
     stages = sorted(
         candidate.stages,
         key=lambda stage: (
-            -(stage.estimated_peak_training_memory.planner_required_bytes or 0),
+            -(_stage_required_bytes(stage) or 0),
             stage.stage_id,
         ),
     )
@@ -367,7 +367,7 @@ def _stage_placements(
     }
     for stage, worker in zip(stages, ordered_workers, strict=True):
         usable = _usable_memory_bytes(worker.resource)
-        required = stage.estimated_peak_training_memory.planner_required_bytes
+        required = _stage_required_bytes(stage)
         remaining = None if usable is None or required is None else usable - required
         utilization = (
             None
@@ -389,6 +389,10 @@ def _stage_placements(
             utilization_ratio=utilization,
         )
     return tuple(placement_by_stage[stage.stage_id] for stage in candidate.stages)
+
+
+def _stage_required_bytes(stage: Any) -> int | None:
+    return stage.estimated_peak_training_memory.planner_required_bytes
 
 
 def _stage_fit_reasons(stage_placements: Sequence[StagePlacement]) -> tuple[str, ...]:
@@ -422,12 +426,9 @@ def _candidate_attempt_reasons(candidates: Sequence[PartitionCandidate]) -> tupl
 
 
 def _usable_memory_bytes(worker: WorkerResource) -> int | None:
-    memory_mb = worker.gpu_free_memory
-    if memory_mb is None:
-        memory_mb = worker.gpu_total_memory
-    if memory_mb is None:
+    if worker.gpu_free_memory is None:
         return None
-    return int(memory_mb) * _BYTES_PER_MB
+    return int(worker.gpu_free_memory) * _BYTES_PER_MB
 
 
 def bytes_to_mb(value: int | None) -> int | None:

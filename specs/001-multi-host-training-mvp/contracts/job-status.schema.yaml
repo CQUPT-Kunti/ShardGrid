@@ -227,6 +227,57 @@ properties:
         type: boolean
       manual_action_required:
         type: boolean
+      code:
+        type:
+          - string
+          - "null"
+        enum:
+          - MODEL_CAPTURE_UNSUPPORTED
+          - GRAPH_BREAK_UNSUPPORTED
+          - CUSTOM_OP_UNSUPPORTED
+          - DYNAMIC_CONTROL_FLOW_UNSUPPORTED
+          - PROFILE_FAILURE
+          - PARTITION_FAILURE
+          - PLAN_VALIDATION_FAILURE
+          - NO_FEASIBLE_PLAN
+          - SEARCH_BUDGET_LIMIT
+          - MEMORY_REJECT
+          - FORMAL_TRAINING_OOM
+          - RESOURCE_CHANGED
+          - NETWORK_FAILURE
+          - RENDEZVOUS_FAILURE
+          - PROCESS_LAUNCH_FAILURE
+          - INFRA_FAILURE
+          - RUNTIME_FAILURE
+          - CPU_PROCESS_SATURATION
+          - GPU_MEMORY_SATURATION
+          - TEST_LIMIT_REACHED
+          - SATURATION_NOT_PROVEN
+          - null
+      producer:
+        type:
+          - string
+          - "null"
+      rank:
+        type:
+          - integer
+          - "null"
+      gpu_id:
+        type:
+          - string
+          - "null"
+      log_refs:
+        type:
+          - array
+          - "null"
+        items:
+          type: string
+      artifact_refs:
+        type:
+          - array
+          - "null"
+        items:
+          type: string
     additionalProperties: false
   checkpoint_ref:
     type:

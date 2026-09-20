@@ -226,7 +226,22 @@ def _render_human(result: JobRunResult) -> str:
             )
     if result.status.failure is not None:
         lines.append(f"Failure Stage: {result.status.failure.stage.value}")
+        if result.status.failure.code is not None:
+            lines.append(f"Failure Code: {result.status.failure.code.value}")
+        if result.status.failure.producer is not None:
+            lines.append(f"Failure Producer: {result.status.failure.producer}")
+        lines.append(
+            f"Failure Retryable: {'YES' if result.status.failure.retryable else 'NO'}"
+        )
         lines.append(f"Failure: {result.status.failure.message}")
+        if result.status.failure.recommended_action:
+            lines.append(
+                f"Recommended Action: {result.status.failure.recommended_action}"
+            )
+        for ref in result.status.failure.log_refs:
+            lines.append(f"Log Ref: {ref}")
+        for ref in result.status.failure.artifact_refs:
+            lines.append(f"Artifact Ref: {ref}")
     return "\n".join(lines)
 
 

@@ -136,7 +136,7 @@ class ControlNodeConfig:
 class SSHConfig:
     default_port: int = 22
     connect_timeout_seconds: int = 15
-    command_timeout_seconds: int = 60
+    command_timeout_seconds: int = 300
     probe_timeout_seconds: int = 120
     strict_host_key_checking: bool = True
     private_key_path: str | None = None
@@ -154,7 +154,7 @@ class SSHConfig:
                 field_name="ssh.connect_timeout_seconds",
             ),
             command_timeout_seconds=_require_int(
-                payload.get("command_timeout_seconds", 60),
+                payload.get("command_timeout_seconds", 300),
                 field_name="ssh.command_timeout_seconds",
             ),
             probe_timeout_seconds=_require_int(

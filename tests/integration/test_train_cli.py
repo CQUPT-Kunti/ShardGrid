@@ -163,3 +163,76 @@ def test_train_returns_nonzero_for_failed_job(tmp_path: Path, monkeypatch, capsy
     output = capsys.readouterr().out
     assert exit_code == 1
     assert "State: FAILED" in output
+
+
+def test_train_human_output_shows_structured_failure_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from shardgrid.common.enums import FailureCode
+
+    _write_cluster_config(tmp_path)
+    _write_training_config(tmp_path)
+
+    class FakeManager:
+        def __init__(self, config) -> None:
+            del config
+
+        def run(self, config_path: str, *, dry_run: bool = False) -> JobRunResult:
+            del config_path, dry_run
+            snapshot_root = tmp_path / "jobs" / "job-train-structured"
+            snapshot = JobSnapshot(
+                job_id=as_job_id("job-train-structured"),
+                root_path=str(snapshot_root),
+                code_path=str(snapshot_root / "code"),
+                config_path=str(snapshot_root / "config"),
+                plan_path=str(snapshot_root / "plan"),
+                logs_path=str(snapshot_root / "logs"),
+                environment_path=str(snapshot_root / "environment"),
+                checkpoint_path=str(snapshot_root / "checkpoint"),
+                diagnostics_path=str(snapshot_root / "diagnostics"),
+            )
+            job = TrainingJob(
+                job_id=as_job_id("job-train-structured"),
+                config_path="examples/train-minimal.yaml",
+                model="tiny-sequential",
+                requested_world_size=1,
+                backend_preference=as_backend_name("ssh"),
+                runtime_environment_ref="env:cluster/shardgrid",
+            )
+            status = JobStatus(
+                job_id=job.job_id,
+                state=JobState.FAILED,
+                phase="training",
+                backend=as_backend_name("nccl"),
+                final_metrics={},
+                checkpoint_ref=None,
+                failure=make_failure_record(
+                    stage=FailureStage.TRAIN,
+                    code=FailureCode.FORMAL_TRAINING_OOM,
+                    producer="ssh_launcher",
+                    host="10.0.0.10",
+                    rank=0,
+                    message="formal training out of memory",
+                    recommended_action="reduce batch size or adjust placement",
+                    log_refs=("logs/train.rank0.stdout",),
+                    artifact_refs=("checkpoint/model-state.pt",),
+                    retryable=False,
+                ),
+            )
+            return JobRunResult(job=job, status=status, snapshot=snapshot)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(train_command, "JobManager", FakeManager)
+
+    exit_code = main(["train", "examples/train-minimal.yaml"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "Failure Stage: TRAIN" in output
+    assert "Failure Code: FORMAL_TRAINING_OOM" in output
+    assert "Failure Producer: ssh_launcher" in output
+    assert "Failure Retryable: NO" in output
+    assert "Log Ref: logs/train.rank0.stdout" in output
+    assert "Artifact Ref: checkpoint/model-state.pt" in output

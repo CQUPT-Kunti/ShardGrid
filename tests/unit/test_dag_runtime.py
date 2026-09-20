@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 from examples.models import train_generic_dag
@@ -12,6 +14,7 @@ from shardgrid.planner.generic_graph import (
     GenericGraphIR,
     GraphEdgeSpec,
     GraphNodeSpec,
+    StateObjectSpec,
 )
 from shardgrid.planner.models import ExecutionPlan, MasterMetadata, WorkerAssignment
 from shardgrid.planner.planning_contract import (
@@ -42,8 +45,17 @@ def test_worker_ownership_allows_non_contiguous_partitions_on_same_gpu() -> None
     worker0 = next(
         worker for worker in runtime_plan.ownership.workers if worker.worker_id == "worker0"
     )
+    worker1 = next(
+        worker for worker in runtime_plan.ownership.workers if worker.worker_id == "worker1"
+    )
+    worker2 = next(
+        worker for worker in runtime_plan.ownership.workers if worker.worker_id == "worker2"
+    )
     assert worker0.owned_partitions == ("P0", "P4")
     assert set(worker0.local_parameter_ids) == {"p0", "p4"}
+    assert worker0.read_only_state_ids == ()
+    assert worker1.read_only_state_ids == ("p0",)
+    assert worker2.local_buffer_ids == ("b2",)
     assert any(
         edge.producer_partition == "P0"
         and edge.consumer_partition == "P4"
@@ -102,6 +114,32 @@ def test_runtime_uses_exact_selected_plan_without_rank_index_swap() -> None:
     assert worker0.local_parameter_ids == ("p1", "p2", "p3", "p4")
     assert worker1.owned_partitions == ("stage0",)
     assert worker1.local_parameter_ids == ("p0",)
+    gpu_by_worker = {worker.worker_id: worker.gpu_id for worker in runtime_plan.ownership.workers}
+    assert gpu_by_worker == {
+        placed.worker_id: placed.gpu_id for placed in placement.placements
+    }
+
+
+def test_runtime_edge_is_remote_for_same_worker_different_gpu() -> None:
+    graph, logical, placement = _runtime_fixture()
+    placement = PlacementPlan(
+        placement.graph_fingerprint,
+        selected_gpu_count=2,
+        placements=(
+            PlacementSpec("P0", "gpu0", "worker0", 0),
+            PlacementSpec("P1", "gpu1", "worker0", 1),
+            *placement.placements[2:],
+        ),
+    )
+
+    runtime_plan = compile_runtime_plan(graph, logical, placement)
+
+    assert any(
+        edge.producer_partition == "P0"
+        and edge.consumer_partition == "P1"
+        and edge.edge_kind is EdgeKind.REMOTE
+        for edge in runtime_plan.edges
+    )
 
 
 def test_value_store_releases_values_after_last_consumer() -> None:
@@ -180,6 +218,41 @@ def test_extract_partition_graph_densenet_matches_full_backward_optimizer() -> N
     _assert_extracted_partitions_match_full("mini_densenet", partition_count=4)
 
 
+def test_extract_partition_graph_rejects_unknown_stable_node_id() -> None:
+    capture, logical = _captured_logical_partition("residual_mlp_dag", 3)
+    partition = replace(
+        logical.partitions[0],
+        node_ids=logical.partitions[0].node_ids + ("missing-node",),
+    )
+
+    with pytest.raises(ValueError, match="PLAN_VALIDATION_FAILURE.*unknown node ids"):
+        extract_partition_graph(capture.canonical_graph, capture.backend_graph, partition)
+
+
+def test_extract_partition_graph_rejects_unknown_value_id() -> None:
+    capture, logical = _captured_logical_partition("residual_mlp_dag", 3)
+    partition = replace(
+        logical.partitions[0],
+        output_value_ids=logical.partitions[0].output_value_ids + ("missing-value",),
+    )
+
+    with pytest.raises(ValueError, match="PLAN_VALIDATION_FAILURE.*unknown value ids"):
+        extract_partition_graph(capture.canonical_graph, capture.backend_graph, partition)
+
+
+def test_extract_partition_graph_rejects_backend_node_identity_mismatch() -> None:
+    capture, logical = _captured_logical_partition("residual_mlp_dag", 3)
+    changed = next(node for node in capture.backend_graph.graph.nodes if node.op == "call_module")
+    changed.target = f"{changed.target}_mismatch"
+
+    with pytest.raises(ValueError, match="PLAN_VALIDATION_FAILURE.*backend graph mismatch"):
+        extract_partition_graph(
+            capture.canonical_graph,
+            capture.backend_graph,
+            logical.partitions[0],
+        )
+
+
 def test_checkpoint_shards_consolidate_complete_state_dict(tmp_path) -> None:
     model = build_zoo_model("mini_unet")
     args, _kwargs = make_zoo_sample("mini_unet")
@@ -226,6 +299,7 @@ def test_checkpoint_shards_consolidate_complete_state_dict(tmp_path) -> None:
         shard_paths,
         tmp_path / "full-model-state-dict.pt",
         expected_state_keys=tuple(model.state_dict()),
+        load_state_dict=True,
     )
 
     assert set(consolidated["state_dict"]) == set(model.state_dict())
@@ -263,6 +337,7 @@ def _runtime_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, PlacementP
             input_value_ids=("input",) if index == 0 else (f"v{index - 1}",),
             output_value_ids=(f"v{index}",),
             parameter_ids=(f"p{index}",),
+            buffer_ids=("b2",) if index == 2 else (),
         )
         for index in range(5)
     )
@@ -296,6 +371,25 @@ def _runtime_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, PlacementP
         parameter_owners={f"p{index}": f"n{index}" for index in range(5)},
         capture_backend="test",
         graph_fingerprint="fixture",
+        states=tuple(
+            StateObjectSpec(
+                canonical_state_id=f"p{index}",
+                kind="parameter",
+                state_dict_key=f"partition{index}.weight",
+                owner_node_ids=(f"n{index}",),
+                use_node_ids=(f"n{index}",),
+            )
+            for index in range(5)
+        )
+        + (
+            StateObjectSpec(
+                canonical_state_id="b2",
+                kind="buffer",
+                state_dict_key="partition2.running",
+                owner_node_ids=("n2",),
+                use_node_ids=("n2",),
+            ),
+        ),
     )
     logical = LogicalPartitionPlan(
         graph_fingerprint="fixture",
@@ -306,10 +400,12 @@ def _runtime_fixture() -> tuple[GenericGraphIR, LogicalPartitionPlan, PlacementP
                 input_value_ids=nodes[index].input_value_ids,
                 output_value_ids=nodes[index].output_value_ids,
                 parameter_ids=(f"p{index}",),
-                buffer_ids=(),
+                buffer_ids=("b2",) if index == 2 else (),
                 estimated_compute=1,
                 estimated_memory=1,
                 boundary_edges=(),
+                owned_state_ids=((f"p{index}",) + (("b2",) if index == 2 else ())),
+                read_only_state_ids=("p0",) if index == 1 else (),
             )
             for index in range(5)
         ),
@@ -428,6 +524,15 @@ def _assert_extracted_partitions_match_full(name: str, *, partition_count: int) 
         not torch.equal(old, parameter)
         for old, parameter in zip(before, model.parameters(), strict=True)
     )
+
+
+def _captured_logical_partition(name: str, partition_count: int):
+    model = build_zoo_model(name)
+    args, kwargs = make_zoo_sample(name)
+    if kwargs:
+        raise AssertionError("partition extractor tests only use positional zoo samples")
+    capture = FXGraphCaptureAdapter().capture(model, sample_args=args)
+    return capture, _logical_plan_for_extractor(capture.canonical_graph, partition_count)
 
 
 def _logical_plan_for_extractor(

@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
+from shardgrid.common.enums import FailureCode
+
 GRAPH_IR_SCHEMA_VERSION = "shardgrid.canonical_graph.v1"
 
 
@@ -63,6 +65,21 @@ class ParameterUseSpec:
 
 
 @dataclass(frozen=True)
+class StateObjectSpec:
+    canonical_state_id: str
+    kind: str
+    state_dict_key: str
+    shape: tuple[int | str, ...] = ()
+    dtype: str | None = None
+    requires_grad: bool | None = None
+    storage_id: str | None = None
+    shared_group_id: str | None = None
+    checkpoint_owner_key: str | None = None
+    owner_node_ids: tuple[str, ...] = ()
+    use_node_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class BoundaryValueSpec:
     value_id: str
     producer_stage: str
@@ -88,6 +105,7 @@ class GenericGraphIR:
     output_pytree_spec: str = "unknown"
     parameter_uses: tuple[ParameterUseSpec, ...] = ()
     shared_parameter_ids: tuple[str, ...] = ()
+    states: tuple[StateObjectSpec, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,7 +122,47 @@ class GenericGraphIR:
             "parameter_owners": dict(self.parameter_owners),
             "parameter_uses": [use.__dict__ for use in self.parameter_uses],
             "shared_parameter_ids": list(self.shared_parameter_ids),
+            "states": [state.__dict__ for state in self.states],
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "GenericGraphIR":
+        return cls(
+            nodes=tuple(
+                GraphNodeSpec(**dict(item))
+                for item in data.get("nodes", ())
+            ),
+            values=tuple(
+                GraphValueSpec(**dict(item))
+                for item in data.get("values", ())
+            ),
+            edges=tuple(
+                GraphEdgeSpec(**dict(item))
+                for item in data.get("edges", ())
+            ),
+            input_value_ids=tuple(str(item) for item in data.get("input_value_ids", ())),
+            output_value_ids=tuple(str(item) for item in data.get("output_value_ids", ())),
+            parameter_owners={
+                str(key): str(value)
+                for key, value in data.get("parameter_owners", {}).items()
+            },
+            capture_backend=str(data.get("capture_backend", "")),
+            schema_version=str(data.get("schema_version", GRAPH_IR_SCHEMA_VERSION)),
+            graph_fingerprint=str(data.get("graph_fingerprint", "")),
+            input_pytree_spec=str(data.get("input_pytree_spec", "tuple")),
+            output_pytree_spec=str(data.get("output_pytree_spec", "unknown")),
+            parameter_uses=tuple(
+                ParameterUseSpec(**dict(item))
+                for item in data.get("parameter_uses", ())
+            ),
+            shared_parameter_ids=tuple(
+                str(item) for item in data.get("shared_parameter_ids", ())
+            ),
+            states=tuple(
+                StateObjectSpec(**dict(item))
+                for item in data.get("states", ())
+            ),
+        )
 
 
 CanonicalGraphIR = GenericGraphIR
@@ -119,6 +177,23 @@ class GraphCaptureResult:
     metadata: Mapping[str, Any]
     diagnostics: tuple[str, ...]
     graph_fingerprint: str
+
+
+class GraphCaptureUnsupported(ValueError):
+    def __init__(
+        self,
+        code: FailureCode | str,
+        message: str,
+        *,
+        diagnostics: Sequence[str] = (),
+        backend: str | None = None,
+        fallback_allowed: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = FailureCode.from_value(str(code))
+        self.diagnostics = tuple(diagnostics)
+        self.backend = backend
+        self.fallback_allowed = fallback_allowed
 
 
 @dataclass(frozen=True)
@@ -221,6 +296,130 @@ class FXGraphCaptureAdapter:
         )
 
 
+class TorchExportGraphCaptureAdapter:
+    backend_name = "torch.export"
+
+    def capture(
+        self,
+        model: Any,
+        *,
+        sample_args: Sequence[Any] = (),
+        sample_kwargs: Mapping[str, Any] | None = None,
+    ) -> GraphCaptureResult:
+        import torch
+
+        sample_kwargs = dict(sample_kwargs or {})
+        try:
+            exported = torch.export.export(
+                model,
+                args=tuple(sample_args),
+                kwargs=sample_kwargs,
+                strict=False,
+            )
+        except Exception as exc:
+            code = _classify_capture_exception(exc)
+            raise GraphCaptureUnsupported(
+                code,
+                str(exc),
+                diagnostics=(f"{code}: {exc}",),
+                backend=self.backend_name,
+                fallback_allowed=code == "MODEL_CAPTURE_UNSUPPORTED",
+            ) from exc
+        graph_module = exported.module()
+        graph = _graph_from_fx(
+            model,
+            graph_module,
+            capture_backend=self.backend_name,
+            input_pytree_spec=_pytree_name(sample_args),
+            output_pytree_spec="unknown",
+        )
+        diagnostics = _custom_op_diagnostics(graph_module)
+        if diagnostics:
+            raise GraphCaptureUnsupported(
+                "CUSTOM_OP_UNSUPPORTED",
+                "; ".join(diagnostics),
+                diagnostics=diagnostics,
+                backend=self.backend_name,
+            )
+        return GraphCaptureResult(
+            canonical_graph=graph,
+            backend_graph=exported,
+            input_pytree_spec=graph.input_pytree_spec,
+            output_pytree_spec=graph.output_pytree_spec,
+            metadata={
+                "backend": self.backend_name,
+                "node_count": len(graph.nodes),
+                "edge_count": len(graph.edges),
+                "control_plane_parameter_real_storage_bytes": _real_parameter_storage_bytes(
+                    model
+                ),
+                "control_plane_full_real_model_materialized": (
+                    _real_parameter_storage_bytes(model) > 0
+                ),
+            },
+            diagnostics=diagnostics,
+            graph_fingerprint=graph.graph_fingerprint,
+        )
+
+    def capture_factory(self, spec: ModelFactorySpec) -> GraphCaptureResult:
+        return FXGraphCaptureAdapter().capture_factory(spec)
+
+
+def capture_generic_graph_with_backend_fallback(
+    model: Any,
+    *,
+    sample_args: Sequence[Any] = (),
+    sample_kwargs: Mapping[str, Any] | None = None,
+) -> GraphCaptureResult:
+    try:
+        return TorchExportGraphCaptureAdapter().capture(
+            model,
+            sample_args=sample_args,
+            sample_kwargs=sample_kwargs,
+        )
+    except GraphCaptureUnsupported as export_failure:
+        if not export_failure.fallback_allowed:
+            raise
+        try:
+            fx_result = FXGraphCaptureAdapter().capture(
+                model,
+                sample_args=sample_args,
+                sample_kwargs=sample_kwargs,
+            )
+        except Exception as exc:
+            code = _classify_capture_exception(exc)
+            raise GraphCaptureUnsupported(
+                code,
+                str(exc),
+                diagnostics=(*export_failure.diagnostics, f"{code}: {exc}"),
+                backend=FXGraphCaptureAdapter.backend_name,
+            ) from exc
+        if fx_result.diagnostics:
+            raise GraphCaptureUnsupported(
+                "CUSTOM_OP_UNSUPPORTED",
+                "; ".join(fx_result.diagnostics),
+                diagnostics=(*export_failure.diagnostics, *fx_result.diagnostics),
+                backend=fx_result.canonical_graph.capture_backend,
+            )
+        return GraphCaptureResult(
+            canonical_graph=fx_result.canonical_graph,
+            backend_graph=fx_result.backend_graph,
+            input_pytree_spec=fx_result.input_pytree_spec,
+            output_pytree_spec=fx_result.output_pytree_spec,
+            metadata={
+                **dict(fx_result.metadata),
+                "export_failure_code": export_failure.code,
+                "fallback_from": TorchExportGraphCaptureAdapter.backend_name,
+            },
+            diagnostics=(
+                f"FX_FALLBACK_FROM:{export_failure.code}",
+                *export_failure.diagnostics,
+                *fx_result.diagnostics,
+            ),
+            graph_fingerprint=fx_result.graph_fingerprint,
+        )
+
+
 def capture_generic_graph(
     model: Any,
     *,
@@ -276,14 +475,30 @@ def _graph_from_fx(
     for fx_node in graph_module.graph.nodes:
         node_id = f"n{node_index:04d}"
         node_index += 1
+        input_nodes = walk_fx_nodes((fx_node.args, fx_node.kwargs))
         input_ids = tuple(
-            value_by_node[parent]
-            for parent in walk_fx_nodes((fx_node.args, fx_node.kwargs))
-            if parent in value_by_node
+            value_by_node[parent] for parent in input_nodes if parent in value_by_node
         )
         module_path = _node_module_path(fx_node)
         parameter_paths = _node_parameter_paths(fx_node, module_by_path)
         buffer_paths = _node_buffer_paths(fx_node, module_by_path)
+        if fx_node.op in {"call_function", "call_method"}:
+            parameter_paths = _unique(
+                parameter_paths
+                + tuple(
+                    path
+                    for parent in input_nodes
+                    for path in _get_attr_state_paths(parent, parameter_ids_by_path)
+                )
+            )
+            buffer_paths = _unique(
+                buffer_paths
+                + tuple(
+                    path
+                    for parent in input_nodes
+                    for path in _get_attr_state_paths(parent, buffer_ids_by_path)
+                )
+            )
         output_ids: tuple[str, ...]
         if fx_node.op == "output":
             output_ids = ()
@@ -372,6 +587,7 @@ def _graph_from_fx(
         output_pytree_spec=output_pytree_spec,
         parameter_uses=_parameter_uses(nodes),
         shared_parameter_ids=_shared_parameter_ids(nodes),
+        states=_state_objects(model, nodes, parameter_ids_by_path, buffer_ids_by_path),
     )
     return GenericGraphIR(
         **{
@@ -461,7 +677,7 @@ def _node_parameter_paths(node: Any, module_by_path: Mapping[str, Any]) -> tuple
         return ()
     return tuple(
         f"{module_path}.{name}" if module_path else name
-        for name, _parameter in module.named_parameters(recurse=False)
+        for name, _parameter in _module_named_parameters(module)
     )
 
 
@@ -474,8 +690,19 @@ def _node_buffer_paths(node: Any, module_by_path: Mapping[str, Any]) -> tuple[st
         return ()
     return tuple(
         f"{module_path}.{name}" if module_path else name
-        for name, _buffer in module.named_buffers(recurse=False)
+        for name, _buffer in _module_named_buffers(module)
     )
+
+
+def _get_attr_state_paths(node: Any, ids_by_path: Mapping[str, str]) -> tuple[str, ...]:
+    if getattr(node, "op", None) != "get_attr":
+        return ()
+    path = str(getattr(node, "target", ""))
+    return (path,) if path in ids_by_path else ()
+
+
+def _unique(items: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(items))
 
 
 def _canonical_target(node: Any, module_by_path: Mapping[str, Any]) -> str:
@@ -571,11 +798,104 @@ def _named_parameters(model: Any) -> tuple[tuple[str, Any], ...]:
         return tuple(model.named_parameters())
 
 
+def _module_named_parameters(module: Any) -> tuple[tuple[str, Any], ...]:
+    try:
+        return tuple(module.named_parameters(recurse=True, remove_duplicate=False))
+    except TypeError:
+        return tuple(module.named_parameters(recurse=True))
+
+
 def _named_buffers(model: Any) -> tuple[tuple[str, Any], ...]:
     try:
         return tuple(model.named_buffers(remove_duplicate=False))
     except TypeError:
         return tuple(model.named_buffers())
+
+
+def _module_named_buffers(module: Any) -> tuple[tuple[str, Any], ...]:
+    try:
+        return tuple(module.named_buffers(recurse=True, remove_duplicate=False))
+    except TypeError:
+        return tuple(module.named_buffers(recurse=True))
+
+
+def _state_objects(
+    model: Any,
+    nodes: Sequence[GraphNodeSpec],
+    parameter_ids_by_path: Mapping[str, str],
+    buffer_ids_by_path: Mapping[str, str],
+) -> tuple[StateObjectSpec, ...]:
+    parameter_users: dict[str, list[str]] = {}
+    parameter_owner: dict[str, str] = {}
+    buffer_users: dict[str, list[str]] = {}
+    buffer_owner: dict[str, str] = {}
+    for node in nodes:
+        for state_id in node.parameter_ids:
+            parameter_users.setdefault(state_id, []).append(node.node_id)
+            parameter_owner.setdefault(state_id, node.node_id)
+        for state_id in node.buffer_ids:
+            buffer_users.setdefault(state_id, []).append(node.node_id)
+            buffer_owner.setdefault(state_id, node.node_id)
+
+    records: list[StateObjectSpec] = []
+    records.extend(
+        _state_records(
+            "parameter",
+            _named_parameters(model),
+            parameter_ids_by_path,
+            parameter_owner,
+            parameter_users,
+        )
+    )
+    records.extend(
+        _state_records(
+            "buffer",
+            _named_buffers(model),
+            buffer_ids_by_path,
+            buffer_owner,
+            buffer_users,
+        )
+    )
+    return tuple(records)
+
+
+def _state_records(
+    kind: str,
+    named_items: Sequence[tuple[str, Any]],
+    ids_by_path: Mapping[str, str],
+    owner_by_id: Mapping[str, str],
+    users_by_id: Mapping[str, Sequence[str]],
+) -> tuple[StateObjectSpec, ...]:
+    keys_by_id: dict[str, list[str]] = {}
+    for path, _item in named_items:
+        keys_by_id.setdefault(ids_by_path[path], []).append(path)
+
+    records: list[StateObjectSpec] = []
+    for path, item in named_items:
+        state_id = ids_by_path[path]
+        keys = keys_by_id[state_id]
+        records.append(
+            StateObjectSpec(
+                canonical_state_id=state_id,
+                kind=kind,
+                state_dict_key=path,
+                shape=tuple(getattr(item, "shape", ()) or ()),
+                dtype=str(getattr(item, "dtype", "")).replace("torch.", "") or None,
+                requires_grad=(
+                    bool(item.requires_grad)
+                    if hasattr(item, "requires_grad") and kind == "parameter"
+                    else False
+                ),
+                storage_id=state_id,
+                shared_group_id=state_id if len(keys) > 1 else None,
+                checkpoint_owner_key=keys[0],
+                owner_node_ids=(
+                    (owner_by_id[state_id],) if state_id in owner_by_id else ()
+                ),
+                use_node_ids=tuple(sorted(set(users_by_id.get(state_id, ())))),
+            )
+        )
+    return tuple(records)
 
 
 def _real_parameter_storage_bytes(model: Any) -> int:
@@ -643,6 +963,26 @@ def _custom_op_diagnostics(graph_module: Any) -> tuple[str, ...]:
     )
 
 
+def _classify_capture_exception(exc: BaseException) -> FailureCode:
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    if any(token in text for token in ("custom op", "custom_op", "no fake impl")):
+        return FailureCode.CUSTOM_OP_UNSUPPORTED
+    if any(
+        token in text
+        for token in (
+            "data dependent",
+            "data-dependent",
+            "control flow",
+            "could not guard on data-dependent expression",
+            "symbolically traced variables cannot be used as inputs to control flow",
+        )
+    ):
+        return FailureCode.DYNAMIC_CONTROL_FLOW_UNSUPPORTED
+    if any(token in text for token in ("graph break", "graph_break", "unsupported")):
+        return FailureCode.GRAPH_BREAK_UNSUPPORTED
+    return FailureCode.MODEL_CAPTURE_UNSUPPORTED
+
+
 def _is_allowed_function(target: Any) -> bool:
     module = getattr(target, "__module__", "")
     name = getattr(target, "__name__", "")
@@ -676,10 +1016,11 @@ def graph_fingerprint(graph: CanonicalGraphIR) -> str:
         "schema_version": graph.schema_version,
         "nodes": [
             {
+                "node_id": node.node_id,
                 "op_kind": node.op_kind,
                 "canonical_target": node.canonical_target,
-                "input_count": len(node.input_value_ids),
-                "output_count": len(node.output_value_ids),
+                "input_value_ids": list(node.input_value_ids),
+                "output_value_ids": list(node.output_value_ids),
                 "parameter_ids": list(node.parameter_ids),
                 "buffer_ids": list(node.buffer_ids),
             }
@@ -687,12 +1028,17 @@ def graph_fingerprint(graph: CanonicalGraphIR) -> str:
         ],
         "values": [
             {
+                "value_id": value.value_id,
+                "producer_node_id": value.producer_node_id,
+                "consumer_node_ids": list(value.consumer_node_ids),
                 "shape": list(value.shape),
                 "dtype": value.dtype,
                 "requires_grad": value.requires_grad,
             }
             for value in graph.values
         ],
+        "input_value_ids": list(graph.input_value_ids),
+        "output_value_ids": list(graph.output_value_ids),
         "edges": [
             {
                 "source_node_id": edge.source_node_id,

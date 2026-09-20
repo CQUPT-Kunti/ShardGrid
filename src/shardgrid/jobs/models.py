@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from shardgrid.common.enums import FailureStage, JobState
+from shardgrid.common.enums import FailureCode, FailureStage, JobState
 from shardgrid.common.models import (
     BackendName,
     JobId,
@@ -52,7 +52,7 @@ def _serialize(value: Any) -> Any:
         return {key: _serialize(item) for key, item in asdict(cast(Any, value)).items()}
     if isinstance(value, dict):
         return {str(key): _serialize(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_serialize(item) for item in value]
     return value
 
@@ -74,6 +74,12 @@ class FailureRecord:
     recommended_action: str = ""
     retryable: bool = False
     manual_action_required: bool = False
+    code: FailureCode | None = None
+    producer: str | None = None
+    rank: int | None = None
+    gpu_id: str | None = None
+    log_refs: tuple[str, ...] = ()
+    artifact_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.message:
@@ -86,6 +92,8 @@ class FailureRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "FailureRecord":
+        code_value = data.get("code")
+        code = None if code_value is None else FailureCode.from_value(str(code_value))
         return cls(
             stage=FailureStage(data["stage"]),
             host=str(data["host"]),
@@ -109,6 +117,12 @@ class FailureRecord:
             recommended_action=str(data["recommended_action"]),
             retryable=bool(data.get("retryable", False)),
             manual_action_required=bool(data.get("manual_action_required", False)),
+            code=code,
+            producer=data.get("producer"),
+            rank=_optional_int(data, "rank"),
+            gpu_id=data.get("gpu_id"),
+            log_refs=tuple(str(ref) for ref in data.get("log_refs", ())),
+            artifact_refs=tuple(str(ref) for ref in data.get("artifact_refs", ())),
         )
 
 

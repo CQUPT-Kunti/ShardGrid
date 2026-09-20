@@ -1,4 +1,4 @@
-"""Generic DAG automatic multi-host training runner."""
+"""Generic DAG example/regression multi-host training runner."""
 
 # ruff: noqa: E402
 

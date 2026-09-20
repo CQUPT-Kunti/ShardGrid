@@ -10,13 +10,14 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from shardgrid.planner.generic_graph import CanonicalGraphIR
 from shardgrid.planner.planning_contract import (
     LogicalPartitionPlan,
     LogicalPartitionSpec,
     PlacementPlan,
+    PlacementSpec,
 )
 
 TensorMap = dict[str, Any]
@@ -36,6 +37,7 @@ class WorkerOwnershipSpec:
     owned_partitions: tuple[str, ...]
     local_parameter_ids: tuple[str, ...]
     local_buffer_ids: tuple[str, ...]
+    read_only_state_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__
@@ -50,6 +52,18 @@ class WorkerOwnershipPlan:
 
 
 @dataclass(frozen=True)
+class WorkerMaterializedState:
+    worker: WorkerOwnershipSpec
+    parameters: Mapping[str, Any]
+    buffers: Mapping[str, Any]
+    read_only_state_ids: tuple[str, ...]
+
+    @property
+    def materialized_state_ids(self) -> tuple[str, ...]:
+        return tuple(self.parameters) + tuple(self.buffers)
+
+
+@dataclass(frozen=True)
 class RuntimeEdgeSpec:
     producer_partition: str
     consumer_partition: str
@@ -59,6 +73,11 @@ class RuntimeEdgeSpec:
     consumer_worker_id: str
     producer_gpu_id: str
     consumer_gpu_id: str
+    shape: tuple[int | str, ...] = ()
+    dtype: str | None = None
+    requires_grad: bool | None = None
+    forward_transfer_bytes: int = 0
+    backward_transfer_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,13 +91,83 @@ class RuntimePlan:
     graph_fingerprint: str
     ownership: WorkerOwnershipPlan
     edges: tuple[RuntimeEdgeSpec, ...]
+    logical_partitions: tuple[LogicalPartitionSpec, ...] = ()
+    placements: tuple[PlacementSpec, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "graph_fingerprint": self.graph_fingerprint,
             "ownership": self.ownership.to_dict(),
             "edges": [edge.to_dict() for edge in self.edges],
+            "logical_partitions": [
+                partition.to_dict() for partition in self.logical_partitions
+            ],
+            "placements": [placement.__dict__ for placement in self.placements],
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RuntimePlan":
+        from shardgrid.planner.planning_contract import (
+            LogicalPartitionSpec,
+            PlacementSpec,
+        )
+
+        return cls(
+            graph_fingerprint=str(data.get("graph_fingerprint", "")),
+            ownership=WorkerOwnershipPlan(
+                tuple(
+                    WorkerOwnershipSpec(
+                        worker_id=str(worker["worker_id"]),
+                        gpu_index=int(worker["gpu_index"]),
+                        gpu_id=str(worker["gpu_id"]),
+                        owned_partitions=tuple(
+                            str(item) for item in worker.get("owned_partitions", ())
+                        ),
+                        local_parameter_ids=tuple(
+                            str(item) for item in worker.get("local_parameter_ids", ())
+                        ),
+                        local_buffer_ids=tuple(
+                            str(item) for item in worker.get("local_buffer_ids", ())
+                        ),
+                        read_only_state_ids=tuple(
+                            str(item) for item in worker.get("read_only_state_ids", ())
+                        ),
+                    )
+                    for worker in data.get("ownership", {}).get("workers", ())
+                )
+            ),
+            edges=tuple(
+                RuntimeEdgeSpec(
+                    producer_partition=str(edge["producer_partition"]),
+                    consumer_partition=str(edge["consumer_partition"]),
+                    value_id=str(edge["value_id"]),
+                    edge_kind=EdgeKind(str(edge["edge_kind"])),
+                    producer_worker_id=str(edge["producer_worker_id"]),
+                    consumer_worker_id=str(edge["consumer_worker_id"]),
+                    producer_gpu_id=str(edge["producer_gpu_id"]),
+                    consumer_gpu_id=str(edge["consumer_gpu_id"]),
+                    shape=tuple(edge.get("shape", ())),
+                    dtype=edge.get("dtype"),
+                    requires_grad=edge.get("requires_grad"),
+                    forward_transfer_bytes=int(edge.get("forward_transfer_bytes", 0)),
+                    backward_transfer_bytes=int(edge.get("backward_transfer_bytes", 0)),
+                )
+                for edge in data.get("edges", ())
+            ),
+            logical_partitions=tuple(
+                LogicalPartitionSpec(**dict(partition))
+                for partition in data.get("logical_partitions", ())
+            ),
+            placements=tuple(
+                PlacementSpec(
+                    partition_id=str(placement["partition_id"]),
+                    gpu_id=str(placement["gpu_id"]),
+                    worker_id=str(placement["worker_id"]),
+                    gpu_index=int(placement["gpu_index"]),
+                )
+                for placement in data.get("placements", ())
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -222,7 +311,18 @@ def compile_runtime_plan(
     logical: LogicalPartitionPlan,
     placement: PlacementPlan,
 ) -> RuntimePlan:
+    if logical.graph_fingerprint != graph.graph_fingerprint:
+        raise ValueError("PLAN_VALIDATION_FAILURE: logical plan graph fingerprint mismatch")
+    if placement.graph_fingerprint != graph.graph_fingerprint:
+        raise ValueError("PLAN_VALIDATION_FAILURE: placement plan graph fingerprint mismatch")
     partition_by_id = {partition.partition_id: partition for partition in logical.partitions}
+    if len(partition_by_id) != len(logical.partitions):
+        raise ValueError("PLAN_VALIDATION_FAILURE: duplicate logical partition ids")
+    placed_partition_ids = [placed.partition_id for placed in placement.placements]
+    if len(set(placed_partition_ids)) != len(placed_partition_ids):
+        raise ValueError("PLAN_VALIDATION_FAILURE: duplicate placement partition ids")
+    if set(placed_partition_ids) != set(partition_by_id):
+        raise ValueError("PLAN_VALIDATION_FAILURE: placement must cover logical partitions")
     partition_by_node = {
         node_id: partition.partition_id
         for partition in logical.partitions
@@ -231,6 +331,7 @@ def compile_runtime_plan(
     placement_by_partition = {
         placed.partition_id: placed for placed in placement.placements
     }
+    value_by_id = {value.value_id: value for value in graph.values}
     worker_groups: dict[tuple[str, int, str], list[LogicalPartitionSpec]] = {}
     for placed in placement.placements:
         partition = partition_by_id[placed.partition_id]
@@ -239,23 +340,44 @@ def compile_runtime_plan(
             [],
         ).append(partition)
 
-    ownership = WorkerOwnershipPlan(
-        tuple(
+    state_kind = {state.canonical_state_id: state.kind for state in graph.states}
+    owned_by_worker: dict[str, tuple[str, int, str]] = {}
+    workers: list[WorkerOwnershipSpec] = []
+    for (worker_id, gpu_index, gpu_id), partitions in sorted(worker_groups.items()):
+        owned_state_ids = {
+            state_id
+            for partition in partitions
+            for state_id in (
+                partition.owned_state_ids
+                or partition.parameter_ids + partition.buffer_ids
+            )
+        }
+        for state_id in owned_state_ids:
+            previous = owned_by_worker.setdefault(state_id, (worker_id, gpu_index, gpu_id))
+            if previous != (worker_id, gpu_index, gpu_id):
+                raise ValueError(f"state {state_id} has multiple runtime owners")
+        workers.append(
             WorkerOwnershipSpec(
                 worker_id=worker_id,
                 gpu_index=gpu_index,
                 gpu_id=gpu_id,
                 owned_partitions=tuple(partition.partition_id for partition in partitions),
-                local_parameter_ids=tuple(
-                    sorted({pid for partition in partitions for pid in partition.parameter_ids})
-                ),
-                local_buffer_ids=tuple(
-                    sorted({bid for partition in partitions for bid in partition.buffer_ids})
+                local_parameter_ids=_owned_state_ids(partitions, state_kind, "parameter"),
+                local_buffer_ids=_owned_state_ids(partitions, state_kind, "buffer"),
+                read_only_state_ids=tuple(
+                    sorted(
+                        {
+                            state_id
+                            for partition in partitions
+                            for state_id in partition.read_only_state_ids
+                            if state_id not in owned_state_ids
+                        }
+                    )
                 ),
             )
-            for (worker_id, gpu_index, gpu_id), partitions in sorted(worker_groups.items())
         )
-    )
+
+    ownership = WorkerOwnershipPlan(tuple(workers))
     edges: list[RuntimeEdgeSpec] = []
     for edge in graph.edges:
         source_partition = partition_by_node.get(edge.source_node_id)
@@ -268,7 +390,12 @@ def compile_runtime_plan(
             continue
         source = placement_by_partition[source_partition]
         target = placement_by_partition[target_partition]
-        same_device = source.worker_id == target.worker_id and source.gpu_index == target.gpu_index
+        value = value_by_id.get(edge.value_id)
+        same_device = (
+            source.worker_id == target.worker_id
+            and source.gpu_index == target.gpu_index
+            and source.gpu_id == target.gpu_id
+        )
         edges.append(
             RuntimeEdgeSpec(
                 producer_partition=source_partition,
@@ -279,12 +406,92 @@ def compile_runtime_plan(
                 consumer_worker_id=target.worker_id,
                 producer_gpu_id=source.gpu_id,
                 consumer_gpu_id=target.gpu_id,
+                shape=() if value is None else value.shape,
+                dtype=None if value is None else value.dtype,
+                requires_grad=None if value is None else value.requires_grad,
+                forward_transfer_bytes=edge.forward_transfer_bytes,
+                backward_transfer_bytes=edge.backward_transfer_bytes,
             )
         )
     return RuntimePlan(
         graph_fingerprint=graph.graph_fingerprint,
         ownership=ownership,
         edges=tuple(edges),
+        logical_partitions=tuple(logical.partitions),
+        placements=tuple(placement.placements),
+    )
+
+
+def materialize_worker_owned_state(
+    runtime_plan: RuntimePlan,
+    *,
+    worker_id: str,
+    state_objects: Mapping[str, Any],
+    gpu_index: int | None = None,
+    gpu_id: str | None = None,
+) -> WorkerMaterializedState:
+    worker = _select_worker(runtime_plan.ownership, worker_id, gpu_index, gpu_id)
+    missing = [
+        state_id
+        for state_id in worker.local_parameter_ids + worker.local_buffer_ids
+        if state_id not in state_objects
+    ]
+    if missing:
+        raise ValueError(f"missing owned worker state: {missing!r}")
+    return WorkerMaterializedState(
+        worker=worker,
+        parameters={state_id: state_objects[state_id] for state_id in worker.local_parameter_ids},
+        buffers={state_id: state_objects[state_id] for state_id in worker.local_buffer_ids},
+        read_only_state_ids=worker.read_only_state_ids,
+    )
+
+
+def _select_worker(
+    ownership: WorkerOwnershipPlan,
+    worker_id: str,
+    gpu_index: int | None,
+    gpu_id: str | None,
+) -> WorkerOwnershipSpec:
+    matches = [
+        worker
+        for worker in ownership.workers
+        if worker.worker_id == worker_id
+        and (gpu_index is None or worker.gpu_index == gpu_index)
+        and (gpu_id is None or worker.gpu_id == gpu_id)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"expected one worker ownership match, found {len(matches)}")
+    return matches[0]
+
+
+def _owned_state_ids(
+    partitions: Sequence[LogicalPartitionSpec],
+    state_kind: Mapping[str, str],
+    kind: str,
+) -> tuple[str, ...]:
+    if not state_kind:
+        attr = "parameter_ids" if kind == "parameter" else "buffer_ids"
+        return tuple(
+            sorted(
+                {
+                    state_id
+                    for partition in partitions
+                    for state_id in getattr(partition, attr)
+                }
+            )
+        )
+    return tuple(
+        sorted(
+            {
+                state_id
+                for partition in partitions
+                for state_id in (
+                    partition.owned_state_ids
+                    or partition.parameter_ids + partition.buffer_ids
+                )
+                if state_kind.get(state_id) == kind
+            }
+        )
     )
 
 

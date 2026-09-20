@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import pytest
 import torch
@@ -22,11 +26,14 @@ from examples.models.partition_stress_model import (
 from torch import nn
 from torch.fx import wrap
 
+from shardgrid.common.enums import FailureCode
+from shardgrid.planner.generic_graph import capture_generic_graph
 from shardgrid.planner.memory import MemoryEstimationConfig, build_model_profile
 from shardgrid.planner.partitioning import (
     build_partition_profile,
     discover_partition_support,
     generate_partition_candidates,
+    validate_partition_candidate,
 )
 from shardgrid.planner.requirements import FeasibilityStatus
 
@@ -41,6 +48,48 @@ def _memory_config() -> MemoryEstimationConfig:
         safety_headroom_bytes=4096,
         temporary_buffer_factor=0.25,
     )
+
+
+def _generic_fixture_module() -> ModuleType:
+    module_name = "generic_training_models"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "generic_training_models.py"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load fixture module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _ordinary_case(name: str) -> Any:
+    return _generic_fixture_module().generic_training_case(name)
+
+
+def _profile_case(case: Any, name: str):
+    return build_model_profile(
+        case.module,
+        engine_id="pytorch_pipeline",
+        model_name=name,
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+        memory_config=_memory_config(),
+    )
+
+
+def _ordinary_profile_and_support(name: str):
+    case = _ordinary_case(name)
+    profile = _profile_case(case, name)
+    support = discover_partition_support(
+        case.module,
+        profile,
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    return case, profile, support
 
 
 def test_partition_stress_model_forward_is_deterministic() -> None:
@@ -269,12 +318,421 @@ def test_equal_capacity_partition_avoids_extreme_imbalance() -> None:
     )
 
     assert candidate.hard_constraint_status == FeasibilityStatus.FEASIBLE
-    assert 10 <= candidate.stages[0].stop_index <= 18
+    assert 1 <= candidate.stages[0].stop_index < candidate.stages[1].stop_index
     stage_bytes = [
         stage.estimated_peak_training_memory.planner_required_bytes
         for stage in candidate.stages
     ]
     assert max(stage_bytes) - min(stage_bytes) < 80_000
+
+
+def test_ordinary_unet_functional_execution_nodes_are_not_partition_slots() -> None:
+    case, profile, support = _ordinary_profile_and_support("unet_like")
+    graph = capture_generic_graph(
+        case.module.eval(),
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    functional_targets = {
+        node.target
+        for node in graph.nodes
+        if node.module_path is None and node.op_kind == "call_function"
+    }
+    profile_paths = {module.module_path for module in profile.modules}
+
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+        max_stage_count=3,
+    )
+
+    assert {"enc1", "enc2", "dec1", "out"} == profile_paths
+    assert any("avg_pool2d" in target for target in functional_targets)
+    assert any("interpolate" in target for target in functional_targets)
+    assert any("cat" in target for target in functional_targets)
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert all(
+        path in profile_paths
+        for candidate in result.candidates
+        for stage in candidate.stages
+        for path in stage.module_paths
+    )
+    assert all(
+        "cat" not in path and "interpolate" not in path and "avg_pool2d" not in path
+        for candidate in result.candidates
+        for stage in candidate.stages
+        for path in stage.module_paths
+    )
+
+
+def test_ordinary_transformer_state_owner_without_execution_node_is_unsupported() -> None:
+    case, profile, support = _ordinary_profile_and_support("transformer")
+    graph = capture_generic_graph(
+        case.module.eval(),
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    profile_paths = {module.module_path for module in profile.modules}
+    executed_paths = {node.module_path for node in graph.nodes if node.module_path}
+
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+    )
+
+    assert "attn.out_proj" in profile_paths
+    assert "attn.out_proj" not in executed_paths
+    assert any(
+        "out_proj" in parameter
+        for module in profile.modules
+        if module.module_path == "attn.out_proj"
+        for parameter in module.parameter_names
+    )
+    assert support.status.value == "unsupported"
+    assert result.status == FeasibilityStatus.UNSUPPORTED
+    assert any("attn.out_proj" in reason for reason in support.reasons)
+
+
+def test_ordinary_shared_module_is_collapsed_to_one_partition_module_slot() -> None:
+    case, profile, support = _ordinary_profile_and_support("shared_module")
+    graph = capture_generic_graph(
+        case.module.eval(),
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    shared_executions = [
+        node
+        for node in graph.nodes
+        if node.op_kind == "call_module" and node.module_path == "shared"
+    ]
+
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+    )
+
+    assert len(shared_executions) == 2
+    assert [module.module_path for module in profile.modules].count("shared") == 1
+    assert support.status.value == "supported"
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert all(
+        [path for stage in candidate.stages for path in stage.module_paths].count("shared")
+        == 1
+        for candidate in result.candidates
+    )
+
+
+def test_ordinary_dense_multi_consumer_values_are_reduced_to_module_edges() -> None:
+    case, profile, support = _ordinary_profile_and_support("dense")
+    graph = capture_generic_graph(
+        case.module.eval(),
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    multi_consumer_values = [
+        value for value in graph.values if len(set(value.consumer_node_ids)) > 1
+    ]
+
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+        min_stage_count=3,
+        max_stage_count=3,
+    )
+    candidate = result.candidates[0]
+    edge_pairs = {
+        (edge.source_module_id, edge.target_module_id)
+        for edge in candidate.communication_edges
+    }
+
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert any(len(value.consumer_node_ids) >= 2 for value in multi_consumer_values)
+    assert any(
+        "input->head" in boundary.forward_dependencies for boundary in support.boundaries
+    )
+    assert any(
+        "layer1->head" in boundary.forward_dependencies for boundary in support.boundaries
+    )
+    assert [stage.module_paths for stage in candidate.stages] == [
+        ("input", "layer1"),
+        ("layer2",),
+        ("head",),
+    ]
+    assert ("m0000", "m0003") in edge_pairs
+    assert ("m0001", "m0003") in edge_pairs
+
+
+def test_graph_partitioning_residual_preserves_skip_boundary_values() -> None:
+    case = _ordinary_case("residual")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    profile = _profile_case(case, "residual")
+
+    result = generate_partition_candidates(
+        profile,
+        graph=graph,
+        memory_config=_memory_config(),
+        min_stage_count=2,
+        max_stage_count=2,
+    )
+    candidate = result.candidates[0]
+    stage_paths = [path for stage in candidate.stages for path in stage.module_paths]
+
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert any("add" in path for path in stage_paths)
+    assert any(
+        edge.source_module_id == "n0001" and edge.target_module_id == "n0005"
+        for edge in candidate.communication_edges
+    )
+    assert "v0001" in candidate.stages[0].output_value_ids
+    assert "v0001" in candidate.stages[1].input_value_ids
+
+
+def test_graph_partitioning_multibranch_uses_execution_order_not_registration_order() -> None:
+    case = _ordinary_case("multi_branch")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    profile = _profile_case(case, "multi_branch")
+
+    result = generate_partition_candidates(
+        profile,
+        graph=graph,
+        memory_config=_memory_config(),
+        min_stage_count=2,
+        max_stage_count=2,
+    )
+    candidate_paths = [
+        path
+        for stage in result.candidates[0].stages
+        for path in stage.module_paths
+    ]
+    profile_paths = [module.module_path for module in profile.modules]
+
+    assert profile_paths.index("right") < profile_paths.index("gate")
+    assert candidate_paths.index("gate") < candidate_paths.index("right")
+    assert any("cat" in path for path in candidate_paths)
+    assert result.candidates[0].stages[0].node_ids[0] == "n0000"
+
+
+def test_graph_partitioning_attention_and_dense_keep_value_dependencies() -> None:
+    transformer = _ordinary_case("transformer")
+    dense = _ordinary_case("dense")
+    transformer_graph = capture_generic_graph(
+        transformer.module.eval(),
+        sample_args=transformer.args,
+    )
+    dense_graph = capture_generic_graph(dense.module.eval(), sample_args=dense.args)
+    transformer_result = generate_partition_candidates(
+        _profile_case(transformer, "transformer"),
+        graph=transformer_graph,
+        memory_config=_memory_config(),
+        min_stage_count=3,
+        max_stage_count=3,
+    )
+    dense_result = generate_partition_candidates(
+        _profile_case(dense, "dense"),
+        graph=dense_graph,
+        memory_config=_memory_config(),
+        min_stage_count=3,
+        max_stage_count=3,
+    )
+
+    assert transformer_result.status == FeasibilityStatus.FEASIBLE
+    attention_value_consumers = {
+        edge.target_module_id
+        for edge in transformer_result.candidates[0].communication_edges
+        if edge.activation and edge.activation[0].name == "v0007"
+    }
+    assert len(attention_value_consumers) >= 2
+    assert dense_result.status == FeasibilityStatus.FEASIBLE
+    assert any(
+        edge.activation and edge.activation[0].name == "v0002"
+        for edge in dense_result.candidates[0].communication_edges
+    )
+    assert "v0002" in dense_result.candidates[0].stages[-1].input_value_ids
+
+
+def test_graph_partitioning_shared_module_state_is_owned_once_and_read_only_later() -> None:
+    case = _ordinary_case("shared_module")
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    profile = _profile_case(case, "shared_module")
+
+    result = generate_partition_candidates(
+        profile,
+        graph=graph,
+        memory_config=_memory_config(),
+        min_stage_count=3,
+        max_stage_count=3,
+    )
+    stages = result.candidates[0].stages
+
+    assert result.status == FeasibilityStatus.FEASIBLE
+    assert stages[0].owned_state_ids == ("p0000", "p0001")
+    assert stages[1].read_only_state_ids == ("p0000", "p0001")
+    assert stages[2].owned_state_ids == ("p0002", "p0003")
+    assert not (set(stages[1].owned_state_ids) & set(stages[1].read_only_state_ids))
+
+
+def _validation_fixture(name: str, stage_count: int = 2):
+    case = _ordinary_case(name)
+    graph = capture_generic_graph(case.module.eval(), sample_args=case.args)
+    profile = _profile_case(case, name)
+    support = discover_partition_support(
+        case.module,
+        profile,
+        sample_args=case.args,
+        sample_kwargs=dict(case.kwargs or {}),
+    )
+    result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        graph=graph,
+        memory_config=_memory_config(),
+        min_stage_count=stage_count,
+        max_stage_count=stage_count,
+    )
+    assert result.candidates
+    return profile, support, graph, result.candidates[0]
+
+
+def _validation_codes(result) -> set[str]:
+    return {violation.code for violation in result.violations}
+
+
+def test_validate_graph_candidate_accepts_legal_candidate() -> None:
+    profile, support, graph, candidate = _validation_fixture("residual")
+
+    result = validate_partition_candidate(profile, candidate, support, graph=graph)
+
+    assert result.valid
+    assert result.status == FeasibilityStatus.FEASIBLE
+
+
+def test_validate_graph_candidate_rejects_duplicate_execution_node() -> None:
+    profile, support, graph, candidate = _validation_fixture("residual")
+    stages = list(candidate.stages)
+    stages[1] = replace(
+        stages[1],
+        node_ids=stages[1].node_ids + (stages[0].node_ids[0],),
+    )
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    assert "duplicate_execution_node" in _validation_codes(result)
+
+
+def test_validate_graph_candidate_rejects_missing_execution_node() -> None:
+    profile, support, graph, candidate = _validation_fixture("residual")
+    stages = list(candidate.stages)
+    stages[0] = replace(stages[0], node_ids=stages[0].node_ids[1:])
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    assert "missing_execution_node" in _validation_codes(result)
+
+
+def test_validate_graph_candidate_rejects_duplicate_and_missing_state_owner() -> None:
+    profile, support, graph, candidate = _validation_fixture("shared_module", 3)
+    stages = list(candidate.stages)
+    stages[1] = replace(
+        stages[1],
+        owned_state_ids=stages[1].owned_state_ids + ("p0000",),
+        read_only_state_ids=tuple(
+            state_id for state_id in stages[1].read_only_state_ids if state_id != "p0000"
+        ),
+    )
+    duplicate = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    stages = list(candidate.stages)
+    stages[0] = replace(
+        stages[0],
+        owned_state_ids=tuple(
+            state_id for state_id in stages[0].owned_state_ids if state_id != "p0000"
+        ),
+    )
+    missing = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    assert "duplicate_state_owner" in _validation_codes(duplicate)
+    assert "missing_state_owner" in _validation_codes(missing)
+
+
+def test_validate_graph_candidate_rejects_read_only_owner_conflict() -> None:
+    profile, support, graph, candidate = _validation_fixture("shared_module", 3)
+    stages = list(candidate.stages)
+    stages[0] = replace(
+        stages[0],
+        read_only_state_ids=stages[0].read_only_state_ids + ("p0000",),
+    )
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    assert "state_read_owner_conflict" in _validation_codes(result)
+
+
+def test_validate_graph_candidate_rejects_ambiguous_shared_state_owner() -> None:
+    profile, support, graph, candidate = _validation_fixture("shared_tied_parameter", 2)
+    shared_state_id = next(state.canonical_state_id for state in graph.states)
+    stages = list(candidate.stages)
+    stages[1] = replace(
+        stages[1],
+        owned_state_ids=stages[1].owned_state_ids + (shared_state_id,),
+        read_only_state_ids=tuple(
+            state_id
+            for state_id in stages[1].read_only_state_ids
+            if state_id != shared_state_id
+        ),
+    )
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, stages=tuple(stages)),
+        support,
+        graph=graph,
+    )
+
+    codes = _validation_codes(result)
+    assert "duplicate_state_owner" in codes
+    assert "ambiguous_shared_state_owner" in codes
+
+
+def test_validate_graph_candidate_rejects_missing_boundary_value_metadata() -> None:
+    profile, support, graph, candidate = _validation_fixture("residual")
+
+    result = validate_partition_candidate(
+        profile,
+        replace(candidate, communication_edges=()),
+        support,
+        graph=graph,
+    )
+
+    assert "missing_boundary_value" in _validation_codes(result)
 
 
 class DynamicControlFlowModel(nn.Module):
@@ -358,6 +816,7 @@ def test_untraceable_dynamic_control_flow_returns_structured_unsupported() -> No
 
     assert result.status == FeasibilityStatus.UNSUPPORTED
     assert any("untraceable graph" in reason for reason in result.reasons)
+    assert result.failure_code is FailureCode.GRAPH_BREAK_UNSUPPORTED
 
 
 def test_custom_op_returns_structured_unsupported() -> None:
@@ -380,6 +839,42 @@ def test_custom_op_returns_structured_unsupported() -> None:
 
     assert result.status == FeasibilityStatus.UNSUPPORTED
     assert any("unsupported custom op" in reason for reason in result.reasons)
+    assert result.failure_code is FailureCode.CUSTOM_OP_UNSUPPORTED
+
+
+def test_partition_failure_codes_distinguish_budget_from_no_feasible_plan() -> None:
+    case = _ordinary_case("sequential")
+    profile = _profile_case(case, "sequential")
+    support = discover_partition_support(
+        case.module,
+        profile,
+        sample_args=case.args,
+    )
+    capacity = (1000, 1000)
+
+    budget_result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+        min_stage_count=2,
+        max_stage_count=3,
+        usable_memory_bytes=capacity,
+        max_candidates=1,
+    )
+    full_result = generate_partition_candidates(
+        profile,
+        partition_support=support,
+        memory_config=_memory_config(),
+        min_stage_count=2,
+        max_stage_count=3,
+        usable_memory_bytes=capacity,
+        max_candidates=1000,
+    )
+
+    assert budget_result.status == FeasibilityStatus.INFEASIBLE
+    assert budget_result.failure_code is FailureCode.SEARCH_BUDGET_LIMIT
+    assert full_result.status == FeasibilityStatus.INFEASIBLE
+    assert full_result.failure_code is FailureCode.NO_FEASIBLE_PLAN
 
 
 def test_shared_parameter_boundary_is_rejected_explicitly() -> None:

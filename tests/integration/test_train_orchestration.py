@@ -9,6 +9,7 @@ import sys
 import weakref
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -654,6 +655,91 @@ def _build_manager(
         source_root=Path(__file__).resolve().parents[2],
     )
     return manager, config_path
+
+
+def test_run_entrypoint_uses_persisted_capture_context_for_planning(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    manager, cluster_config_path = _build_manager(tmp_path, events)
+
+    def fail_legacy_model_type_workload(_training_config: object) -> object:
+        raise AssertionError("run_entrypoint fell back to model.type workload")
+
+    manager._planner_workload = fail_legacy_model_type_workload
+    fixture_root = Path(__file__).resolve().parents[1] / "fixtures" / "ordinary_training_scripts"
+
+    result = manager.run_entrypoint(
+        SimpleNamespace(
+            entrypoint=fixture_root / "positional_tuple_train.py",
+            argv=("--epochs", "1", "--checkpoint", "out/tuple.pt"),
+            cwd=fixture_root,
+            environment={"SHARDGRID_TEST_CAPTURE": "1"},
+            cluster_config_path=cluster_config_path,
+            dry_run=True,
+        ),
+        job_id=as_job_id("job-captured-entrypoint"),
+    )
+
+    assert result.status.state is JobState.SNAPSHOTTING
+    assert result.snapshot is not None
+    assert result.parallel_plan is not None
+    assert result.execution_plan is not None
+    capture_context_path = Path(result.snapshot.plan_path) / "capture-context.json"
+    capture_context = json.loads(capture_context_path.read_text(encoding="utf-8"))
+    assert capture_context["model_identity"]["class_name"] == "TupleBatchModel"
+    assert capture_context["model_call"]["args"]["kind"] == "tuple"
+    assert capture_context["tensor_metadata"]["arg0"]["shape"] == [3, 4]
+    assert result.parallel_plan.requirements["workload_source"] == "captured_context"
+    assert manager._last_planning_evidence["planner_workload_source"] == (
+        "capture_context_artifact"
+    )
+    assert manager._last_planning_evidence["capture_context_ref"] == (
+        "plan/capture-context.json"
+    )
+    metadata = manager._last_planning_evidence["planner_workload_metadata"]
+    assert metadata["capture_context_ref"] == "plan/capture-context.json"
+    assert metadata["model_identity"]["class_name"] == "TupleBatchModel"
+    assert "arg0" in metadata["tensor_metadata_keys"]
+
+
+def test_run_entrypoint_capture_failure_does_not_fallback_to_model_type(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    manager, cluster_config_path = _build_manager(tmp_path, events)
+    script = tmp_path / "unsupported_train.py"
+    script.write_text("raise RuntimeError('unsupported user script')\n", encoding="utf-8")
+
+    def fail_legacy_model_type_workload(_training_config: object) -> object:
+        raise AssertionError("run_entrypoint fell back to model.type workload")
+
+    manager._planner_workload = fail_legacy_model_type_workload
+
+    result = manager.run_entrypoint(
+        SimpleNamespace(
+            entrypoint=script,
+            argv=(),
+            cwd=tmp_path,
+            environment={},
+            cluster_config_path=cluster_config_path,
+            dry_run=True,
+        ),
+        job_id=as_job_id("job-capture-failure"),
+    )
+
+    assert result.status.state is JobState.FAILED
+    assert result.status.phase == "capture"
+    assert result.status.failure is not None
+    assert result.status.failure.stage is FailureStage.BOOTSTRAP
+    assert result.snapshot is not None
+    capture_context = json.loads(
+        (Path(result.snapshot.plan_path) / "capture-context.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert capture_context["ok"] is False
+    assert capture_context["failure"]["code"] == "RuntimeError"
 
 
 def _automatic_parallel_plan() -> ParallelPlan:

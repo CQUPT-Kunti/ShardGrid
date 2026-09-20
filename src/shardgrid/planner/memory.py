@@ -6,7 +6,8 @@ does not generate partition candidates or perform placement search.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from math import ceil
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -15,9 +16,12 @@ from shardgrid.engines.models import (
     AutomaticPartitionSupport,
     CommunicationEdge,
     EstimateKind,
+    ExecutionCostProfile,
+    GraphValueCostProfile,
     ModelProfile,
     ModuleProfile,
     ProfileResult,
+    StateMemoryProfile,
     TensorMetadata,
     TrainingMemoryEstimate,
 )
@@ -95,6 +99,107 @@ class StageMemoryFit:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class CalibrationProvenance:
+    """Provenance for a historical offline CUDA calibration record.
+
+    Offline calibration records are prior measurements used only as correction
+    evidence for the metadata estimator. They must never trigger a per-job GPU
+    trial when a new job is submitted.
+    """
+
+    gpu_name: str
+    dtype: str
+    optimizer_type: str
+    model_family: str
+    batch_size: int
+    recorded_at: str
+    source: str = "offline-calibration"
+
+    def matches(
+        self,
+        *,
+        gpu_name: str,
+        dtype: str,
+        optimizer_type: str,
+        model_family: str,
+        batch_size: int,
+    ) -> bool:
+        return (
+            _normalize_gpu_name(self.gpu_name) == _normalize_gpu_name(gpu_name)
+            and normalize_dtype_name(self.dtype) == normalize_dtype_name(dtype)
+            and self.optimizer_type.strip().lower() == optimizer_type.strip().lower()
+            and self.model_family.strip().lower() == model_family.strip().lower()
+            and self.batch_size == batch_size
+        )
+
+
+def _normalize_gpu_name(value: str) -> str:
+    return "".join(value.strip().lower().split())
+
+
+def _is_stale_calibration(recorded_at: str, now: datetime | None) -> bool:
+    if now is None:
+        return False
+    try:
+        recorded = datetime.fromisoformat(recorded_at)
+    except ValueError:
+        return True
+    return recorded < now - timedelta(days=_CALIBRATION_MAX_AGE_DAYS)
+
+
+_CALIBRATION_MAX_AGE_DAYS = 30
+
+
+def apply_offline_calibration(
+    estimate: TrainingMemoryEstimate,
+    calibration: CalibrationProvenance | None,
+    *,
+    gpu_name: str,
+    dtype: str,
+    optimizer_type: str,
+    model_family: str,
+    batch_size: int,
+    measured_peak_bytes: int | None = None,
+    now: datetime | None = None,
+) -> TrainingMemoryEstimate:
+    """Apply a historical offline calibration record to an estimate.
+
+    Calibration is used only as offline correction evidence. When the record is
+    missing, stale, or mismatched against the current job metadata, the estimate
+    is returned unchanged (conservative) and no online per-job trial is started.
+    """
+    if calibration is None or measured_peak_bytes is None:
+        return estimate
+    if _is_stale_calibration(calibration.recorded_at, now):
+        return replace(
+            estimate,
+            notes=estimate.notes + ("CALIBRATION_STALE: ignored",),
+        )
+    if not calibration.matches(
+        gpu_name=gpu_name,
+        dtype=dtype,
+        optimizer_type=optimizer_type,
+        model_family=model_family,
+        batch_size=batch_size,
+    ):
+        return replace(
+            estimate,
+            notes=estimate.notes + ("CALIBRATION_MISMATCH: ignored",),
+        )
+    if estimate.estimated_peak_bytes is None:
+        return estimate
+    corrected_peak = max(estimate.estimated_peak_bytes, measured_peak_bytes)
+    return replace(
+        estimate,
+        estimated_peak_bytes=corrected_peak,
+        planner_required_bytes=corrected_peak + estimate.safety_headroom_bytes,
+        estimate_kind=EstimateKind.ESTIMATED,
+        source=calibration.source,
+        notes=estimate.notes + ("CALIBRATION_APPLIED: offline",),
+    )
+
+
 def normalize_dtype_name(dtype: Any) -> str | None:
     if dtype is None:
         return None
@@ -142,6 +247,18 @@ def build_model_profile(
     if profile_result is not None:
         diagnostics.extend(profile_result.diagnostics)
         diagnostics.extend(profile_result.notes)
+    (
+        execution_costs,
+        graph_value_costs,
+        state_memory,
+        graph_diagnostics,
+    ) = _graph_memory_profiles(
+        model,
+        sample_args=sample_args,
+        sample_kwargs=sample_kwargs,
+        config=config,
+    )
+    diagnostics.extend(graph_diagnostics)
 
     shared_groups = _shared_parameter_groups(model)
     if shared_groups:
@@ -178,6 +295,20 @@ def build_model_profile(
         required_runtime=required_runtime,
         required_backends=tuple(required_backends),
         total_memory=total_memory,
+        execution_costs=execution_costs,
+        graph_value_costs=graph_value_costs,
+        state_memory=state_memory,
+        state_parameter_bytes=_state_bytes(state_memory, kind="parameter"),
+        state_buffer_bytes=_state_bytes(state_memory, kind="buffer"),
+        graph_value_activation_bytes=_sum_known(
+            value.estimated_bytes for value in graph_value_costs
+        ),
+        execution_activation_bytes=_sum_known(
+            item.activation_bytes for item in execution_costs
+        ),
+        execution_temporary_bytes=_sum_known(
+            item.temporary_bytes for item in execution_costs
+        ),
         evidence_paths=tuple(profile_result.evidence_paths) if profile_result else (),
         diagnostics=tuple(diagnostics),
     )
@@ -193,14 +324,13 @@ def estimate_stage_memory(
         raise ValueError("module_range must select at least one module")
     estimate_config = config or MemoryEstimationConfig()
 
-    parameter_bytes = sum(module.parameter_bytes for module in selected)
-    trainable_parameter_bytes = sum(
-        module.trainable_parameter_bytes for module in selected
-    )
-    parameter_count = sum(module.parameter_count for module in selected)
-    trainable_parameter_count = sum(
-        module.trainable_parameter_count for module in selected
-    )
+    (
+        parameter_count,
+        parameter_bytes,
+        trainable_parameter_count,
+        trainable_parameter_bytes,
+    ) = _selected_parameter_stats(profile, selected)
+    buffer_bytes = _selected_buffer_bytes(profile, selected)
 
     activation_total = 0
     activation_known = False
@@ -247,6 +377,7 @@ def estimate_stage_memory(
     activation_bytes = activation_total if activation_known else None
     peak = (
         parameter_bytes
+        + buffer_bytes
         + gradient_bytes
         + optimizer_bytes
         + (activation_bytes or 0)
@@ -318,6 +449,71 @@ def evaluate_stage_memory_fit(
         shortfall_bytes=required - usable_bytes,
         reason="estimated peak training memory exceeds usable GPU memory after headroom",
     )
+
+
+def _graph_memory_profiles(
+    model: "nn.Module",
+    *,
+    sample_args: Sequence[Any],
+    sample_kwargs: Mapping[str, Any],
+    config: MemoryEstimationConfig,
+) -> tuple[
+    tuple[ExecutionCostProfile, ...],
+    tuple[GraphValueCostProfile, ...],
+    tuple[StateMemoryProfile, ...],
+    tuple[str, ...],
+]:
+    try:
+        from shardgrid.planner.generic_graph import capture_generic_graph
+
+        graph = capture_generic_graph(
+            model,
+            sample_args=sample_args,
+            sample_kwargs=sample_kwargs,
+        )
+    except Exception as exc:
+        return (), (), (), (f"graph memory profile unavailable: {type(exc).__name__}: {exc}",)
+
+    execution_costs = tuple(
+        ExecutionCostProfile(
+            node_id=node.node_id,
+            op_kind=node.op_kind,
+            target=node.target,
+            module_path=node.module_path,
+            state_ids=tuple(dict.fromkeys(node.parameter_ids + node.buffer_ids)),
+            input_value_ids=node.input_value_ids,
+            output_value_ids=node.output_value_ids,
+            activation_bytes=node.activation_bytes,
+            temporary_bytes=int(node.activation_bytes * config.temporary_buffer_factor),
+            estimated_compute_cost=node.estimated_compute_cost,
+        )
+        for node in graph.nodes
+        if node.op_kind != "output"
+    )
+    graph_value_costs = tuple(
+        GraphValueCostProfile(
+            value_id=value.value_id,
+            producer_node_id=value.producer_node_id,
+            consumer_node_ids=value.consumer_node_ids,
+            estimated_bytes=value.estimated_bytes or 0,
+            dtype=value.dtype,
+            shape=value.shape,
+        )
+        for value in graph.values
+    )
+    state_memory = tuple(
+        StateMemoryProfile(
+            canonical_state_id=state.canonical_state_id,
+            kind=state.kind,
+            state_dict_key=state.state_dict_key,
+            bytes=_state_item_bytes(model.state_dict().get(state.state_dict_key)),
+            requires_grad=state.requires_grad,
+            shared_group_id=state.shared_group_id,
+            checkpoint_owner_key=state.checkpoint_owner_key,
+        )
+        for state in graph.states
+    )
+    return execution_costs, graph_value_costs, state_memory, ()
 
 
 def _profile_modules(
@@ -436,6 +632,34 @@ def _profile_modules(
     return tuple(modules), tuple(edges)
 
 
+def _state_item_bytes(item: Any) -> int:
+    numel = getattr(item, "numel", None)
+    element_size = getattr(item, "element_size", None)
+    if callable(numel) and callable(element_size):
+        return int(numel() * element_size())
+    return 0
+
+
+def _state_bytes(states: Sequence[StateMemoryProfile], *, kind: str) -> int:
+    seen: set[str] = set()
+    total = 0
+    for state in states:
+        if state.kind != kind or state.canonical_state_id in seen:
+            continue
+        seen.add(state.canonical_state_id)
+        total += state.bytes
+    return total
+
+
+def _sum_known(values: Sequence[int | None]) -> int | None:
+    total = 0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return total
+
+
 def _iter_target_modules(model: "nn.Module") -> Sequence[tuple[str, "nn.Module"]]:
     targets: list[tuple[str, Any]] = []
     for name, module in model.named_modules():
@@ -500,6 +724,7 @@ def _activation_bytes_for_module(
     module: ModuleProfile,
     config: MemoryEstimationConfig,
 ) -> int | None:
+    saved_or_liveness = module.memory.activation_bytes
     if module.output_tensors:
         if config.activation_dtype is not None:
             total = 0
@@ -507,16 +732,105 @@ def _activation_bytes_for_module(
                 numel = _tensor_numel(tensor.shape)
                 size = dtype_bytes(config.activation_dtype)
                 if numel is None or size is None:
-                    return module.memory.activation_bytes
+                    return saved_or_liveness
                 total += numel * size
-            return total
+            return max(total, saved_or_liveness or 0)
         total = 0
         for tensor in module.output_tensors:
             if tensor.estimated_bytes is None:
-                return module.memory.activation_bytes
+                return saved_or_liveness
             total += tensor.estimated_bytes
-        return total
-    return module.memory.activation_bytes
+        return max(total, saved_or_liveness or 0)
+    return saved_or_liveness
+
+
+def _selected_parameter_stats(
+    profile: ModelProfile,
+    selected: Sequence[ModuleProfile],
+) -> tuple[int, int, int, int]:
+    shared_owner_by_name = _shared_owner_by_parameter_name(profile)
+    if not shared_owner_by_name and not profile.state_memory:
+        return (
+            sum(module.parameter_count for module in selected),
+            sum(module.parameter_bytes for module in selected),
+            sum(module.trainable_parameter_count for module in selected),
+            sum(module.trainable_parameter_bytes for module in selected),
+        )
+
+    state_by_key = {
+        state.state_dict_key: state
+        for state in profile.state_memory
+        if state.kind == "parameter"
+    }
+    seen_keys: set[str] = set()
+    totals = [0, 0, 0, 0]
+    for module in selected:
+        parameter_names = module.parameter_names
+        if not parameter_names:
+            totals[0] += module.parameter_count
+            totals[1] += module.parameter_bytes
+            totals[2] += module.trainable_parameter_count
+            totals[3] += module.trainable_parameter_bytes
+            continue
+        count_share = _ceil_div(module.parameter_count, len(parameter_names))
+        bytes_share = _ceil_div(module.parameter_bytes, len(parameter_names))
+        trainable_count_share = _ceil_div(
+            module.trainable_parameter_count,
+            len(parameter_names),
+        )
+        trainable_bytes_share = _ceil_div(
+            module.trainable_parameter_bytes,
+            len(parameter_names),
+        )
+        for name in parameter_names:
+            canonical_key = shared_owner_by_name.get(name, name)
+            if canonical_key in seen_keys:
+                continue
+            seen_keys.add(canonical_key)
+            state = state_by_key.get(canonical_key)
+            totals[0] += count_share
+            totals[1] += state.bytes if state is not None else bytes_share
+            totals[2] += trainable_count_share
+            totals[3] += state.bytes if state is not None else trainable_bytes_share
+    return tuple(totals)  # type: ignore[return-value]
+
+
+def _selected_buffer_bytes(
+    profile: ModelProfile,
+    selected: Sequence[ModuleProfile],
+) -> int:
+    if not profile.state_memory:
+        return 0
+    selected_paths = tuple(module.module_path for module in selected)
+    total = 0
+    seen: set[str] = set()
+    for state in profile.state_memory:
+        if state.kind != "buffer" or state.canonical_state_id in seen:
+            continue
+        if any(
+            state.state_dict_key == path or state.state_dict_key.startswith(f"{path}.")
+            for path in selected_paths
+        ):
+            seen.add(state.canonical_state_id)
+            total += state.bytes
+    return total
+
+
+def _shared_owner_by_parameter_name(profile: ModelProfile) -> dict[str, str]:
+    owners: dict[str, str] = {}
+    for group in profile.shared_parameter_groups:
+        if not group:
+            continue
+        owner = group[0]
+        for name in group:
+            owners[name] = owner
+    return owners
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    if divisor <= 0:
+        return 0
+    return ceil(value / divisor)
 
 
 def _temporary_bytes_for_module(

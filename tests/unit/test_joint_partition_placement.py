@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -12,7 +13,12 @@ from shardgrid.common.models import as_hostname, as_machine_id, as_worker_id
 from shardgrid.control.resource_manager import ResourceManager
 from shardgrid.planner.memory import MemoryEstimationConfig, build_model_profile
 from shardgrid.planner.partitioning import build_partition_profile
-from shardgrid.planner.placement import _worker_subsets, search_joint_partition_placement
+from shardgrid.planner.placement import (
+    _stage_required_bytes,
+    _usable_memory_bytes,
+    _worker_subsets,
+    search_joint_partition_placement,
+)
 from shardgrid.planner.requirements import FeasibilityStatus
 from shardgrid.resources.models import NetworkLink, NetworkState, WorkerResource
 
@@ -265,7 +271,7 @@ def test_capacity_aware_heterogeneous_workers_allow_uneven_partition() -> None:
     cluster = _cluster_state(
         [
             _worker("worker-a", machine_id="machine-a", free_memory_mb=20),
-            _worker("worker-b", machine_id="machine-b", free_memory_mb=8),
+            _worker("worker-b", machine_id="machine-b", free_memory_mb=9),
         ]
     )
 
@@ -280,6 +286,11 @@ def test_capacity_aware_heterogeneous_workers_allow_uneven_partition() -> None:
 
     assert plan.status == FeasibilityStatus.FEASIBLE
     assert plan.selected_worker_count == 2
+    assert plan.partition_candidate is not None
+    assert tuple(placement.stage_required_bytes for placement in plan.stage_placements) == tuple(
+        _stage_required_bytes(stage) for stage in plan.partition_candidate.stages
+    )
+    assert any(stage.owned_state_ids for stage in plan.partition_candidate.stages)
     assert (
         plan.stage_placements[0].stage_required_bytes
         > plan.stage_placements[1].stage_required_bytes
@@ -447,3 +458,78 @@ def test_worker_subset_search_honors_budget(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("SHARDGRID_PLACEMENT_CANDIDATE_BUDGET", "3")
 
     assert len(_worker_subsets(workers, 8)) <= 3
+
+
+def test_usable_memory_prefers_fresh_free_memory_over_total() -> None:
+    worker = _worker("worker-a", machine_id="machine-a", free_memory_mb=7)
+    worker = replace(worker, gpu_total_memory=99)
+
+    assert _usable_memory_bytes(worker) == 7 * 1024 * 1024
+
+
+def test_placement_does_not_admit_on_stale_total_memory_only() -> None:
+    model, sample, profile = _chain_profile(5)
+    cluster = _cluster_state(
+        [
+            _worker("worker-a", machine_id="machine-a", free_memory_mb=13),
+            _worker("worker-b", machine_id="machine-b", free_memory_mb=13),
+        ]
+    )
+    stale = replace(cluster.workers[1].resource, gpu_free_memory=None)
+
+    updated = ResourceManager().build_cluster_state(
+        [
+            cluster.workers[0].resource,
+            stale,
+        ],
+        network_state=_network([cluster.workers[0].resource, stale]),
+        now=datetime(2026, 9, 3, 0, 0, tzinfo=UTC),
+    )
+    assert updated.workers[0].eligible is True
+
+    plan = search_joint_partition_placement(
+        model,
+        profile,
+        updated,
+        sample_args=(sample,),
+        memory_config=_memory_config(),
+    )
+
+    assert plan.status == FeasibilityStatus.INFEASIBLE
+    assert any("no usable GPU memory" in reason for reason in plan.reasons)
+
+
+def test_multi_job_placement_uses_fresh_free_vram_per_admission() -> None:
+    model, sample, profile = _chain_profile(5)
+
+    job_a_cluster = _cluster_state(
+        [
+            _worker("worker-a", machine_id="machine-a", free_memory_mb=13),
+            _worker("worker-b", machine_id="machine-b", free_memory_mb=13),
+        ]
+    )
+    plan_a = search_joint_partition_placement(
+        model,
+        profile,
+        job_a_cluster,
+        sample_args=(sample,),
+        memory_config=_memory_config(),
+    )
+    assert plan_a.status == FeasibilityStatus.FEASIBLE
+
+    job_b_cluster = _cluster_state(
+        [
+            _worker("worker-a", machine_id="machine-a", free_memory_mb=13),
+            _worker("worker-b", machine_id="machine-b", free_memory_mb=4),
+        ]
+    )
+    plan_b = search_joint_partition_placement(
+        model,
+        profile,
+        job_b_cluster,
+        sample_args=(sample,),
+        memory_config=_memory_config(),
+    )
+    assert plan_b.status == FeasibilityStatus.INFEASIBLE
+    assert any("exceeds" in reason for reason in plan_b.reasons)
+    assert plan_b.attempted_worker_counts == (2,)
